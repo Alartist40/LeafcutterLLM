@@ -113,7 +113,7 @@ func (t *Tensor) Reshape(newShape []int) (*Tensor, error) {
 	}, nil
 }
 
-// Slice returns a sliced view of the tensor (zero-copy)
+// Slice returns a sliced view of the tensor (zero-overhead)
 func (t *Tensor) Slice(start, end int) (*Tensor, error) {
 	if len(t.Shape) == 0 {
 		return nil, fmt.Errorf("cannot slice 0-d tensor")
@@ -205,7 +205,8 @@ func Float16ToFloat32(bits uint16) float32 {
 	if exp == 0 {
 		if frac == 0 {
 			// Zero
-			return *(*float32)(unsafe.Pointer(&((sign << 31))))
+			val := sign << 31
+			return *(*float32)(unsafe.Pointer(&val))
 		}
 		// Subnormal number
 		return float32(-1) * float32(sign) * (float32(frac) / float32(1<<10)) * float32(1) / float32(1<<14)
@@ -213,20 +214,23 @@ func Float16ToFloat32(bits uint16) float32 {
 	if exp == 0x1F {
 		if frac == 0 {
 			// Infinity
-			return *(*float32)(unsafe.Pointer(&((sign << 31) | 0x7F800000)))
+			val := (sign << 31) | 0x7F800000
+			return *(*float32)(unsafe.Pointer(&val))
 		}
 		// NaN
-		return *(*float32)(unsafe.Pointer(&((sign << 31) | 0x7FC00000 | frac)))
+		val := (sign << 31) | 0x7FC00000 | frac
+		return *(*float32)(unsafe.Pointer(&val))
 	}
 	// Normal number
-	return *(*float32)(unsafe.Pointer(&(((sign << 31) | ((exp + 112) << 23) | (frac << 13)))))
+	val := (sign << 31) | ((exp + 112) << 23) | (frac << 13)
+	return *(*float32)(unsafe.Pointer(&val))
 }
 
 // Float32ToFloat16 converts single-precision to IEEE 754 half-precision
 func Float32ToFloat16(f float32) uint16 {
 	bits := *(*uint32)(unsafe.Pointer(&f))
 	sign := uint16(bits >> 31)
-	exp := int16((bits >> 23) & 0xFF) - 127
+	exp := int16((bits>>23)&0xFF) - 127
 	frac := bits & 0x7FFFFF
 
 	if exp <= -15 {
@@ -266,7 +270,7 @@ func (t *Tensor) Transpose(dim1, dim2 int) (*Tensor, error) {
 	// For a true transpose, we need to actually reorder data
 	// This allocates new memory
 	result := NewTensor(newShape, t.DType)
-	
+
 	// Simple implementation for 2D case
 	if len(t.Shape) == 2 {
 		for i := 0; i < t.Shape[0]; i++ {

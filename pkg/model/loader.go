@@ -9,8 +9,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/xander/airllm-go/internal/safetensors"
-	"github.com/xander/airllm-go/pkg/tensor"
+	"github.com/Alartist40/LeafcutterLLM/internal/safetensors"
+	"github.com/Alartist40/LeafcutterLLM/pkg/tensor"
 )
 
 // Config represents a HuggingFace model configuration
@@ -277,9 +277,9 @@ func (l *LayerLoader) ClearCache() {
 
 // CheckPoint represents a loaded model checkpoint
 type CheckPoint struct {
-	Config       *Config
-	LayerLoader  *LayerLoader
-	Tokenizer    *Tokenizer
+	Config      *Config
+	LayerLoader *LayerLoader
+	// Tokenizer    *Tokenizer // Removed as it is not yet implemented
 	Architecture string
 }
 

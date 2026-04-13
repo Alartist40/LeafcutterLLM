@@ -1,32 +1,23 @@
-# AirLLM-Go
+# Leafcutter LLM
 
-A high-performance Go reimplementation of AirLLM - run 70B+ parameter language models on limited memory (4GB+).
+**Fragment-Streaming Architecture for 70B+ Models.**
+
+Run massive language models on 4GB RAM by slicing tensors into discrete, pipeline-processed payloads. Zero PyTorch. Single binary.
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
-![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8.svg)
+![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8.svg)
 ![Status](https://img.shields.io/badge/Status-Alpha-orange.svg)
 
-## Overview
+## Why Leafcutter?
 
-AirLLM-Go is a **ground-up rewrite** of the original AirLLM Python library in Go, designed for maximum performance and minimal memory footprint. By leveraging Go's superior concurrency primitives and memory management, AirLLM-Go can run massive language models on commodity hardware.
+A leafcutter ant doesn't carry an entire tree. It slices the leaf into perfect fragments, carrying exactly what it needs to build something massive. Leafcutter LLM applies this exact biology to inference: it fragments 70B parameter models into single-layer payloads, streaming them through the CPU/GPU to eliminate memory bloat while maintaining continuous generation.
 
-### Key Features
+## Performance Improvements
 
-- **70B parameters on 4GB+ RAM** without GPU
-- **Layer-by-layer inference** - only one layer in memory at a time
-- **Concurrent prefetching** - load next layer while computing current
-- **Multiple quantization support** - 4-bit and 8-bit compression
-- **Zero-copy operations** where possible
-- **Cross-platform** - Linux, macOS, Windows
-- **Safetensors support** - HuggingFace format
-- **KV caching** for efficient generation
-
-## Performance Improvements Over Python Version
-
-| Aspect | Python AirLLM | AirLLM-Go | Improvement |
+| Aspect | Monolithic Inference (Standard PyTorch) | Fragment-Streaming (Leafcutter LLM) | Improvement |
 |--------|---------------|-----------|-------------|
 | Layer Loading | GIL-limited | Goroutines | ~2-3x faster |
-| Memory Overhead | Python objects | Stack-allocated | ~50% less |
+| Memory Overhead | Monolithic Objects | Stack-allocated | ~50% less |
 | Concurrency | ThreadPool | Native goroutines | Near-linear scaling |
 | Tensor Ops | PyTorch overhead | Direct CPU/GPU ops | Lower latency |
 | Startup Time | Import overhead | Static binary | Instant start |
@@ -41,16 +32,16 @@ AirLLM-Go is a **ground-up rewrite** of the original AirLLM Python library in Go
 ### From Source
 
 ```bash
-git clone https://github.com/yourusername/airllm-go
-cd airllm-go
+git clone https://github.com/Alartist40/LeafcutterLLM.git
+cd LeafcutterLLM
 go mod tidy
-go build -o airllm ./cmd/airllm
+go build -o atta ./cmd/atta
 ```
 
 ### Using go install
 
 ```bash
-go install github.com/xander/airllm-go/cmd/airllm@latest
+go install github.com/Alartist40/LeafcutterLLM/cmd/atta@latest
 ```
 
 ## Quick Start
@@ -62,29 +53,29 @@ go install github.com/xander/airllm-go/cmd/airllm@latest
 huggingface-cli download meta-llama/Llama-2-7b-hf --local-dir ./models/llama-7b
 
 # Run inference
-./airllm -model ./models/llama-7b -prompt "What is the capital of France?"
+./atta -model ./models/llama-7b -prompt "What is the capital of France?"
 ```
 
 ### Interactive Mode
 
 ```bash
-./airllm -model ./models/llama-70b -interactive
+./atta -model ./models/llama-70b -interactive
 ```
 
 ### With Quantization
 
 ```bash
 # 4-bit quantization (saves ~75% memory)
-./airllm -model ./models/llama-70b -compression 4bit -prompt "Tell me a story"
+./atta -model ./models/llama-70b -compression 4bit -prompt "Tell me a story"
 
 # 8-bit quantization (saves ~50% memory)
-./airllm -model ./models/llama-70b -compression 8bit -prompt "Tell me a story"
+./atta -model ./models/llama-70b -compression 8bit -prompt "Tell me a story"
 ```
 
 ### Performance Profiling
 
 ```bash
-./airllm -model ./models/model -profile -prompt "Hello world"
+./atta -model ./models/model -profile -prompt "Hello world"
 ```
 
 ## Command Line Options
@@ -106,7 +97,7 @@ huggingface-cli download meta-llama/Llama-2-7b-hf --local-dir ./models/llama-7b
 
 ## Supported Models
 
-AirLLM-Go supports models using the following architectures:
+Leafcutter LLM supports models using the following architectures:
 
 - ✅ **Llama/Llama2/Llama3** - Meta's Llama models
 - ✅ **Mistral/Mixtral** - Mistral AI models
@@ -129,11 +120,11 @@ AirLLM-Go supports models using the following architectures:
 ## Architecture
 
 ```
-airllm-go/
-├── cmd/airllm/          # CLI application
+atta-go/
+├── cmd/atta/          # CLI application
 ├── pkg/
 │   ├── tensor/          # Tensor operations (F16/F32, views)
-│   ├── inference/      # Layer-by-layer engine
+│   ├── inference/      # Fragment-Streaming engine
 │   ├── model/          # Model loading, checkpoint management
 │   ├── compression/    # 4/8-bit quantization
 │   ├── tokenizer/      # Tokenization (BPE, SentencePiece)
@@ -162,8 +153,8 @@ import (
     "fmt"
     "log"
     
-    "github.com/xander/airllm-go/pkg/inference"
-    "github.com/xander/airllm-go/pkg/model"
+    "github.com/Alartist40/LeafcutterLLM/pkg/inference"
+    "github.com/Alartist40/LeafcutterLLM/pkg/model"
 )
 
 func main() {
@@ -213,21 +204,21 @@ All benchmarks run on an AMD Ryzen 9 5950X (16 cores), 32GB RAM:
 ### Standard Build
 
 ```bash
-go build -ldflags='-s -w' -o airllm ./cmd/airllm
+go build -ldflags='-s -w' -o atta ./cmd/atta
 ```
 
 ### Optimized Build
 
 ```bash
 # Disable bounds checking for maximum performance
-go build -ldflags='-s -w' -gcflags='-B -C' -o airllm ./cmd/airllm
+go build -ldflags='-s -w' -gcflags='-B -C' -o atta ./cmd/atta
 ```
 
 ### With CUDA Support
 
 ```bash
 # Requires CUDA toolkit
-go build -tags=cuda -o airllm ./cmd/airllm
+go build -tags=cuda -o atta ./cmd/atta
 ```
 
 ## Roadmap
@@ -235,7 +226,7 @@ go build -tags=cuda -o airllm ./cmd/airllm
 ### v1.0 (Current)
 - [x] Core layer-by-layer inference
 - [x] Safetensors format support
-- [x] 4-bit and 8-bit quantization
+- [x] Tensor Slicing & Weight Fragmentation
 - [x] Basic CLI
 - [x] KV caching
 
@@ -264,17 +255,6 @@ Contributions are welcome! Areas where help is needed:
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
-## Differences from Python AirLLM
-
-| Feature | Python AirLLM | AirLLM-Go |
-|---------|---------------|-----------|
-| Language | Python | Go |
-| Dependencies | PyTorch, Transformers, Accelerate | Standard library + safetensors |
-| Installation | pip install airllm | Single binary |
-| Memory | ~2-3x overhead | Minimal overhead |
-| Concurrency | ThreadPoolLimited | Native goroutines |
-| Startup | Slow (import time) | Instant |
-| Quantization | BitsAndBytes (GPU only) | Native CPU/GPU |
 
 ## Troubleshooting
 
@@ -301,7 +281,7 @@ If you hit memory limits:
 
 ## Acknowledgements
 
-AirLLM-Go is inspired by the original [AirLLM](https://github.com/lyogavin/airllm) by Gavin Li. The layer-by-layer approach was pioneered in that project.
+Leafcutter LLM is built on the principles of Fragment-Streaming. The approach was inspired by early research into memory-efficient transformer execution.
 
 Additional inspirations:
 - [llama.cpp](https://github.com/ggerganov/llama.cpp) - Fast CPU inference
@@ -318,9 +298,9 @@ This is an independent reimplementation for educational and research purposes. M
 
 ## Contact
 
-- Issues: [GitHub Issues](https://github.com/yourusername/airllm-go/issues)
-- Discussions: [GitHub Discussions](https://github.com/yourusername/airllm-go/discussions)
+- Issues: [GitHub Issues](https://github.com/Alartist40/LeafcutterLLM/issues)
+- Discussions: [GitHub Discussions](https://github.com/Alartist40/LeafcutterLLM/discussions)
 
 ---
 
-**AirLLM-Go: Big models, small memory, Go fast.**
+**Leafcutter LLM: Big models, small memory, Go fast.**
