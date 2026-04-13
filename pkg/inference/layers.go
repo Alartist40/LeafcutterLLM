@@ -5,7 +5,7 @@ import (
 	"math"
 	"sync"
 
-	"github.com/xander/airllm-go/pkg/tensor"
+	"github.com/Alartist40/LeafcutterLLM/pkg/tensor"
 )
 
 // LinearLayer implements a fully connected layer

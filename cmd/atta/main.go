@@ -1,4 +1,4 @@
-// Package main provides the airllm CLI
+// Package main provides the atta CLI
 package main
 
 import (
@@ -12,40 +12,40 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/xander/airllm-go/pkg/inference"
-	"github.com/xander/airllm-go/pkg/model"
-	"github.com/xander/airllm-go/pkg/tensor"
+	"github.com/Alartist40/LeafcutterLLM/pkg/inference"
+	"github.com/Alartist40/LeafcutterLLM/pkg/model"
+	"github.com/Alartist40/LeafcutterLLM/pkg/tensor"
 )
 
 var (
 	// Model flags
-	modelPath   = flag.String("model", "", "Path to model checkpoint directory")
-	modelID     = flag.String("model-id", ".", "HuggingFace model ID or local path")
-	
+	modelPath = flag.String("model", "", "Path to model checkpoint directory")
+	modelID   = flag.String("model-id", ".", "HuggingFace model ID or local path")
+
 	// Generation flags
 	prompt      = flag.String("prompt", "What is the capital of France?", "Input prompt")
 	maxTokens   = flag.Int("max-tokens", 100, "Maximum number of tokens to generate")
 	temperature = flag.Float64("temperature", 0.8, "Sampling temperature")
-	
+
 	// Performance flags
-	device      = flag.String("device", "cpu", "Device to use: cpu, cuda")
-	numThreads  = flag.Int("threads", 0, "Number of threads (0 = auto)")
-	prefetching = flag.Bool("prefetch", true, "Enable layer prefetching")
-	profiling   = flag.Bool("profile", false, "Enable profiling output")
-	
+	device                        = flag.String("device", "cpu", "Device to use: cpu, cuda")
+	numThreads                    = flag.Int("threads", 0, "Number of threads (0 = auto)")
+	AnticipatoryAssemblyPipelines = flag.Bool("prefetch", true, "Enable layer AnticipatoryAssemblyPipelines")
+	profiling                     = flag.Bool("profile", false, "Enable profiling output")
+
 	// Memory flags
-	maxSeqLen   = flag.Int("max-seq-len", 2048, "Maximum sequence length")
-	dtype       = flag.String("dtype", "float16", "Data type: float32, float16")
-	
-	// Quantization flags
+	maxSeqLen = flag.Int("max-seq-len", 2048, "Maximum sequence length")
+	dtype     = flag.String("dtype", "float16", "Data type: float32, float16")
+
+	// TensorSlicingWeightFragmentation flags
 	compression = flag.String("compression", "", "Compression: 4bit, 8bit (empty = none)")
-	
+
 	// Special modes
 	interactive = flag.Bool("interactive", false, "Run in interactive mode")
 	version     = flag.Bool("version", false, "Show version")
 )
 
-const versionStr = "airllm-go v1.0.0"
+const versionStr = "atta-go v1.0.0"
 
 func main() {
 	flag.Usage = func() {
@@ -62,7 +62,7 @@ func main() {
 
 	if *version {
 		fmt.Println(versionStr)
-		fmt.Println("  A Go reimplementation of AirLLM for high-performance inference")
+		fmt.Println("  A Go reimplementation of Leafcutter LLM for high-performance inference")
 		fmt.Println("  Run 70B+ parameter models on 4GB+ of RAM")
 		os.Exit(0)
 	}
@@ -123,7 +123,7 @@ func runSingle(ctx context.Context) {
 
 	// Create inference engine
 	engine := inference.NewEngine(cfg, checkpoint.LayerLoader)
-	
+
 	fmt.Printf("Model loaded in %v\n\n", time.Since(startTime))
 
 	// Tokenize input (simplified - just split by space for demo's sake)
@@ -179,7 +179,7 @@ func runInteractive(ctx context.Context) {
 		}
 
 		fmt.Print("> ")
-		
+
 		// Read user input
 		var input string
 		if _, err := fmt.Scanln(&input); err != nil {
@@ -194,7 +194,7 @@ func runInteractive(ctx context.Context) {
 
 		// Tokenize and generate
 		tokens := tokenizeSimple(input)
-		
+
 		fmt.Print("Assistant: ")
 		start := time.Now()
 
@@ -216,24 +216,24 @@ func runInteractive(ctx context.Context) {
 }
 
 func buildConfig() *inference.Config {
-	var dtype tensor.DType
+	var dType tensor.DType
 	switch *dtype {
 	case "float32":
-		dtype = tensor.Float32
+		dType = tensor.Float32
 	case "float16":
-		dtype = tensor.Float16
+		dType = tensor.Float16
 	default:
-		dtype = tensor.Float16
+		dType = tensor.Float16
 	}
 
 	return &inference.Config{
-		Device:         *device,
-		DType:          dtype,
-		MaxSeqLen:      *maxSeqLen,
-		NumThreads:     *numThreads,
-		Prefetching:    *prefetching,
-		Profiling:      *profiling,
-		KVCacheEnabled: true,
+		Device:                        *device,
+		DType:                         dType,
+		MaxSeqLen:                     *maxSeqLen,
+		NumThreads:                    *numThreads,
+		AnticipatoryAssemblyPipelines: *AnticipatoryAssemblyPipelines,
+		Profiling:                     *profiling,
+		KVCacheEnabled:                true,
 	}
 }
 
@@ -242,7 +242,7 @@ func tokenizeSimple(text string) []int {
 	// This is a very naive tokenizer - in production use a proper BPE tokenizer
 	// For now, convert characters to token IDs for testing
 	tokens := []int{1} // BOS token
-	
+
 	// Simple word-level tokenization
 	words := strings.Fields(text)
 	for i, word := range words {
@@ -250,13 +250,13 @@ func tokenizeSimple(text string) []int {
 		if len(word) > 0 {
 			tokens = append(tokens, int(word[0]))
 		}
-		
+
 		// Add space token between words
 		if i < len(words)-1 {
 			tokens = append(tokens, 259) // Space token ID
 		}
 	}
-	
+
 	tokens = append(tokens, 2) // EOS token
 	return tokens
 }

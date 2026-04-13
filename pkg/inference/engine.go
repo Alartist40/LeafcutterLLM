@@ -1,4 +1,4 @@
-// Package inference provides the core layer-by-layer inference engine
+// Package inference provides the core Fragment-Streaming inference engine
 package inference
 
 import (
@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xander/airllm-go/pkg/tensor"
+	"github.com/Alartist40/LeafcutterLLM/pkg/tensor"
 )
 
 // Layer represents a neural network layer
@@ -77,7 +77,7 @@ type Config struct {
 	DType            tensor.DType  // Float32, Float16
 	MaxSeqLen        int
 	NumThreads       int
-	Prefetching      bool          // Enable prefetching of next layer
+	AnticipatoryAssemblyPipelines      bool          // Enable AnticipatoryAssemblyPipelines of next layer
 	Profiling        bool          // Enable timing profiling
 	KVCacheEnabled   bool          // Use KV caching
 }
@@ -89,13 +89,13 @@ func DefaultConfig() *Config {
 		DType:          tensor.Float16,
 		MaxSeqLen:      2048,
 		NumThreads:     runtime.NumCPU(),
-		Prefetching:    true,
+		AnticipatoryAssemblyPipelines:    true,
 		Profiling:      false,
 		KVCacheEnabled: true,
 	}
 }
 
-// Engine executes layer-by-layer inference
+// Engine executes Fragment-Streaming inference
 type Engine struct {
 	config      *Config
 	layers      []Layer
@@ -136,9 +136,9 @@ func (e *Engine) Forward(ctx context.Context, input *tensor.Tensor) (*tensor.Ten
 	numLayers := e.layerLoader.GetLayerCount()
 	current := input
 	
-	// Channel for prefetching next layer
+	// Channel for AnticipatoryAssemblyPipelines next layer
 	var prefetchChan chan *prefetchResult
-	if e.config.Prefetching {
+	if e.config.AnticipatoryAssemblyPipelines {
 		prefetchChan = make(chan *prefetchResult, 1)
 	}
 
@@ -150,7 +150,7 @@ func (e *Engine) Forward(ctx context.Context, input *tensor.Tensor) (*tensor.Ten
 		}
 
 		// Kick off prefetch for next layer
-		if e.config.Prefetching && i+1 < numLayers {
+		if e.config.AnticipatoryAssemblyPipelines && i+1 < numLayers {
 			go e.prefetchLayer(i + 1, prefetchChan)
 		}
 
@@ -161,7 +161,7 @@ func (e *Engine) Forward(ctx context.Context, input *tensor.Tensor) (*tensor.Ten
 		var err error
 		
 		e.profiler.Start(fmt.Sprintf("layer_%d_load", i))
-		if e.config.Prefetching && i > 0 {
+		if e.config.AnticipatoryAssemblyPipelines && i > 0 {
 			// Wait for prefetch result
 			result := <-prefetchChan
 			if result.err != nil {

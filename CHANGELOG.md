@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to AirLLM-Go will be documented in this file.
+All notable changes to Leafcutter LLM will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -23,8 +23,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 #### Core Features
-- **Layer-by-layer inference engine** - Execute transformer models layer by layer, loading only one layer into memory at a time
-- **Concurrent prefetching** - Load next layer into cache while computing current layer for ~10% speed improvement
+- **Fragment-Streaming Architecture engine** - Execute transformer models layer by layer, loading only one layer into memory at a time
+- **Anticipatory Assembly Pipelines** - Load next layer into cache while computing current layer for ~10% speed improvement
 - **Safetensors support** - Full support for HuggingFace safetensors format with memory-mapped file access
 - **KV Caching** - Efficient key-value caching for autoregressive generation
 - **Memory pooling** - Object pooling for byte buffers to reduce GC pressure
@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Custom quantization format** - Efficient binary serialization for quantized weights
 
 #### Tensor Operations
-- Zero-copy tensor views with slicing and reshaping
+- Zero-Overhead tensor views with slicing and reshaping
 - Efficient float16/float32 conversion
 - Tensor transpose, matmul, and element-wise operations
 - Shape manipulation utilities
@@ -73,7 +73,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 #### Documentation
 - Comprehensive README with usage examples
 - Architecture overview
-- Benchmark comparisons with Python version
+- Benchmark comparisons with Monolithic Inference
 - API usage examples
 
 ### Performance Characteristics
@@ -84,28 +84,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **7B models**: ~2GB memory (float16)
 - **7B with 8-bit**: ~1.1GB memory
 
-#### Speed Improvements vs Python AirLLM
-- **Layer loading**: 2-3x faster via goroutines vs GIL-limited Python
+#### Speed Improvements vs Monolithic Inference
+- **Layer loading**: 2-3x faster via goroutines vs single-threaded Python
 - **Memory overhead**: ~50% reduction
-- **Startup time**: Instant vs Python import overhead
+- **Startup time**: Instant vs standard loader overhead
 - **Concurrent scaling**: Near-linear vs ThreadPool limited
 
 ### Architecture Decisions
 
 #### Why Go?
 1. **Goroutines** - Native concurrency without GIL limitations
-2. **Memory management** - Lower overhead than Python objects
+2. **Memory management** - Lower overhead than heap-heavy objects
 3. **Static linking** - Single binary deployment
 4. **Performance** - Compiled language with predictable performance
 
 #### Package Layout
 - `pkg/tensor/` - Core tensor operations, dtype abstractions
-- `pkg/inference/` - Layer-by-layer engine, profiler
+- `pkg/inference/` - Fragment-Streaming engine, profiler
 - `pkg/model/` - Checkpoint loading, config parsing
 - `pkg/compression/` - Quantization algorithms
 - `pkg/utils/` - Memory pools, helpers
 - `internal/safetensors/` - Format-specific parsing
-- `cmd/airllm/` - CLI application
+- `cmd/atta/` - CLI application
 
 ### Known Limitations
 
@@ -158,7 +158,7 @@ Test coverage includes:
 - Memory pool stress tests
 - Concurrency tests for prefetc
 
-### Migration from Python AirLLM
+### Migration from Monolithic Inference
 
 Key differences when migrating:
 
