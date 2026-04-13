@@ -117,29 +117,43 @@ Leafcutter LLM supports models using the following architectures:
 | Mixtral-8x7b | 47B | ~8GB | ✅ Working |
 | Qwen-7b | 7B | ~2GB | ✅ Working |
 
-## Architecture
+## Technical Architecture
 
-```
-atta-go/
-├── cmd/atta/          # CLI application
+### 1. Fragment-Streaming (Weight Slicing)
+Unlike monolithic engines that attempt to load an entire 70B parameter model (140GB+ in float16) into VRAM, Leafcutter LLM treats the model as a stream of discrete fragments. 
+- **Layer Isolation**: Each transformer layer is processed as an independent execution unit.
+- **Dynamic Payloading**: Only the active fragment resides in memory. Once the tensor operation is complete, the memory is instantly reclaimed or zeroed for the next payload.
+
+### 2. Anticipatory Assembly Pipelines
+To eliminate the latency penalty of disk-to-CPU/GPU streaming, Leafcutter implements a dual-lane pipeline:
+- **Execution Lane**: The CPU/GPU processes the current fragment.
+- **Assembly Lane**: In the background, a dedicated goroutine anticipates the next required fragment, fetching it from the `safetensors` stream and preparing it for immediate hot-swapping.
+- **Zero-Overhead Payloading**: By using memory-mapped views and zero-copy slicing, the handover between the assembly lane and the execution lane occurs with near-zero latency.
+
+### 3. Tensor Slicing & Weight Fragmentation
+Leafcutter utilizes advanced quantization patterns to further reduce the fragment size:
+- **Block-wise Fragmentation**: Weights are sliced into blocks with independent scale factors, allowing for 4-bit and 8-bit precision without the catastrophic accuracy loss of global quantization.
+- **Normal Float 4 (NF4)**: Optimized for the statistical distribution of model weights, providing the density of 4-bit with the accuracy of 8-bit.
+
+## Project Structure
+
+```bash
+atta/                    # The CLI alias (leafcutter entry point)
 ├── pkg/
-│   ├── tensor/          # Tensor operations (F16/F32, views)
-│   ├── inference/      # Fragment-Streaming engine
-│   ├── model/          # Model loading, checkpoint management
-│   ├── compression/    # 4/8-bit quantization
-│   ├── tokenizer/      # Tokenization (BPE, SentencePiece)
-│   └── utils/          # Memory pools, helpers
-├── internal/
-│   └── safetensors/    # Safetensors format parser
-└── benchmarks/         # Performance benchmarks
+│   ├── tensor/          # Optimized tensor mathematics and Zero-Overhead views
+│   ├── inference/       # The Fragment-Streaming engine
+│   ├── model/           # Multi-architecture loader (Llama, Mistral, Qwen)
+│   ├── compression/     # Tensor Slicing & Weight Fragmentation (4/8-bit)
+│   └── utils/           # Anticipatory buffer pools
+└── internal/
+    └── safetensors/     # Low-level streaming parser for HuggingFace formats
 ```
 
-### Core Design Principles
+## Core Design Principles
 
-1. **Memory-Efficient**: Only one transformer layer in memory at a time
-2. **Concurrent**: Prefetch next layer while computing current
-3. **Zero-Copy**: Tensor views avoid unnecessary allocations
-4. **Portable**: Pure Go with optional CUDA bindings
+1. **Memory-Invariant**: Performance is decoupled from total RAM; if you can fit one fragment, you can run the whole model.
+2. **Asynchronous Handover**: Computation never waits for I/O.
+3. **Hardware Agnostic**: Pure Go implementation with optimized paths for both silicon and copper.
 
 ## API Usage
 
