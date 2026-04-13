@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Marketing Pivot & Rebranding**: Transitioned from AirLLM-Go to **Leafcutter LLM**.
+- **New Identity**: New binary name `atta` (CLI alias) and brand metaphor implementation.
+- **Terminology Upgrade**: Adopted 2026 engineering terms: *Fragment-Streaming*, *Anticipatory Assembly Pipelines*, *Tensor Slicing*, and *Zero-Overhead Payloading*.
+
+### Fixed
+- Fixed build errors in `pkg/tensor` regarding illegal pointer addresses of constants.
+- Resolved variable shadowing in `cmd/atta` that prevented successful compilation.
+- Cleaned up dangling references to unimplemented components.
+
 ### Planned
 - CUDA/CUDNN GPU acceleration support
 - Metal backend for Apple Silicon
