@@ -1,326 +1,131 @@
-# AirLLM-Go
+# AirLLM-Go Server
 
-A high-performance Go reimplementation of AirLLM - run 70B+ parameter language models on limited memory (4GB+).
+A high-performance Go LLM inference server featuring **Speculative Decoding** and **Continuous Batching**, leveraging CGO for native 4-bit quantization math.
 
-![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+![Status](https://img.shields.io/badge/Status-Beta-orange.svg)
 ![Go Version](https://img.shields.io/badge/Go-1.21+-00ADD8.svg)
-![Status](https://img.shields.io/badge/Status-Alpha-orange.svg)
 
 ## Overview
 
-AirLLM-Go is a **ground-up rewrite** of the original AirLLM Python library in Go, designed for maximum performance and minimal memory footprint. By leveraging Go's superior concurrency primitives and memory management, AirLLM-Go can run massive language models on commodity hardware.
+AirLLM-Go has been completely architected for extreme concurrency and throughput. Standard LLM servers suffer from the Python GIL and sequential processing bottlenecks. This engine solves that by combining Go's goroutines with a custom C-based 4-bit math kernel to achieve native hardware speeds without heavy dependencies like PyTorch or llama.cpp.
 
-### Key Features
+### Key Architectural Features
 
-- **70B parameters on 4GB+ RAM** without GPU
-- **Layer-by-layer inference** - only one layer in memory at a time
-- **Concurrent prefetching** - load next layer while computing current
-- **Multiple quantization support** - 4-bit and 8-bit compression
-- **Zero-copy operations** where possible
-- **Cross-platform** - Linux, macOS, Windows
-- **Safetensors support** - HuggingFace format
-- **KV caching** for efficient generation
+1. **Speculative Decoding (Parallel Generation & Verification)**
+   - Runs a fast, small "draft" model to guess future tokens.
+   - Concurrently runs a massive "target" model to verify batches of draft tokens in a single forward pass.
+   - Go Channels seamlessly pipeline the data between the models, providing true multi-core parallelization impossible in Python.
+2. **Continuous Batching (In-Flight Batching)**
+   - Incoming user requests enter a priority FIFO queue.
+   - A background dispatcher groups ready requests into a single hardware batch.
+   - Prevents the "stop-the-world" effect of sequential request processing.
+4. **KV Caching (O(1) Generation)**
+   - Tracks `pastK` and `pastV` tensors across network layers for sequential token generation.
+   - Reduces transformer computational complexity from O(T) to O(1) by avoiding redundant history calculation.
+5. **CGO Native 4-bit Kernel (`qkernel`)**
+   - 4-bit Quantized Matrix Multiplication (GEMM) written in pure C.
+   - Avoids the overhead of pure Go math loops for tensor operations.
+   - Implements in-register nibble unpacking to prevent memory bandwidth bottlenecks.
+   - Strict memory safety boundaries utilizing Go's `runtime.KeepAlive` and C NULL guards.
 
-## Performance Improvements Over Python Version
+## Installation & Setup
 
-| Aspect | Python AirLLM | AirLLM-Go | Improvement |
-|--------|---------------|-----------|-------------|
-| Layer Loading | GIL-limited | Goroutines | ~2-3x faster |
-| Memory Overhead | Python objects | Stack-allocated | ~50% less |
-| Concurrency | ThreadPool | Native goroutines | Near-linear scaling |
-| Tensor Ops | PyTorch overhead | Direct CPU/GPU ops | Lower latency |
-| Startup Time | Import overhead | Static binary | Instant start |
+Because this project utilizes CGO for high-performance math, it is recommended to run it via Docker to isolate the C runtime, or ensure you have `gcc` installed.
 
-## Installation
+### Option 1: Docker (Recommended)
 
-### Prerequisites
-
-- Go 1.21 or later
-- For CUDA support: CUDA toolkit 11.8+
-
-### From Source
+A multi-stage `Dockerfile` is included to build and sandbox the engine safely.
 
 ```bash
-git clone https://github.com/yourusername/airllm-go
+git clone https://github.com/xander/airllm-go.git
 cd airllm-go
-go mod tidy
-go build -o airllm ./cmd/airllm
+
+# Build the container
+docker build -t airllm-server .
+
+# Run the container (mounting your local models directory)
+docker run -p 8080:8080 -v /path/to/local/models:/models airllm-server \
+    --model /models/target-70b \
+    --draft /models/draft-300m \
+    --speculative \
+    --batch-size 8 \
+    --port 8080
 ```
 
-### Using go install
+### Option 2: Build From Source
+
+You must have `gcc` and Go 1.21+ installed.
 
 ```bash
-go install github.com/xander/airllm-go/cmd/airllm@latest
+cd airllm-go
+
+# Build the HTTP inference server
+CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o airllm-server ./cmd/server
+
+# Build the CLI debugging tool
+CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o airllm ./cmd/airllm
 ```
 
-## Quick Start
+## Running the Server
 
-### Basic Usage
+Start the API server with Speculative Decoding enabled:
 
 ```bash
-# Download a model from HuggingFace
-huggingface-cli download meta-llama/Llama-2-7b-hf --local-dir ./models/llama-7b
-
-# Run inference
-./airllm -model ./models/llama-7b -prompt "What is the capital of France?"
+./airllm-server \
+    --model ./models/llama-2-70b \
+    --draft ./models/llama-2-small \
+    --speculative \
+    --batch-size 16 \
+    --queue-depth 512 \
+    --port 8080
 ```
 
-### Interactive Mode
+### Server Endpoints
+
+**1. Generate Text**
+`POST /generate`
 
 ```bash
-./airllm -model ./models/llama-70b -interactive
+curl -X POST http://localhost:8080/generate \
+     -H "Content-Type: application/json" \
+     -d '{
+       "prompt": "The capital of France is",
+       "max_tokens": 50,
+       "temperature": 0.7
+     }'
 ```
 
-### With Quantization
+**2. Health & Metrics**
+`GET /health`
 
 ```bash
-# 4-bit quantization (saves ~75% memory)
-./airllm -model ./models/llama-70b -compression 4bit -prompt "Tell me a story"
-
-# 8-bit quantization (saves ~50% memory)
-./airllm -model ./models/llama-70b -compression 8bit -prompt "Tell me a story"
+curl http://localhost:8080/health
+# Returns queue depth, dropped requests, batch stats
 ```
 
-### Performance Profiling
+## Code Structure
 
-```bash
-./airllm -model ./models/model -profile -prompt "Hello world"
-```
-
-## Command Line Options
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-model` | (required) | Path to model directory |
-| `-prompt` | "What is..." | Input prompt text |
-| `-max-tokens` | 100 | Maximum tokens to generate |
-| `-temperature` | 0.8 | Sampling temperature |
-| `-device` | "cpu" | Device: cpu, cuda |
-| `-threads` | 0 (auto) | Number of CPU threads |
-| `-prefetch` | true | Enable layer prefetching |
-| `-profile` | false | Enable profiling output |
-| `-max-seq-len` | 2048 | Maximum sequence length |
-| `-dtype` | "float16" | Data type: float32, float16 |
-| `-compression` | "" | Compression: 4bit, 8bit |
-| `-interactive` | false | Run in interactive mode |
-
-## Supported Models
-
-AirLLM-Go supports models using the following architectures:
-
-- ✅ **Llama/Llama2/Llama3** - Meta's Llama models
-- ✅ **Mistral/Mixtral** - Mistral AI models
-- ✅ **Qwen** - Alibaba Qwen models
-- ✅ **Baichuan** - Baichuan models
-- ✅ **ChatGLM** - ChatGLM3 and similar
-- ✅ **InternLM** - InternLM models
-
-### Tested Models
-
-| Model | Size | Memory Required | Status |
-|-------|------|-----------------|--------|
-| Llama-2-7b | 7B | ~2GB | ✅ Working |
-| Llama-2-70b | 70B | ~4GB | ✅ Working |
-| Llama-3-8b | 8B | ~2.5GB | ✅ Working |
-| Mistral-7b | 7B | ~2GB | ✅ Working |
-| Mixtral-8x7b | 47B | ~8GB | ✅ Working |
-| Qwen-7b | 7B | ~2GB | ✅ Working |
-
-## Architecture
-
-```
+```text
 airllm-go/
-├── cmd/airllm/          # CLI application
+├── cmd/
+│   ├── airllm/          # Interactive CLI mode
+│   └── server/          # Production HTTP server (Scheduler & API)
 ├── pkg/
-│   ├── tensor/          # Tensor operations (F16/F32, views)
-│   ├── inference/      # Layer-by-layer engine
-│   ├── model/          # Model loading, checkpoint management
-│   ├── compression/    # 4/8-bit quantization
-│   ├── tokenizer/      # Tokenization (BPE, SentencePiece)
-│   └── utils/          # Memory pools, helpers
-├── internal/
-│   └── safetensors/    # Safetensors format parser
-└── benchmarks/         # Performance benchmarks
+│   ├── qkernel/         # CGO 4-bit Matrix Math (qkernel.c, qkernel.go)
+│   ├── inference/       # Tensor layers and SpeculativeEngine (speculative.go)
+│   ├── server/          # Continuous Batching Scheduler (scheduler.go)
+│   ├── tensor/          # Go tensor structs and memory layout
+│   └── model/           # Safetensors weight loading
+└── Dockerfile           # Secure runtime sandbox
 ```
 
-### Core Design Principles
+## Safety Guarantees
 
-1. **Memory-Efficient**: Only one transformer layer in memory at a time
-2. **Concurrent**: Prefetch next layer while computing current
-3. **Zero-Copy**: Tensor views avoid unnecessary allocations
-4. **Portable**: Pure Go with optional CUDA bindings
-
-## API Usage
-
-### As a Library
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "log"
-    
-    "github.com/xander/airllm-go/pkg/inference"
-    "github.com/xander/airllm-go/pkg/model"
-)
-
-func main() {
-    // Load model checkpoint
-    checkpoint, err := model.LoadCheckPoint("./models/llama-7b")
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    // Create inference config
-    cfg := &inference.Config{
-        Device:      "cpu",
-        DType:       tensor.Float16,
-        MaxSeqLen:   2048,
-        Prefetching: true,
-        Profiling:   false,
-    }
-    
-    // Create engine
-    engine := inference.NewEngine(cfg, checkpoint.LayerLoader)
-    defer engine.Release()
-    
-    // Generate text
-    tokens := []int{1, 100, 200, 300} // Tokenized input
-    result, err := engine.Generate(context.Background(), tokens, 50, nil)
-    if err != nil {
-        log.Fatal(err)
-    }
-    
-    fmt.Printf("Generated %d tokens\n", len(result))
-}
-```
-
-## Benchmarks
-
-All benchmarks run on an AMD Ryzen 9 5950X (16 cores), 32GB RAM:
-
-| Model | Mode | Memory | Tokens/sec | PyTorch Speedup |
-|-------|------|--------|------------|-----------------|
-| Llama-2-7B | float16 | 1.8GB | 15.2 | 1.2x |
-| Llama-2-7B | 8-bit | 1.1GB | 22.5 | 1.5x |
-| Llama-2-70B | float16 | 3.8GB | 3.8 | 1.8x |
-| Llama-2-70B | 4-bit | 1.2GB | 11.2 | 2.3x |
-
-## Building
-
-### Standard Build
-
-```bash
-go build -ldflags='-s -w' -o airllm ./cmd/airllm
-```
-
-### Optimized Build
-
-```bash
-# Disable bounds checking for maximum performance
-go build -ldflags='-s -w' -gcflags='-B -C' -o airllm ./cmd/airllm
-```
-
-### With CUDA Support
-
-```bash
-# Requires CUDA toolkit
-go build -tags=cuda -o airllm ./cmd/airllm
-```
-
-## Roadmap
-
-### v1.0 (Current)
-- [x] Core layer-by-layer inference
-- [x] Safetensors format support
-- [x] 4-bit and 8-bit quantization
-- [x] Basic CLI
-- [x] KV caching
-
-### v1.1 (Planned)
-- [ ] GPU (CUDA) acceleration
-- [ ] Metal backend for macOS
-- [ ] Proper BPE tokenization
-- [ ] Streaming generation
-- [ ] Beam search
-
-### v1.2 (Planned)
-- [ ] LoRA adapter support
-- [ ] Multi-GPU support
-- [ ] Speculative decoding
-- [ ] GGUF format support
-
-## Contributing
-
-Contributions are welcome! Areas where help is needed:
-
-1. **Optimized kernels** - SIMD operations for matrix multiply
-2. **CUDA kernels** - GPU acceleration
-3. **More architectures** - Support additional model types
-4. **Better quantization** - SmoothQuant, AWQ, etc.
-5. **Documentation** - Examples, tutorials
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-## Differences from Python AirLLM
-
-| Feature | Python AirLLM | AirLLM-Go |
-|---------|---------------|-----------|
-| Language | Python | Go |
-| Dependencies | PyTorch, Transformers, Accelerate | Standard library + safetensors |
-| Installation | pip install airllm | Single binary |
-| Memory | ~2-3x overhead | Minimal overhead |
-| Concurrency | ThreadPoolLimited | Native goroutines |
-| Startup | Slow (import time) | Instant |
-| Quantization | BitsAndBytes (GPU only) | Native CPU/GPU |
-
-## Troubleshooting
-
-### Out of Memory
-
-If you hit memory limits:
-
-1. Use quantization: `-compression 4bit`
-2. Reduce max sequence length: `-max-seq-len 512`
-3. Close other applications
-
-### Slow Performance
-
-1. Enable prefetching (default): `-prefetch`
-2. Increase threads: `-threads 16`
-3. Use float16 instead of float32: `-dtype float16`
-4. Enable profiling to identify bottlenecks: `-profile`
-
-### Model Loading Errors
-
-1. Ensure model uses safetensors format
-2. Check that config.json exists and is valid
-3. Verify tokenizer files are present
-
-## Acknowledgements
-
-AirLLM-Go is inspired by the original [AirLLM](https://github.com/lyogavin/airllm) by Gavin Li. The layer-by-layer approach was pioneered in that project.
-
-Additional inspirations:
-- [llama.cpp](https://github.com/ggerganov/llama.cpp) - Fast CPU inference
-- [exllama](https://github.com/turboderp/exllama) - Memory-efficient inference
-- [safetensors](https://github.com/huggingface/safetensors) - Safe tensor format
-
-## License
-
-MIT License - see [LICENSE](LICENSE) for details.
+Working with C memory from Go requires strict safety boundaries. AirLLM-Go implements:
+- Slice capacity validation in Go before any pointer crosses the CGO boundary.
+- `runtime.KeepAlive` calls following every C invocation to protect against aggressive Go Garbage Collection.
+- Internal pointer `NULL` guards inside `qkernel.c`.
 
 ## Disclaimer
 
-This is an independent reimplementation for educational and research purposes. Model usage is subject to the original model licenses. Ensure you have proper authorization to use models you download.
-
-## Contact
-
-- Issues: [GitHub Issues](https://github.com/yourusername/airllm-go/issues)
-- Discussions: [GitHub Discussions](https://github.com/yourusername/airllm-go/discussions)
-
----
-
-**AirLLM-Go: Big models, small memory, Go fast.**
+This is a high-performance inference engine built for research and low-level hardware utilization. It expects safetensor formats. While it integrates a real HuggingFace BPE tokenizer, the current version is highly optimized for performance testing rather than robust edge-case validation.

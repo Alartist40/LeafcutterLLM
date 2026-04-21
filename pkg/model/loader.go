@@ -275,6 +275,15 @@ func (l *LayerLoader) ClearCache() {
 	l.cache = make(map[string]map[string]*tensor.Tensor)
 }
 
+// Tokenizer is a placeholder for future BPE/SentencePiece tokenizer support.
+// The full implementation is out of scope for the Go rewrite; use a proper
+// tokenizer library (e.g. tiktoken-go) for production use.
+type Tokenizer struct {
+	VocabSize int
+	// ModelPath is the path to the tokenizer.json / tokenizer.model file.
+	ModelPath string
+}
+
 // CheckPoint represents a loaded model checkpoint
 type CheckPoint struct {
 	Config       *Config

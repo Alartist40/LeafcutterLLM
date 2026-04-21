@@ -2,6 +2,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -154,7 +155,6 @@ func runInteractive(ctx context.Context) {
 	fmt.Println(versionStr)
 	fmt.Println("Loading model...")
 
-	// Load checkpoint
 	checkpoint, err := model.LoadCheckPoint(*modelPath)
 	if err != nil {
 		log.Fatalf("Failed to load checkpoint: %v", err)
@@ -163,14 +163,13 @@ func runInteractive(ctx context.Context) {
 	fmt.Printf("Model: %s\n", checkpoint.Architecture)
 	fmt.Printf("Type 'quit' or 'exit' to stop\n\n")
 
-	// Build config
 	cfg := buildConfig()
-
-	// Create inference engine
 	engine := inference.NewEngine(cfg, checkpoint.LayerLoader)
 	defer engine.Release()
 
-	// Interactive loop
+	// FIX: use bufio.Scanner so multi-word prompts aren't truncated.
+	scanner := bufio.NewScanner(os.Stdin)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -179,28 +178,28 @@ func runInteractive(ctx context.Context) {
 		}
 
 		fmt.Print("> ")
-		
-		// Read user input
-		var input string
-		if _, err := fmt.Scanln(&input); err != nil {
+
+		if !scanner.Scan() {
+			// EOF or error
 			fmt.Println()
+			return
+		}
+		input := strings.TrimSpace(scanner.Text())
+		if input == "" {
 			continue
 		}
 
-		if strings.ToLower(input) == "quit" || strings.ToLower(input) == "exit" {
+		if strings.EqualFold(input, "quit") || strings.EqualFold(input, "exit") {
 			fmt.Println("Goodbye!")
 			return
 		}
 
-		// Tokenize and generate
 		tokens := tokenizeSimple(input)
-		
+
 		fmt.Print("Assistant: ")
 		start := time.Now()
 
 		result, err := engine.Generate(ctx, tokens, *maxTokens, func(token int) {
-			// In a real implementation, would detokenize here
-			// For now, just print token ID
 			if token < 256 {
 				fmt.Printf("%c", rune(token))
 			}
@@ -216,19 +215,19 @@ func runInteractive(ctx context.Context) {
 }
 
 func buildConfig() *inference.Config {
-	var dtype tensor.DType
+	var dt tensor.DType
 	switch *dtype {
 	case "float32":
-		dtype = tensor.Float32
+		dt = tensor.Float32
 	case "float16":
-		dtype = tensor.Float16
+		dt = tensor.Float16
 	default:
-		dtype = tensor.Float16
+		dt = tensor.Float16
 	}
 
 	return &inference.Config{
 		Device:         *device,
-		DType:          dtype,
+		DType:          dt,
 		MaxSeqLen:      *maxSeqLen,
 		NumThreads:     *numThreads,
 		Prefetching:    *prefetching,
