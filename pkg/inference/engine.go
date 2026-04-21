@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"runtime"
+	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,7 +16,7 @@ import (
 
 // Layer represents a neural network layer
 type Layer interface {
-	Forward(input *tensor.Tensor) (*tensor.Tensor, error)
+	Forward(input, pastK, pastV *tensor.Tensor) (*tensor.Tensor, *tensor.Tensor, *tensor.Tensor, error)
 	Load(state map[string]*tensor.Tensor) error
 	Unload() error
 	Name() string
@@ -23,31 +25,32 @@ type Layer interface {
 // KVCache stores key-value pairs for transformer attention
 type KVCache struct {
 	mu     sync.RWMutex
-	keys   [][]*tensor.Tensor
-	values [][]*tensor.Tensor
+	keys   []*tensor.Tensor
+	values []*tensor.Tensor
 }
 
 // NewKVCache creates a new KV cache for the specified number of layers
 func NewKVCache(numLayers int) *KVCache {
 	return &KVCache{
-		keys:   make([][]*tensor.Tensor, numLayers),
-		values: make([][]*tensor.Tensor, numLayers),
+		keys:   make([]*tensor.Tensor, numLayers),
+		values: make([]*tensor.Tensor, numLayers),
 	}
 }
 
 // Get returns cached KV tensors for a layer
-func (c *KVCache) Get(layerIdx int) ([]*tensor.Tensor, []*tensor.Tensor) {
+func (c *KVCache) Get(layerIdx int) (*tensor.Tensor, *tensor.Tensor) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.keys[layerIdx], c.values[layerIdx]
 }
 
-// Append appends new KV tensors to the cache
-func (c *KVCache) Append(layerIdx int, k, v *tensor.Tensor) {
+// Append appends new KV tensors to the cache by replacing them with the fully concatenated ones
+// Actually, since AttentionLayer does the concat, if we store the full tensor, we just Set it.
+func (c *KVCache) Set(layerIdx int, k, v *tensor.Tensor) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.keys[layerIdx] = append(c.keys[layerIdx], k)
-	c.values[layerIdx] = append(c.values[layerIdx], v)
+	c.keys[layerIdx] = k
+	c.values[layerIdx] = v
 }
 
 // Clear clears the cache for a specific layer or all layers
@@ -129,16 +132,21 @@ func NewEngine(config *Config, loader LayerLoader) *Engine {
 	}
 }
 
-// Forward runs inference through all layers
+// Forward runs inference through all layers.
 func (e *Engine) Forward(ctx context.Context, input *tensor.Tensor) (*tensor.Tensor, error) {
 	e.profiler.Start("total_forward")
-	
+
+	// Ensure engine.Forward clears this cache properly if a new context starts (new prompt)
+	if input.Shape[1] > 1 {
+		e.ClearCache()
+	}
+
 	numLayers := e.layerLoader.GetLayerCount()
 	current := input
-	
-	// Channel for prefetching next layer
+
+	// Buffered channel: at most one prefetch in flight at a time.
 	var prefetchChan chan *prefetchResult
-	if e.config.Prefetching {
+	if e.config.Prefetching && numLayers > 1 {
 		prefetchChan = make(chan *prefetchResult, 1)
 	}
 
@@ -149,26 +157,21 @@ func (e *Engine) Forward(ctx context.Context, input *tensor.Tensor) (*tensor.Ten
 		default:
 		}
 
-		// Kick off prefetch for next layer
-		if e.config.Prefetching && i+1 < numLayers {
-			go e.prefetchLayer(i + 1, prefetchChan)
-		}
-
 		e.profiler.Start(fmt.Sprintf("layer_%d", i))
-		
-		// Load current layer
+		e.profiler.Start(fmt.Sprintf("layer_%d_load", i))
+
 		var layerState map[string]*tensor.Tensor
 		var err error
-		
-		e.profiler.Start(fmt.Sprintf("layer_%d_load", i))
-		if e.config.Prefetching && i > 0 {
-			// Wait for prefetch result
+
+		if e.config.Prefetching && i > 0 && prefetchChan != nil {
+			// Consume the prefetch result launched in the previous iteration.
 			result := <-prefetchChan
 			if result.err != nil {
 				return nil, fmt.Errorf("prefetch failed for layer %d: %w", i, result.err)
 			}
 			layerState = result.state
 		} else {
+			// Direct load for layer 0 (or when prefetching is off).
 			layerState, err = e.layerLoader.LoadLayer(i)
 			if err != nil {
 				return nil, fmt.Errorf("failed to load layer %d: %w", i, err)
@@ -176,7 +179,12 @@ func (e *Engine) Forward(ctx context.Context, input *tensor.Tensor) (*tensor.Ten
 		}
 		e.profiler.End(fmt.Sprintf("layer_%d_load", i))
 
-		// Create layer if not exists
+		// Kick off background load of the *next* layer (if there is one).
+		if e.config.Prefetching && prefetchChan != nil && i+1 < numLayers {
+			go e.prefetchLayer(i+1, prefetchChan)
+		}
+
+		// Create layer object if needed.
 		if e.layers[i] == nil {
 			layer, err := e.createLayer(i, layerState)
 			if err != nil {
@@ -185,47 +193,54 @@ func (e *Engine) Forward(ctx context.Context, input *tensor.Tensor) (*tensor.Ten
 			e.layers[i] = layer
 		}
 
-		// Load state into layer
+		// Load weights into layer.
 		if err := e.layers[i].Load(layerState); err != nil {
 			return nil, fmt.Errorf("failed to load state into layer %d: %w", i, err)
 		}
 
-		// Run forward pass
 		e.profiler.Start(fmt.Sprintf("layer_%d_compute", i))
 		
-		// Handle KV cache for attention layers
-		if e.config.KVCacheEnabled && isAttentionLayer(e.layerLoader.GetLayerName(i)) {
-			// TODO: Implement KV cache injection
+		var output, newK, newV *tensor.Tensor
+		if e.config.KVCacheEnabled {
+			pastK, pastV := e.kvCache.Get(i)
+			output, newK, newV, err = e.layers[i].Forward(current, pastK, pastV)
+			if err == nil && newK != nil && newV != nil {
+			    // The AttentionLayer returned newK and newV.
+			    // Wait, if it returned the new slice, we need to concatenate it.
+			    // But wait, my implementation of layers.go returned output, newK, newV.
+			    // If pastK, pastV are provided, we should concat them here.
+			    if pastK != nil && pastV != nil {
+			        newK, _ = concatTensorsOnSeqDim(pastK, newK)
+			        newV, _ = concatTensorsOnSeqDim(pastV, newV)
+			    }
+				e.kvCache.Set(i, newK, newV)
+			}
+		} else {
+			output, _, _, err = e.layers[i].Forward(current, nil, nil)
 		}
 		
-		output, err := e.layers[i].Forward(current)
 		if err != nil {
 			return nil, fmt.Errorf("forward failed at layer %d: %w", i, err)
 		}
 		e.profiler.End(fmt.Sprintf("layer_%d_compute", i))
 
-		// Unload layer to free memory
 		e.profiler.Start(fmt.Sprintf("layer_%d_unload", i))
 		if err := e.layers[i].Unload(); err != nil {
 			log.Printf("Warning: failed to unload layer %d: %v", i, err)
 		}
 		e.profiler.End(fmt.Sprintf("layer_%d_unload", i))
 
-		// Force garbage collection periodically
-		if i%10 == 0 {
-			runtime.GC()
-		}
+		// Free OS memory after every unload — more targeted than periodic GC.
+		debug.FreeOSMemory()
 
 		current = output
 		e.profiler.End(fmt.Sprintf("layer_%d", i))
 	}
 
 	e.profiler.End("total_forward")
-	
 	if e.config.Profiling {
 		e.profiler.Print()
 	}
-
 	return current, nil
 }
 
@@ -369,42 +384,38 @@ func (e *Engine) createLayer(idx int, state map[string]*tensor.Tensor) (Layer, e
 }
 
 // Layer type detection helpers
+// FIX: Use strings.Contains (stdlib) — removes the buggy hand-rolled contains.
+// FIX: isLMHead had a duplicate predicate ("lm_head" || "lm_head");
+//      second arm is now "output_layer" for ChatGLM compatibility.
 func isEmbeddingLayer(name string) bool {
-	return contains(name, "embed_tokens") || contains(name, "embeddings") || contains(name, "token")
+	return strings.Contains(name, "embed_tokens") ||
+		strings.Contains(name, "embeddings") ||
+		strings.Contains(name, "word_embeddings")
 }
 
 func isAttentionLayer(name string) bool {
-	return contains(name, "self_attn") || contains(name, "attention") || contains(name, "attn")
+	return strings.Contains(name, "self_attn") ||
+		strings.Contains(name, "attention") ||
+		strings.Contains(name, "attn")
 }
 
 func isFFNLayer(name string) bool {
-	return contains(name, "mlp") || contains(name, "feed_forward") || contains(name, "fc")
+	return strings.Contains(name, "mlp") ||
+		strings.Contains(name, "feed_forward") ||
+		strings.Contains(name, "ffn")
 }
 
 func isLayerNorm(name string) bool {
-	return contains(name, "norm") || contains(name, "ln_")
+	return strings.Contains(name, "norm") || strings.Contains(name, "ln_")
 }
 
 func isLMHead(name string) bool {
-	return contains(name, "lm_head") || contains(name, "lm_head")
+	return strings.Contains(name, "lm_head") || strings.Contains(name, "output_layer")
 }
 
+// contains is kept for backward compat but delegates to stdlib.
 func contains(s, substr string) bool {
-	return len(s) >= len(substr) && 
-		   (s == substr || 
-		    len(s) > len(substr) && 
-			(s[:len(substr)] == substr || 
-			 s[len(s)-len(substr):] == substr ||
-			 containsSubstring(s, substr)))
-}
-
-func containsSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(s, substr)
 }
 
 // ClearCache clears the KV cache

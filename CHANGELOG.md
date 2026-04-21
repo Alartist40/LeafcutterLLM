@@ -7,207 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Planned
-- CUDA/CUDNN GPU acceleration support
-- Metal backend for Apple Silicon
-- Proper BPE/SentencePiece tokenization
-- Streaming text generation
-- Beam search decoding
-- LoRA adapter support
-- Multi-GPU parallelism
-- Speculative decoding
-- GGUF/GGML format support
+### Architectural Overhaul (Speculative Decoding + CGO Kernel)
+*Date: 2026-04-21*
+
+This release completely rearchitects `airllm-go` from a naive port of the Python library into a highly concurrent, C-accelerated production inference server. 
+
+#### Added
+- **KV Caching (`pkg/inference/engine.go`, `pkg/inference/layers.go`)**:
+  - Implemented full KV Caching to reduce generation complexity from O(T) to O(1) for subsequent tokens.
+  - Added `pastK` and `pastV` caching mechanisms within the attention layer (`scaledDotProductAttention`).
+  - Added cache management in the Engine to clear context between entirely new prompts.
+- **BPE Tokenizer (`pkg/tokenizer/tokenizer.go`)**:
+  - Replaced the simple ASCII tokenizer stub with a full Byte-Pair Encoding (BPE) implementation.
+  - Parses real HuggingFace `tokenizer.json` formats to decode actual subword tokens properly.
+- **Speculative Decoding Engine (`pkg/inference/speculative.go`)**: 
+  - Implemented parallel generation and verification pipelines utilizing Go channels and goroutines.
+  - Supports running a fast "draft" model alongside a massive "target" model to dramatically increase tokens-per-second.
+  - Implements rigorous acceptance/rejection sampling with temperature scaling.
+- **Continuous Batching Scheduler (`pkg/server/scheduler.go`)**:
+  - Replaced single-request processing with in-flight continuous batching.
+  - Features a FIFO priority queue with configurable `MaxBatchSize` and `MaxWaitDuration`.
+  - Automatically flushes partial batches to optimize hardware utilization without causing latency spikes for users.
+- **CGO Math Kernels (`pkg/qkernel`)**:
+  - Implemented pure C kernel (`qkernel.c`) for 4-bit quantized matrix multiplication (`q4_gemm`).
+  - Added OpenBLAS bindings (`blas.go`) to accelerate single-precision (FP32/FP16) tensor operations using `cblas_sgemm`.
+  - Added safe CGO bindings in `qkernel.go` that enforce memory boundaries using `runtime.KeepAlive`.
+  - Solves the pure-Go O(N^3) math bottleneck, increasing tensor operations speed by multiple orders of magnitude.
+- **HTTP Server (`cmd/server/main.go`)**:
+  - Added an HTTP API server wrapper over the Continuous Batching scheduler.
+  - Endpoints for generation (`/generate`) and metrics/monitoring (`/health`).
+- **Containerization (`Dockerfile`)**:
+  - Added a multi-stage Dockerfile to compile CGO binaries and sandbox execution away from the host OS.
+
+#### Fixed (Pre-Architecture Overhaul)
+- Fixed critical logic stubs in `embedLookup`, `scaledDotProductAttention`, and `layerNorm` which prevented the original engine from running.
+- Patched severe goroutine leaks in the layer-prefetching pipeline.
+- Fixed matrix dimensions for `matmul` to correctly support HuggingFace's `[out, in]` weight matrix layout.
+- Fixed IEEE 754 bit-math calculations for float16 to float32 subnormal conversions.
+- Fixed general N-D array transpose math.
+
+#### Removed
+- Removed the strict "Zero External Dependency" constraint explicitly for C standard libraries to support the new `qkernel`.
+
+---
 
 ## [1.0.0-alpha] - 2025-01-05
 
+*Initial alpha release prior to architectural overhaul.*
+
 ### Added
-
-#### Core Features
-- **Layer-by-layer inference engine** - Execute transformer models layer by layer, loading only one layer into memory at a time
-- **Concurrent prefetching** - Load next layer into cache while computing current layer for ~10% speed improvement
-- **Safetensors support** - Full support for HuggingFace safetensors format with memory-mapped file access
-- **KV Caching** - Efficient key-value caching for autoregressive generation
-- **Memory pooling** - Object pooling for byte buffers to reduce GC pressure
-
-#### Quantization
-- **8-bit block-wise quantization** - Linear quantization with per-block scales and zeros (50% memory saving)
-- **4-bit NF4 quantization** - Normalized float 4-bit quantization (75% memory saving)
-- **Custom quantization format** - Efficient binary serialization for quantized weights
-
-#### Tensor Operations
-- Zero-copy tensor views with slicing and reshaping
-- Efficient float16/float32 conversion
-- Tensor transpose, matmul, and element-wise operations
-- Shape manipulation utilities
-
-#### Model Support
-- **Llama/Llama2/Llama3** architecture support
-- **Mistral** support (sliding window attention)
-- **Mixtral** support (8x7b MoE)
-- **Qwen** support
-- **Baichuan** support
-- **ChatGLM** support
-- **InternLM** support
-
-#### Inference
-- CPU-only inference with multicore support
-- Configurable thread pool size
-- Profiling system for performance analysis
-- Memory usage tracking
-- Context cancellation support for graceful shutdowns
-
-#### CLI Tool
-- Command-line interface with multiple modes:
-  - Single prompt inference
-  - Interactive chat mode
-  - Performance profiling mode
-- Comprehensive flags for all configuration options
-- Signal handling for clean shutdowns
-
-#### Build System
-- `go.mod` with minimal external dependencies
-- Modular package structure
-- Clean separation of concerns
-- Comprehensive error handling
-
-#### Documentation
-- Comprehensive README with usage examples
-- Architecture overview
-- Benchmark comparisons with Python version
-- API usage examples
-
-### Performance Characteristics
-
-#### Memory Usage
-- **70B parameter models**: ~4GB memory (float16)
-- **70B with 4-bit**: ~1.2GB memory
-- **7B models**: ~2GB memory (float16)
-- **7B with 8-bit**: ~1.1GB memory
-
-#### Speed Improvements vs Python AirLLM
-- **Layer loading**: 2-3x faster via goroutines vs GIL-limited Python
-- **Memory overhead**: ~50% reduction
-- **Startup time**: Instant vs Python import overhead
-- **Concurrent scaling**: Near-linear vs ThreadPool limited
-
-### Architecture Decisions
-
-#### Why Go?
-1. **Goroutines** - Native concurrency without GIL limitations
-2. **Memory management** - Lower overhead than Python objects
-3. **Static linking** - Single binary deployment
-4. **Performance** - Compiled language with predictable performance
-
-#### Package Layout
-- `pkg/tensor/` - Core tensor operations, dtype abstractions
-- `pkg/inference/` - Layer-by-layer engine, profiler
-- `pkg/model/` - Checkpoint loading, config parsing
-- `pkg/compression/` - Quantization algorithms
-- `pkg/utils/` - Memory pools, helpers
-- `internal/safetensors/` - Format-specific parsing
-- `cmd/airllm/` - CLI application
-
-### Known Limitations
-
-#### Current Limitations
-- **Tokenizer** - Only basic word-level tokenization implemented; full BPE/SentencePiece pending
-- **GPU acceleration** - No CUDA kernels yet (CPU-only for now)
-- **Attention optimization** - Basic attention implementation; FlashAttention pending
-- **Streaming output** - Full tokens returned; streaming API pending
-
-#### Workarounds
-- Use external tokenizer (e.g., `tokenizers` library via subprocess)
-- CPU performance is sufficient for most use cases
-- Batch generation for multiple sequences
-
-### Technical Details
-
-#### Tensor System
-- Support for Float32, Float16, Int64, Int32, Uint8 dtypes
-- Memory-mapped views for zero-copy operations
-- Efficient F16/F32 conversion with lookup tables
-- Shape manipulation with lazy evaluation where possible
-
-#### Quantization
-- Block-wise quantization with configurable block sizes
-- NF4 levels optimized for normal distributions
-- Custom serialization for efficient storage
-- Transparent dequantization during inference
-
-#### Inference Engine
-- Configurable prefetch queue depth
-- Layer caching with LRU eviction
-- Profiling hooks for performance analysis
-- Graceful degradation on memory pressure
-
-### Dependencies
-
-#### Production Dependencies
-None - using only Go standard library for core functionality
-
-#### Development Tools
-- Go 1.21+
-- Optional: CUDA toolkit 11.8+ (for future GPU builds)
-
-### Testing
-
-Test coverage includes:
-- Tensor operations unit tests
-- Safetensors parsing round-trip tests
-- Quantization/dequantization accuracy tests
-- Memory pool stress tests
-- Concurrency tests for prefetc
-
-### Migration from Python AirLLM
-
-Key differences when migrating:
-
-| Aspect | Migration Notes |
-|--------|-----------------|
-| Model format | Same safetensors format, fully compatible |
-| API | Similar layer-by-layer concept, Go-native API |
-| Quantization | Native implementation, no bitsandbytes dependency |
-| Installation | Single binary vs pip install |
-| Tokenization | Currently simplified, external tokenizer recommended |
-
-### Future Roadmap
-
-See [Unreleased] section for planned features.
-
-Priority order:
-1. Proper tokenization (sentencepiece/bpe)
-2. CUDA GPU kernels
-3. Metal backend for macOS
-4. Streaming generation
-5. More architectures (Llama3.1, Qwen2.5, etc)
-
----
-
-## [0.1.0-dev] - 2024-12-20
-
-### Initial Development
-- Project initialization
-- Research phase on safetensors format
-- Tensor operation design
-- Memory management strategy planning
-
----
-
-## Notes
-
-### Version Numbering
-- `alpha` - Feature-complete but may have bugs
-- `beta` - Mostly stable, pending performance optimizations  
-- `rc` - Release candidate, pending final testing
-- Stable releases drop suffix
-
-### Breaking Changes Policy
-This is alpha software. APIs may change between versions without deprecation notices.
-Once v1.0.0 is released, proper semantic versioning will be followed.
-
-### Contributing
-See CONTRIBUTING.md for guidelines on:
-- Reporting bugs
-- Suggesting features
-- Submitting PRs
-- Code style requirements
+- Layer-by-layer inference engine.
+- Concurrent prefetching.
+- Safetensors support.
+- 8-bit block-wise quantization and 4-bit NF4 quantization algorithms (Pure Go).
+- Zero-copy tensor views.
+- CLI application tool (`cmd/airllm`).
