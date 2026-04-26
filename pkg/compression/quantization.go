@@ -9,7 +9,7 @@ import (
 	"github.com/Alartist40/LeafcutterLLM/pkg/tensor"
 )
 
-// QuantType represents quantization types
+// QuantType represents TensorSlicingWeightFragmentation types
 type QuantType int
 
 const (
@@ -26,18 +26,18 @@ type QuantizedTensor struct {
 	Scales    []float32 // Per-block scales
 	Zeros     []float32 // Per-block zeros (for symmetric, these are 0)
 	Shape     []int     // Original shape
-	BlockSize int       // Size of quantization blocks
+	BlockSize int       // Size of TensorSlicingWeightFragmentation blocks
 	QuantType QuantType
 	NumBits   int
 }
 
-// Quantize8Bit performs block-wise 8-bit quantization
+// Quantize8Bit performs block-wise 8-bit TensorSlicingWeightFragmentation
 func Quantize8Bit(t *tensor.Tensor, blockSize int) (*QuantizedTensor, error) {
 	if blockSize <= 0 {
 		blockSize = 256 // Default block size
 	}
 
-	// Convert to float32 for quantization
+	// Convert to float32 for TensorSlicingWeightFragmentation
 	tF32 := t.ToFloat32()
 	size := tF32.Size()
 
@@ -96,7 +96,7 @@ func Quantize8Bit(t *tensor.Tensor, blockSize int) (*QuantizedTensor, error) {
 	return qt, nil
 }
 
-// Quantize4Bit performs block-wise 4-bit quantization (NF4-like)
+// Quantize4Bit performs block-wise 4-bit TensorSlicingWeightFragmentation (NF4-like)
 func Quantize4Bit(t *tensor.Tensor, blockSize int) (*QuantizedTensor, error) {
 	if blockSize <= 0 {
 		blockSize = 64
@@ -119,7 +119,7 @@ func Quantize4Bit(t *tensor.Tensor, blockSize int) (*QuantizedTensor, error) {
 	}
 	copy(qt.Shape, t.Shape)
 
-	// NF4 quantization levels (normalized float 4-bit)
+	// NF4 TensorSlicingWeightFragmentation levels (normalized float 4-bit)
 	// These approximate a normal distribution
 	nf4Values := []float32{-1.0, -0.6961928, -0.5250731, -0.3949175, -0.2844414,
 		-0.1847734, -0.09105004, 0.0, 0.0795803, 0.1609302, 0.2461123, 0.3379152,
@@ -181,7 +181,7 @@ func (qt *QuantizedTensor) Dequantize() (*tensor.Tensor, error) {
 	case Quant4Bit:
 		return qt.dequantize4Bit()
 	default:
-		return nil, fmt.Errorf("unsupported quantization type")
+		return nil, fmt.Errorf("unsupported TensorSlicingWeightFragmentation type")
 	}
 }
 
@@ -287,7 +287,7 @@ func CompressLayer(name string, state map[string]*tensor.Tensor, quantType Quant
 		case Quant4Bit:
 			qt, err = Quantize4Bit(tensor, blockSize)
 		default:
-			continue // Skip unknown quantization
+			continue // Skip unknown TensorSlicingWeightFragmentation
 		}
 
 		if err != nil {
