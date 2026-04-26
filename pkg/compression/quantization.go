@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"math"
 
-	"github.com/xander/airllm-go/pkg/tensor"
+	"github.com/Alartist40/LeafcutterLLM/pkg/tensor"
 )
 
 // QuantType represents quantization types
