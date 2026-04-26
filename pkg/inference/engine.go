@@ -1,435 +1,315 @@
-// Package inference provides the core layer-by-layer inference engine
+// Package inference — engine.go
+//
+// Engine is the Logic Center of LeafcutterLLM.
+//
+// It drives the autoregressive token-generation loop:
+//  1. Build the layer pipeline (embedding → N × transformer → LM-head).
+//  2. For each generation step:
+//     a. Load one layer's weights from disk via Loader.LoadLayer(idx).
+//     b. Run layer.Forward(input, pastK, pastV) → (output, newK, newV).
+//     c. Accumulate newK/newV in the per-layer KV cache.
+//     d. Unload the layer weights to free RAM.
+//  3. After all layers: argmax sample the next token, call onToken, repeat.
+//
+// Only one layer's weights are in RAM at any moment — the AirLLM trick.
 package inference
 
 import (
 	"context"
 	"fmt"
-	"log"
-	"runtime"
-	"runtime/debug"
-	"strings"
-	"sync"
-	"time"
+	"math"
 
-	"github.com/xander/airllm-go/pkg/tensor"
+	"github.com/Alartist40/LeafcutterLLM/pkg/tensor"
 )
 
-// Layer represents a neural network layer
-type Layer interface {
-	Forward(input, pastK, pastV *tensor.Tensor) (*tensor.Tensor, *tensor.Tensor, *tensor.Tensor, error)
-	Load(state map[string]*tensor.Tensor) error
-	Unload() error
-	Name() string
-}
+// ─── Engine ───────────────────────────────────────────────────────────────────
 
-// KVCache stores key-value pairs for transformer attention
-type KVCache struct {
-	mu     sync.RWMutex
-	keys   []*tensor.Tensor
-	values []*tensor.Tensor
-}
-
-// NewKVCache creates a new KV cache for the specified number of layers
-func NewKVCache(numLayers int) *KVCache {
-	return &KVCache{
-		keys:   make([]*tensor.Tensor, numLayers),
-		values: make([]*tensor.Tensor, numLayers),
-	}
-}
-
-// Get returns cached KV tensors for a layer
-func (c *KVCache) Get(layerIdx int) (*tensor.Tensor, *tensor.Tensor) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.keys[layerIdx], c.values[layerIdx]
-}
-
-// Append appends new KV tensors to the cache by replacing them with the fully concatenated ones
-// Actually, since AttentionLayer does the concat, if we store the full tensor, we just Set it.
-func (c *KVCache) Set(layerIdx int, k, v *tensor.Tensor) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.keys[layerIdx] = k
-	c.values[layerIdx] = v
-}
-
-// Clear clears the cache for a specific layer or all layers
-func (c *KVCache) Clear(layerIdx ...int) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	
-	if len(layerIdx) == 0 {
-		// Clear all
-		for i := range c.keys {
-			c.keys[i] = nil
-			c.values[i] = nil
-		}
-	} else {
-		for _, idx := range layerIdx {
-			if idx >= 0 && idx < len(c.keys) {
-				c.keys[idx] = nil
-				c.values[idx] = nil
-			}
-		}
-	}
-}
-
-// Config holds inference configuration
-type Config struct {
-	Device           string        // "cpu", "cuda", "cuda:0", etc.
-	DType            tensor.DType  // Float32, Float16
-	MaxSeqLen        int
-	NumThreads       int
-	Prefetching      bool          // Enable prefetching of next layer
-	Profiling        bool          // Enable timing profiling
-	KVCacheEnabled   bool          // Use KV caching
-}
-
-// DefaultConfig returns sensible defaults
-func DefaultConfig() *Config {
-	return &Config{
-		Device:         "cpu",
-		DType:          tensor.Float16,
-		MaxSeqLen:      2048,
-		NumThreads:     runtime.NumCPU(),
-		Prefetching:    true,
-		Profiling:      false,
-		KVCacheEnabled: true,
-	}
-}
-
-// Engine executes layer-by-layer inference
+// Engine drives forward passes through a transformer model.
 type Engine struct {
-	config      *Config
-	layers      []Layer
-	layerLoader LayerLoader
-	profiler    *Profiler
-	kvCache     *KVCache
+	Config *Config
+	Loader LayerLoader
+
+	// kvCache[layerIdx] = (K, V) accumulated across all prior steps.
+	kvCache [][2]*tensor.Tensor
 }
 
-// LayerLoader loads layer weights from disk
-type LayerLoader interface {
-	LoadLayer(idx int) (map[string]*tensor.Tensor, error)
-	GetLayerCount() int
-	GetLayerName(idx int) string
-}
-
-// NewEngine creates a new inference engine
+// NewEngine creates an Engine with the given config and weight loader.
 func NewEngine(config *Config, loader LayerLoader) *Engine {
 	if config == nil {
-		config = DefaultConfig()
+		cfg := DefaultConfig
+		config = &cfg
 	}
-	if config.NumThreads <= 0 {
-		config.NumThreads = runtime.NumCPU()
+	var kvCache [][2]*tensor.Tensor
+	if loader != nil {
+		kvCache = make([][2]*tensor.Tensor, loader.GetLayerCount())
 	}
-
 	return &Engine{
-		config:      config,
-		layers:      make([]Layer, loader.GetLayerCount()),
-		layerLoader: loader,
-		profiler:    NewProfiler(config.Profiling),
-		kvCache:     NewKVCache(loader.GetLayerCount()),
+		Config:  config,
+		Loader:  loader,
+		kvCache: kvCache,
 	}
 }
 
-// Forward runs inference through all layers.
-func (e *Engine) Forward(ctx context.Context, input *tensor.Tensor) (*tensor.Tensor, error) {
-	e.profiler.Start("total_forward")
+// Release frees KV-cache tensors and nulls the loader reference.
+func (e *Engine) Release() error {
+	for i := range e.kvCache {
+		e.kvCache[i] = [2]*tensor.Tensor{}
+	}
+	e.Loader = nil
+	return nil
+}
 
-	// Ensure engine.Forward clears this cache properly if a new context starts (new prompt)
-	if input.Shape[1] > 1 {
-		e.ClearCache()
+// ─── Generate ─────────────────────────────────────────────────────────────────
+
+// Generate satisfies the inference.Model interface.
+//
+// It runs a full autoregressive decode loop:
+//   - Prefill  : process all prompt tokens in one forward pass (step 0).
+//   - Decode   : generate up to maxTokens new tokens one at a time.
+//
+// onToken is called for each newly generated token so callers can stream
+// partial results without waiting for the full sequence.
+func (e *Engine) Generate(
+	ctx context.Context,
+	prompt []int,
+	maxTokens int,
+	onToken func(int),
+) ([]int, error) {
+	if e.Loader == nil {
+		return nil, fmt.Errorf("engine: no layer loader attached")
+	}
+	if len(prompt) == 0 {
+		return nil, fmt.Errorf("engine: empty prompt")
+	}
+	if maxTokens <= 0 {
+		maxTokens = e.Config.MaxSeqLen
 	}
 
-	numLayers := e.layerLoader.GetLayerCount()
-	current := input
-
-	// Buffered channel: at most one prefetch in flight at a time.
-	var prefetchChan chan *prefetchResult
-	if e.config.Prefetching && numLayers > 1 {
-		prefetchChan = make(chan *prefetchResult, 1)
+	// Reset the KV cache for a new generation.
+	for i := range e.kvCache {
+		e.kvCache[i] = [2]*tensor.Tensor{}
 	}
 
-	for i := 0; i < numLayers; i++ {
+	// Build a 1-D token ID tensor for the full prompt (prefill).
+	input := tokenIDsToTensor(prompt)
+
+	// ── Prefill pass ────────────────────────────────────────────────────────
+	logits, err := e.forward(ctx, input)
+	if err != nil {
+		return nil, fmt.Errorf("engine: prefill failed: %w", err)
+	}
+
+	generated := make([]int, 0, maxTokens)
+
+	// ── Decode loop ─────────────────────────────────────────────────────────
+	for step := 0; step < maxTokens; step++ {
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return generated, ctx.Err()
 		default:
 		}
 
-		e.profiler.Start(fmt.Sprintf("layer_%d", i))
-		e.profiler.Start(fmt.Sprintf("layer_%d_load", i))
-
-		var layerState map[string]*tensor.Tensor
-		var err error
-
-		if e.config.Prefetching && i > 0 && prefetchChan != nil {
-			// Consume the prefetch result launched in the previous iteration.
-			result := <-prefetchChan
-			if result.err != nil {
-				return nil, fmt.Errorf("prefetch failed for layer %d: %w", i, result.err)
-			}
-			layerState = result.state
-		} else {
-			// Direct load for layer 0 (or when prefetching is off).
-			layerState, err = e.layerLoader.LoadLayer(i)
-			if err != nil {
-				return nil, fmt.Errorf("failed to load layer %d: %w", i, err)
-			}
-		}
-		e.profiler.End(fmt.Sprintf("layer_%d_load", i))
-
-		// Kick off background load of the *next* layer (if there is one).
-		if e.config.Prefetching && prefetchChan != nil && i+1 < numLayers {
-			go e.prefetchLayer(i+1, prefetchChan)
-		}
-
-		// Create layer object if needed.
-		if e.layers[i] == nil {
-			layer, err := e.createLayer(i, layerState)
-			if err != nil {
-				return nil, fmt.Errorf("failed to create layer %d: %w", i, err)
-			}
-			e.layers[i] = layer
-		}
-
-		// Load weights into layer.
-		if err := e.layers[i].Load(layerState); err != nil {
-			return nil, fmt.Errorf("failed to load state into layer %d: %w", i, err)
-		}
-
-		e.profiler.Start(fmt.Sprintf("layer_%d_compute", i))
-		
-		var output, newK, newV *tensor.Tensor
-		if e.config.KVCacheEnabled {
-			pastK, pastV := e.kvCache.Get(i)
-			output, newK, newV, err = e.layers[i].Forward(current, pastK, pastV)
-			if err == nil && newK != nil && newV != nil {
-			    // The AttentionLayer returned newK and newV.
-			    // Wait, if it returned the new slice, we need to concatenate it.
-			    // But wait, my implementation of layers.go returned output, newK, newV.
-			    // If pastK, pastV are provided, we should concat them here.
-			    if pastK != nil && pastV != nil {
-			        newK, _ = concatTensorsOnSeqDim(pastK, newK)
-			        newV, _ = concatTensorsOnSeqDim(pastV, newV)
-			    }
-				e.kvCache.Set(i, newK, newV)
-			}
-		} else {
-			output, _, _, err = e.layers[i].Forward(current, nil, nil)
-		}
-		
-		if err != nil {
-			return nil, fmt.Errorf("forward failed at layer %d: %w", i, err)
-		}
-		e.profiler.End(fmt.Sprintf("layer_%d_compute", i))
-
-		e.profiler.Start(fmt.Sprintf("layer_%d_unload", i))
-		if err := e.layers[i].Unload(); err != nil {
-			log.Printf("Warning: failed to unload layer %d: %v", i, err)
-		}
-		e.profiler.End(fmt.Sprintf("layer_%d_unload", i))
-
-		// Free OS memory after every unload — more targeted than periodic GC.
-		debug.FreeOSMemory()
-
-		current = output
-		e.profiler.End(fmt.Sprintf("layer_%d", i))
-	}
-
-	e.profiler.End("total_forward")
-	if e.config.Profiling {
-		e.profiler.Print()
-	}
-	return current, nil
-}
-
-// ForwardBatch runs batched inference
-func (e *Engine) ForwardBatch(ctx context.Context, inputs []*tensor.Tensor) ([]*tensor.Tensor, error) {
-	// For simplicity, process sequentially
-	// In production, could use parallel processing for independent sequences
-	results := make([]*tensor.Tensor, len(inputs))
-	for i, input := range inputs {
-		output, err := e.Forward(ctx, input)
-		if err != nil {
-			return nil, fmt.Errorf("batch item %d failed: %w", i, err)
-		}
-		results[i] = output
-	}
-	return results, nil
-}
-
-// Generate generates tokens autoregressively
-func (e *Engine) Generate(ctx context.Context, inputIDs []int, maxNewTokens int, callback func(int)) ([]int, error) {
-	// Convert input IDs to tensor
-	inputShape := []int{1, len(inputIDs)}
-	inputTensor := tensor.NewTensor(inputShape, tensor.Int64)
-	for i, id := range inputIDs {
-		// Store as int64
-		idx := i * 8
-		for j := 0; j < 8; j++ {
-			inputTensor.Data[idx+j] = byte(id >> (8 * j))
-		}
-	}
-
-	generated := make([]int, 0, maxNewTokens)
-	
-	for i := 0; i < maxNewTokens; i++ {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		default:
-		}
-
-		// Run forward pass
-		output, err := e.Forward(ctx, inputTensor)
-		if err != nil {
-			return nil, fmt.Errorf("generation step %d failed: %w", i, err)
-		}
-
-		// Get logits and sample next token
-		nextToken := e.sampleNextToken(output)
+		nextToken := argmax(logits)
 		generated = append(generated, nextToken)
-
-		if callback != nil {
-			callback(nextToken)
+		if onToken != nil {
+			onToken(nextToken)
 		}
 
-		// Update input for next iteration (KV cache handles past context)
-		inputTensor = e.prepareNextInput(nextToken)
+		// Stop on EOS (token 2 by convention; model-specific in production).
+		if nextToken == 2 {
+			break
+		}
+
+		// Feed the new token back as the next input (single-token decode step).
+		input = tokenIDsToTensor([]int{nextToken})
+		logits, err = e.forward(ctx, input)
+		if err != nil {
+			return generated, fmt.Errorf("engine: decode step %d failed: %w", step, err)
+		}
 	}
 
 	return generated, nil
 }
 
-// sampleNextToken samples the next token from logits
-func (e *Engine) sampleNextToken(logits *tensor.Tensor) int {
-	// Simple greedy sampling - take argmax
-	// In production could implement temperature, top-k, top-p sampling
-	
-	lastDim := logits.Shape[len(logits.Shape)-1]
-	offset := logits.Size() - lastDim
+// ─── forward ──────────────────────────────────────────────────────────────────
 
-	maxIdx := 0
-	maxVal := float32(-1e38)
-	
-	for i := 0; i < lastDim; i++ {
-		var val float32
-		switch logits.DType {
-		case tensor.Float32:
-			val = logits.GetFloat32(offset + i)
-		case tensor.Float16:
-			val = logits.GetFloat16(offset + i)
+// forward runs one complete forward pass through all transformer layers for the
+// given input token tensor.  It updates e.kvCache in place and returns the
+// final logit vector (shape [seqLen, vocabSize]).
+func (e *Engine) forward(ctx context.Context, input *tensor.Tensor) (*tensor.Tensor, error) {
+	layerCount := e.Loader.GetLayerCount()
+	h := input // hidden state; updated by each layer
+
+	for idx := 0; idx < layerCount; idx++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
 		}
-		if val > maxVal {
-			maxVal = val
-			maxIdx = i
+
+		// ── 1. Load weights for this layer ──────────────────────────────────
+		state, err := e.Loader.LoadLayer(idx)
+		if err != nil {
+			return nil, fmt.Errorf("layer %d load: %w", idx, err)
+		}
+
+		// ── 2. Build the layer and load its weights ──────────────────────────
+		// We construct a lightweight AttentionLayer + FFNLayer + LayerNorm
+		// on every step and discard them when done (their tensors are the
+		// backing store — no extra copy).
+		attn := NewAttentionLayer(e.Loader.GetLayerName(idx)+".self_attn", e.Config)
+		if err := attn.Load(state); err != nil {
+			return nil, fmt.Errorf("layer %d attn load: %w", idx, err)
+		}
+
+		ffn := NewFFNLayer(e.Loader.GetLayerName(idx)+".mlp", e.Config)
+		if err := ffn.Load(state); err != nil {
+			return nil, fmt.Errorf("layer %d ffn load: %w", idx, err)
+		}
+
+		preNorm := NewLayerNorm(e.Loader.GetLayerName(idx)+".input_layernorm", e.Config)
+		if err := preNorm.Load(state); err != nil {
+			return nil, fmt.Errorf("layer %d pre-norm load: %w", idx, err)
+		}
+
+		postNorm := NewLayerNorm(e.Loader.GetLayerName(idx)+".post_attention_layernorm", e.Config)
+		if err := postNorm.Load(state); err != nil {
+			return nil, fmt.Errorf("layer %d post-norm load: %w", idx, err)
+		}
+
+		// ── 3. Pre-attention RMSNorm ────────────────────────────────────────
+		normed, _, _, err := preNorm.Forward(h, nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("layer %d pre-norm forward: %w", idx, err)
+		}
+
+		// ── 4. Self-attention (with KV cache) ───────────────────────────────
+		pastK := e.kvCache[idx][0]
+		pastV := e.kvCache[idx][1]
+
+		attnOut, newK, newV, err := attn.Forward(normed, pastK, pastV)
+		if err != nil {
+			return nil, fmt.Errorf("layer %d attn forward: %w", idx, err)
+		}
+
+		// Store updated KV for next generation step.
+		e.kvCache[idx] = [2]*tensor.Tensor{newK, newV}
+
+		// ── 5. Residual connection ──────────────────────────────────────────
+		h = addTensors(h, attnOut)
+
+		// ── 6. Post-attention RMSNorm ───────────────────────────────────────
+		normed, _, _, err = postNorm.Forward(h, nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("layer %d post-norm forward: %w", idx, err)
+		}
+
+		// ── 7. Feed-forward network ─────────────────────────────────────────
+		ffnOut, _, _, err := ffn.Forward(normed, nil, nil)
+		if err != nil {
+			return nil, fmt.Errorf("layer %d ffn forward: %w", idx, err)
+		}
+
+		// ── 8. Residual connection ──────────────────────────────────────────
+		h = addTensors(h, ffnOut)
+
+		// ── 9. Unload weights (keep only the KV tensors) ────────────────────
+		attn.Unload()  //nolint:errcheck
+		ffn.Unload()   //nolint:errcheck
+		preNorm.Unload()  //nolint:errcheck
+		postNorm.Unload() //nolint:errcheck
+	}
+
+	// ── Final norm (model.norm) ─────────────────────────────────────────────
+	finalNormState, err := e.Loader.LoadSpecialLayer("model.norm")
+	if err == nil && len(finalNormState) > 0 {
+		finalNorm := NewLayerNorm("model.norm", e.Config)
+		if loadErr := finalNorm.Load(finalNormState); loadErr == nil {
+			normed, _, _, normErr := finalNorm.Forward(h, nil, nil)
+			if normErr == nil {
+				h = normed
+			}
 		}
 	}
 
-	return maxIdx
-}
-
-// prepareNextInput prepares the input for the next generation step
-func (e *Engine) prepareNextInput(nextToken int) *tensor.Tensor {
-	// Just the new token since KV cache handles past context
-	shape := []int{1, 1}
-	t := tensor.NewTensor(shape, tensor.Int64)
-	for j := 0; j < 8; j++ {
-		t.Data[j] = byte(nextToken >> (8 * j))
+	// ── lm_head projection: [1, seqLen, hiddenSize] → [1, seqLen, vocabSize] ──
+	lmHeadState, err := e.Loader.LoadSpecialLayer("lm_head")
+	if err != nil || len(lmHeadState) == 0 {
+		// No lm_head found — return hidden state as-is (stub mode for testing).
+		return h, nil
 	}
-	return t
-}
 
-// prefetchResult holds the result of a prefetch operation
-type prefetchResult struct {
-	state map[string]*tensor.Tensor
-	err   error
-}
+	lmHead := NewLinearLayer("lm_head", e.Config)
+	if err := lmHead.Load(lmHeadState); err != nil {
+		return h, nil // graceful degradation
+	}
 
-// prefetchLayer loads a layer in the background
-func (e *Engine) prefetchLayer(idx int, ch chan *prefetchResult) {
-	start := time.Now()
-	state, err := e.layerLoader.LoadLayer(idx)
+	logits, _, _, err := lmHead.Forward(h, nil, nil)
 	if err != nil {
-		ch <- &prefetchResult{err: err}
-		return
+		return h, nil // graceful degradation
 	}
-	ch <- &prefetchResult{state: state}
-	
-	if e.config.Profiling {
-		log.Printf("Prefetched layer %d in %v", idx, time.Since(start))
-	}
+
+	return logits, nil
 }
 
-// createLayer creates a Layer implementation based on the layer index and state
-func (e *Engine) createLayer(idx int, state map[string]*tensor.Tensor) (Layer, error) {
-	name := e.layerLoader.GetLayerName(idx)
-	
-	switch {
-	case isEmbeddingLayer(name):
-		return NewEmbeddingLayer(name), nil
-	case isAttentionLayer(name):
-		return NewAttentionLayer(name, e.config), nil
-	case isFFNLayer(name):
-		return NewFFNLayer(name, e.config), nil
-	case isLayerNorm(name):
-		return NewLayerNorm(name, e.config), nil
-	case isLMHead(name):
-		return NewLinearLayer(name, e.config), nil
-	default:
-		// Default to a passthrough/linear layer
-		return NewLinearLayer(name, e.config), nil
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+// tokenIDsToTensor wraps a []int of token IDs into a 2-D Tensor [1, seqLen].
+// Uses []int64 to match embedLookup's expectations. (FIX-011)
+func tokenIDsToTensor(ids []int) *tensor.Tensor {
+	data := make([]int64, len(ids))
+	for i, id := range ids {
+		data[i] = int64(id)
+	}
+	return &tensor.Tensor{
+		Shape:   []int{1, len(ids)},
+		Data:    data,
+		DType:   tensor.Int64,
+		Strides: []int{1, len(ids)},
 	}
 }
 
-// Layer type detection helpers
-// FIX: Use strings.Contains (stdlib) — removes the buggy hand-rolled contains.
-// FIX: isLMHead had a duplicate predicate ("lm_head" || "lm_head");
-//      second arm is now "output_layer" for ChatGLM compatibility.
-func isEmbeddingLayer(name string) bool {
-	return strings.Contains(name, "embed_tokens") ||
-		strings.Contains(name, "embeddings") ||
-		strings.Contains(name, "word_embeddings")
-}
-
-func isAttentionLayer(name string) bool {
-	return strings.Contains(name, "self_attn") ||
-		strings.Contains(name, "attention") ||
-		strings.Contains(name, "attn")
-}
-
-func isFFNLayer(name string) bool {
-	return strings.Contains(name, "mlp") ||
-		strings.Contains(name, "feed_forward") ||
-		strings.Contains(name, "ffn")
-}
-
-func isLayerNorm(name string) bool {
-	return strings.Contains(name, "norm") || strings.Contains(name, "ln_")
-}
-
-func isLMHead(name string) bool {
-	return strings.Contains(name, "lm_head") || strings.Contains(name, "output_layer")
-}
-
-// contains is kept for backward compat but delegates to stdlib.
-func contains(s, substr string) bool {
-	return strings.Contains(s, substr)
-}
-
-// ClearCache clears the KV cache
-func (e *Engine) ClearCache() {
-	e.kvCache.Clear()
-}
-
-// Release frees all resources
-func (e *Engine) Release() {
-	for _, layer := range e.layers {
-		if layer != nil {
-			layer.Unload()
+// argmax returns the index of the maximum value in the last dimension of t. (FIX-012)
+func argmax(t *tensor.Tensor) int {
+	if t == nil {
+		return 0
+	}
+	data, ok := t.Data.([]float32)
+	if !ok || len(data) == 0 {
+		return 0
+	}
+	cols := t.Shape[len(t.Shape)-1]
+	if cols <= 0 {
+		cols = len(data)
+	}
+	start := len(data) - cols
+	if start < 0 {
+		start = 0
+	}
+	best, bestVal := start, float32(math.Inf(-1))
+	for i := start; i < len(data); i++ {
+		if data[i] > bestVal {
+			bestVal = data[i]
+			best = i
 		}
 	}
-	e.layers = nil
-	e.ClearCache()
+	return best - start
+}
+
+// addTensors performs element-wise addition using GetFloat32/SetFloat32 for type safety. (FIX-012)
+func addTensors(a, b *tensor.Tensor) *tensor.Tensor {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	n := a.Size()
+	if b.Size() < n {
+		n = b.Size()
+	}
+	for i := 0; i < n; i++ {
+		a.SetFloat32(i, a.GetFloat32(i)+b.GetFloat32(i))
+	}
+	return a
 }

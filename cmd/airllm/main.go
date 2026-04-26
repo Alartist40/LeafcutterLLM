@@ -13,9 +13,9 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/xander/airllm-go/pkg/inference"
-	"github.com/xander/airllm-go/pkg/model"
-	"github.com/xander/airllm-go/pkg/tensor"
+	"github.com/Alartist40/LeafcutterLLM/pkg/inference"
+	"github.com/Alartist40/LeafcutterLLM/pkg/model"
+	"github.com/Alartist40/LeafcutterLLM/pkg/tensor"
 )
 
 var (

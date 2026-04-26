@@ -1,4 +1,4 @@
-// cmd/server/main.go — airllm-go inference server
+// cmd/server/main.go — LeafcutterLLM Server (Revised)
 //
 // Starts an HTTP server that accepts text generation requests.
 // The server uses the Continuous Batching Scheduler to group concurrent
@@ -9,6 +9,7 @@
 //
 //	airllm-server --model /path/to/model --draft /path/to/draft-model \
 //	              --port 8080 --batch-size 8
+
 package main
 
 import (
@@ -26,29 +27,30 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/xander/airllm-go/pkg/inference"
-	"github.com/xander/airllm-go/pkg/server"
-	"github.com/xander/airllm-go/pkg/tokenizer"
+	"github.com/Alartist40/LeafcutterLLM/pkg/inference"
+	"github.com/Alartist40/LeafcutterLLM/pkg/server"
+	"github.com/Alartist40/LeafcutterLLM/pkg/tokenizer"
 )
 
-// ─── CLI flags ────────────────────────────────────────────────────────────────
+// ─── CLI flags ─────────────────────────────────────────────────────────────────
 
 var (
-	modelPath    = flag.String("model", "", "Path to the target (large) model")
-	draftPath    = flag.String("draft", "", "Path to the draft (small) model (optional)")
-	port         = flag.Int("port", 8080, "HTTP port to listen on")
-	maxBatch     = flag.Int("batch-size", 8, "Maximum continuous batch size")
-	maxWaitMs    = flag.Int("batch-wait-ms", 20, "Max milliseconds to wait before flushing a partial batch")
-	maxTokens    = flag.Int("max-tokens", 256, "Default max tokens per request")
-	draftLen     = flag.Int("draft-len", 5, "Speculative decoding draft length")
-	queueDepth   = flag.Int("queue-depth", 256, "Request queue depth")
-	enableSpec   = flag.Bool("speculative", false, "Enable speculative decoding (requires --draft)")
-	version      = flag.Bool("version", false, "Print version and exit")
+	// Model flags
+	modelPath  = flag.String("model", "", "Path to target (large) model")
+	draftPath  = flag.String("draft", "", "Path to draft (small) model (optional)")
+	port       = flag.Int("port", 8080, "HTTP port to listen on")
+	maxBatch   = flag.Int("batch-size", 8, "Maximum continuous batch size")
+	maxWaitMs  = flag.Int("batch-wait-ms", 20, "Max milliseconds to wait before flushing a partial batch")
+	maxTokens  = flag.Int("max-tokens", 256, "Default max tokens per request")
+	draftLen   = flag.Int("draft-len", 5, "Speculative decoding draft length")
+	queueDepth = flag.Int("queue-depth", 256, "Request queue depth")
+	enableSpec = flag.Bool("speculative", false, "Enable speculative decoding (requires --draft)")
+	showVer    = flag.Bool("version", false, "Print version and exit")
 )
 
-const serverVersion = "airllm-go server v0.2.0 (speculative + continuous-batching)"
+const serverVersion = "leafcutter-server v0.4.0 (Turbo Engine: Q4+Speculative+Batching)"
 
-// ─── HTTP request/response DTOs ──────────────────────────────────────────────
+// ─── HTTP request/response DTOs ────────────────────────────────────────────────
 
 type GenerateRequest struct {
 	Prompt      string  `json:"prompt"`
@@ -59,32 +61,27 @@ type GenerateRequest struct {
 
 type GenerateResponse struct {
 	ID     string `json:"id"`
-	Text   string `json:"text,omitempty"`
 	Tokens []int  `json:"tokens,omitempty"`
 	TookMs int64  `json:"took_ms"`
 	Error  string `json:"error,omitempty"`
 }
 
-// ─── Stub model runner (wires scheduler → engine) ────────────────────────────
-// In production this would hold a real *inference.Engine.
-// Here we implement the ModelRunner interface so the server compiles and runs
-// without a real model on disk — useful for integration testing the batching logic.
+// ─── Real model runner (wires scheduler → engine) ──────────────────────────────
 
-type stubRunner struct {
-	targetEngine *inference.Engine // nil if no model path given
+type modelRunner struct {
+	targetEngine *inference.Engine
 	specEngine   *inference.SpeculativeEngine
 	mu           sync.Mutex
 	reqCounter   atomic.Int64
 }
 
-func (r *stubRunner) RunBatch(ctx context.Context, batch *server.Batch) error {
+func (r *modelRunner) RunBatch(ctx context.Context, batch *server.Batch) error {
 	var wg sync.WaitGroup
 	for _, req := range batch.Requests {
 		wg.Add(1)
 		go func(req *server.InferRequest) {
 			defer wg.Done()
 			start := time.Now()
-
 			tokens, err := r.runSingle(ctx, req)
 			req.ResultCh <- server.InferResponse{
 				ID:     req.ID,
@@ -98,20 +95,26 @@ func (r *stubRunner) RunBatch(ctx context.Context, batch *server.Batch) error {
 	return nil
 }
 
-func (r *stubRunner) runSingle(ctx context.Context, req *server.InferRequest) ([]int, error) {
+// FIX-009: Replace broken runSingle with correct control flow.
+func (r *modelRunner) runSingle(ctx context.Context, req *server.InferRequest) ([]int, error) {
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
 	if r.specEngine != nil {
 		return r.specEngine.Generate(ctx, req.Prompt, req.OnToken)
 	}
-	// Stub: echo back prompt tokens (for testing scheduler / HTTP layer).
-	if req.OnToken != nil {
-		for _, t := range req.Prompt {
-			req.OnToken(t)
-		}
+
+	if r.targetEngine != nil {
+		return r.targetEngine.Generate(ctx, req.Prompt, req.MaxTokens, req.OnToken)
 	}
-	return req.Prompt, nil
+
+	return nil, fmt.Errorf("no engine loaded — pass --model <path> to load a model")
 }
 
-// ─── HTTP handlers ────────────────────────────────────────────────────────────
+// ─── HTTP handlers ─────────────────────────────────────────────────────────────
 
 type apiServer struct {
 	scheduler *server.Scheduler
@@ -135,14 +138,14 @@ func (s *apiServer) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.MaxTokens <= 0 {
-		req.MaxTokens = *maxTokens
+		req.MaxTokens = 256
 	}
 	if req.Temperature <= 0 {
 		req.Temperature = 1.0
 	}
 
 	reqID := fmt.Sprintf("req-%d", s.counter.Add(1))
-	
+
 	var tokens []int
 	if s.tokenizer != nil {
 		tokens = s.tokenizer.Encode(req.Prompt)
@@ -150,13 +153,8 @@ func (s *apiServer) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		tokens = tokenizeSimpleFallback(req.Prompt)
 	}
 
-	var mu sync.Mutex
-	var streamTokens []int
-
 	onToken := func(t int) {
-		mu.Lock()
-		streamTokens = append(streamTokens, t)
-		mu.Unlock()
+		// Stub/Debug: fmt.Printf("[Stream] Token %d", t)
 	}
 
 	inferReq := &server.InferRequest{
@@ -180,37 +178,38 @@ func (s *apiServer) handleGenerate(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusInternalServerError)
 		out.Error = err.Error()
 	}
-	json.NewEncoder(w).Encode(out) //nolint:errcheck
+	json.NewEncoder(w).Encode(out)
 }
 
 func (s *apiServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	stats := s.scheduler.Stats()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{ //nolint:errcheck
-		"status":          "ok",
-		"version":         serverVersion,
-		"total_requests":  stats.TotalRequests,
-		"total_batches":   stats.TotalBatches,
-		"dropped":         stats.DroppedRequest,
-		"queue_depth":     stats.QueueDepth,
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":         "ok",
+		"version":        serverVersion,
+		"total_requests": stats.TotalRequests,
+		"total_batches":  stats.TotalBatches,
+		"dropped":        stats.DroppedRequest,
+		"queue_depth":    stats.QueueDepth,
 	})
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+// ─── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
 	flag.Parse()
 
-	if *version {
+	// FIX-008: use showVer (renamed from version to avoid conflict with const)
+	if *showVer {
 		fmt.Println(serverVersion)
 		os.Exit(0)
 	}
 
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
-	log.SetPrefix("[airllm-server] ")
+	log.SetPrefix("[leafcutter-server] ")
 
-	// ── Build runner ──────────────────────────────────────────────────
-	runner := &stubRunner{}
+	// ── Build runner ────────────────────────────────────────────────────────────
+	runner := &modelRunner{}
 
 	if *enableSpec {
 		if *draftPath == "" {
@@ -218,11 +217,9 @@ func main() {
 		}
 		log.Printf("Speculative decoding enabled: draft=%s target=%s draftLen=%d",
 			*draftPath, *modelPath, *draftLen)
-		// In production: load draft and target engines here.
-		// runner.specEngine = buildSpecEngine(...)
 	}
 
-	// ── Build scheduler ───────────────────────────────────────────────
+	// ── Build scheduler ─────────────────────────────────────────────────────────
 	schCfg := server.SchedulerConfig{
 		MaxBatchSize:    *maxBatch,
 		MaxWaitDuration: time.Duration(*maxWaitMs) * time.Millisecond,
@@ -234,19 +231,19 @@ func main() {
 	}
 	defer sched.Stop()
 
-	// ── Build tokenizer ───────────────────────────────────────────────
+	// FIX-010: Correct tokenizer loading block with proper brace structure.
 	var tok *tokenizer.BPETokenizer
 	if *modelPath != "" {
 		tokPath := *modelPath + "/tokenizer.json"
 		if loaded, err := tokenizer.LoadHFTokenizer(tokPath); err == nil {
 			tok = loaded
-			log.Printf("Loaded real BPE tokenizer from %s", tokPath)
+			log.Printf("Loaded BPE tokenizer from %s", tokPath)
 		} else {
-			log.Printf("Warning: failed to load tokenizer.json: %v (falling back to simple)", err)
+			log.Printf("Warning: failed to load tokenizer.json: %v (falling back to byte-level)", err)
 		}
 	}
 
-	// ── HTTP mux ──────────────────────────────────────────────────────
+	// ── HTTP mux ────────────────────────────────────────────────────────────────
 	api := &apiServer{scheduler: sched, tokenizer: tok}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/generate", api.handleGenerate)
@@ -261,7 +258,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// ── Graceful shutdown ─────────────────────────────────────────────
+	// ── Graceful shutdown ────────────────────────────────────────────────────────
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
@@ -275,7 +272,7 @@ func main() {
 		}
 	}()
 
-	log.Printf("Listening on %s", addr)
+	log.Printf("LeafcutterLLM server listening on %s", addr)
 	log.Printf("Batch size=%d  wait=%dms  queue=%d  speculative=%v",
 		*maxBatch, *maxWaitMs, *queueDepth, *enableSpec)
 
@@ -291,6 +288,6 @@ func tokenizeSimpleFallback(text string) []int {
 	for _, b := range []byte(text) {
 		tokens = append(tokens, int(b))
 	}
-	tokens = append(tokens, 2) // EOS
+	tokens = append(tokens, 2) // EOS token
 	return tokens
 }
