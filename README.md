@@ -6,6 +6,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Status: Production Ready](https://img.shields.io/badge/Status-Production%20Ready-green)]()
 
+![image alt](https://github.com/Alartist40/LeafcutterLLM/blob/e95fe79a9628a2c165ffe46ebd1350d7f4dead6f/LeafCutter_logo_light.png)
+
 ---
 
 ## What Is LeafcutterLLM?
