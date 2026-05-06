@@ -5,7 +5,7 @@
 package qkernel
 
 /*
-#cgo CFLAGS: -O3 -march=native
+#cgo CFLAGS: -O3
 #cgo pkg-config: openblas
 #include <cblas.h>
 #include <stdlib.h>

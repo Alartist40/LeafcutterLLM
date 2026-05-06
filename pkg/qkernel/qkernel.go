@@ -8,7 +8,7 @@
 package qkernel
 
 /*
-#cgo CFLAGS: -O3 -march=native -ffast-math
+#cgo CFLAGS: -O3 -ffast-math
 #include "qkernel.h"
 #include <stdlib.h>
 */
