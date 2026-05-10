@@ -33,45 +33,74 @@ func newGGUFLayerLoader(path string) (*GGUFLayerLoader, inference.Config, error)
 func extractConfigFromGGUF(metadata map[string]interface{}) inference.Config {
 	cfg := inference.DefaultConfig
 
-	// Helper to get int from multiple possible GGUF types
+	// Helper to get int from multiple possible GGUF types, including single-element arrays
 	getInt := func(key string) (int, bool) {
-		if val, ok := metadata[key].(uint32); ok {
-			return int(val), true
+		val, ok := metadata[key]
+		if !ok {
+			return 0, false
 		}
-		if val, ok := metadata[key].(uint64); ok {
-			return int(val), true
+
+		// Handle single-element arrays (common in some GGUF exporters)
+		if arr, ok := val.([]interface{}); ok && len(arr) == 1 {
+			val = arr[0]
 		}
-		if val, ok := metadata[key].(int32); ok {
-			return int(val), true
-		}
-		if val, ok := metadata[key].(int64); ok {
-			return int(val), true
+
+		switch v := val.(type) {
+		case uint32:
+			return int(v), true
+		case uint64:
+			return int(v), true
+		case int32:
+			return int(v), true
+		case int64:
+			return int(v), true
+		case float32:
+			return int(v), true
+		case float64:
+			return int(v), true
 		}
 		return 0, false
 	}
 
+	if v, ok := getInt("general.architecture"); ok {
+		// Not useful as an int, but placeholder for arch-specific logic
+		_ = v
+	}
+
+	// Try common keys for different architectures
 	if v, ok := getInt("llama.embedding_length"); ok {
 		cfg.HiddenSize = v
+	} else if v, ok := getInt("gpt2.embedding_length"); ok {
+		cfg.HiddenSize = v
 	}
+	
 	if v, ok := getInt("llama.block_count"); ok {
 		cfg.NumHiddenLayers = v
+	} else if v, ok := getInt("gpt2.block_count"); ok {
+		cfg.NumHiddenLayers = v
 	}
+	
 	if v, ok := getInt("llama.attention.head_count"); ok {
 		cfg.NumHeads = v
 		cfg.NumAttentionHeads = v
 	}
+	
 	if v, ok := getInt("llama.attention.head_count_kv"); ok {
 		cfg.NumKVHeads = v
 	}
+	
 	if v, ok := getInt("llama.feed_forward_length"); ok {
 		cfg.IntermediateSize = v
 	}
+	
 	if v, ok := getInt("llama.context_length"); ok {
 		cfg.MaxSeqLen = v
 	}
 
-	// Vocab size is often the length of the tokens array
-	if val, ok := metadata["tokenizer.ggml.tokens"].([]interface{}); ok {
+	// Vocab size: check tokens array or metadata
+	if v, ok := getInt("tokenizer.ggml.tokens.length"); ok {
+		cfg.VocabSize = v
+	} else if val, ok := metadata["tokenizer.ggml.tokens"].([]interface{}); ok {
 		cfg.VocabSize = len(val)
 	}
 
@@ -171,15 +200,15 @@ func convertGGUFToTensor(data []byte, tInfo *gguf.GGUFTensor) (*tensor.Tensor, e
 		t := tensor.FromBuffer(data, shape, tensor.Float16)
 		return t.ToFloat32(), nil
 	case gguf.GGML_TYPE_Q4_0:
-		return dequantizeQ4_0(data, shape), nil
+		return dequantizeQ4_0(data, shape)
 	case gguf.GGML_TYPE_Q8_0:
-		return dequantizeQ8_0(data, shape), nil
+		return dequantizeQ8_0(data, shape)
 	default:
-		return nil, fmt.Errorf("unsupported GGUF tensor type: %d", tInfo.Type)
+		return nil, fmt.Errorf("unsupported GGUF quantization type: %d\nSupported: Q4_0, Q8_0\nThis model uses an unsupported quantization (likely K-quant). Support for K-quants is planned.", tInfo.Type)
 	}
 }
 
-func dequantizeQ4_0(data []byte, shape []int) *tensor.Tensor {
+func dequantizeQ4_0(data []byte, shape []int) (*tensor.Tensor, error) {
 	size := 1
 	for _, d := range shape {
 		size *= d
@@ -196,7 +225,7 @@ func dequantizeQ4_0(data []byte, shape []int) *tensor.Tensor {
 		blockIdx := i / blockSize
 		start := blockIdx * groupSize
 		if start+groupSize > len(data) {
-			break
+			return nil, fmt.Errorf("truncated quantized data for Q4_0 at block %d", blockIdx)
 		}
 		blockData := data[start : start+groupSize]
 
@@ -215,10 +244,10 @@ func dequantizeQ4_0(data []byte, shape []int) *tensor.Tensor {
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
-func dequantizeQ8_0(data []byte, shape []int) *tensor.Tensor {
+func dequantizeQ8_0(data []byte, shape []int) (*tensor.Tensor, error) {
 	size := 1
 	for _, d := range shape {
 		size *= d
@@ -235,7 +264,7 @@ func dequantizeQ8_0(data []byte, shape []int) *tensor.Tensor {
 		blockIdx := i / blockSize
 		start := blockIdx * groupSize
 		if start+groupSize > len(data) {
-			break
+			return nil, fmt.Errorf("truncated quantized data for Q8_0 at block %d", blockIdx)
 		}
 		blockData := data[start : start+groupSize]
 
@@ -247,7 +276,7 @@ func dequantizeQ8_0(data []byte, shape []int) *tensor.Tensor {
 			}
 		}
 	}
-	return out
+	return out, nil
 }
 
 func float16BitsToFloat32(h uint16) float32 {

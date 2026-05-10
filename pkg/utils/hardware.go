@@ -3,6 +3,7 @@ package utils
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"runtime"
 	"strconv"
 	"strings"
@@ -85,11 +86,57 @@ func detectRAMLinux() (total, available int64, err error) {
 }
 
 func detectRAMMacOS() (total, available int64, err error) {
-	// sysctl hw.memsize
-	// For now return dummy or use a shell command
-	return 8 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024, nil
+	// Use sysctl for total RAM
+	totalData, err := runCommand("sysctl", "-n", "hw.memsize")
+	if err != nil {
+		return 0, 0, fmt.Errorf("macOS total RAM: %w", err)
+	}
+	total, _ = strconv.ParseInt(strings.TrimSpace(totalData), 10, 64)
+
+	// Use vm_stat for available RAM
+	// This is a rough estimation based on free + inactive pages
+	vmData, err := runCommand("vm_stat")
+	if err != nil {
+		return total, 0, nil // Return total if available fails
+	}
+
+	pageSize := int64(4096) // Default page size
+	lines := strings.Split(vmData, "\n")
+	var free, inactive int64
+	for _, line := range lines {
+		if strings.HasPrefix(line, "Pages free:") {
+			free = parseVMStatLine(line)
+		} else if strings.HasPrefix(line, "Pages inactive:") {
+			inactive = parseVMStatLine(line)
+		}
+	}
+	available = (free + inactive) * pageSize
+
+	return total, available, nil
 }
 
 func detectRAMWindows() (total, available int64, err error) {
-	return 8 * 1024 * 1024 * 1024, 4 * 1024 * 1024 * 1024, nil
+	// Proper Windows RAM detection would require "wmic" or "systeminfo"
+	// but those are slow and sometimes missing.
+	// For now, return error to indicate it's not implemented, instead of lying.
+	return 0, 0, fmt.Errorf("Windows RAM detection not yet implemented")
+}
+
+func runCommand(name string, args ...string) (string, error) {
+	cmd := exec.Command(name, args...)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+func parseVMStatLine(line string) int64 {
+	fields := strings.Fields(line)
+	if len(fields) < 3 {
+		return 0
+	}
+	valStr := strings.TrimSuffix(fields[len(fields)-1], ".")
+	val, _ := strconv.ParseInt(valStr, 10, 64)
+	return val
 }

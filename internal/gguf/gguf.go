@@ -97,7 +97,11 @@ func Open(path string) (*GGUFFile, error) {
 	}
 
 	padding := (alignment - (uint64(currentPos) % alignment)) % alignment
-	g.dataPos, _ = f.Seek(int64(padding), io.SeekCurrent)
+	g.dataPos, err = f.Seek(int64(padding), io.SeekCurrent)
+	if err != nil {
+		f.Close()
+		return nil, fmt.Errorf("failed to seek to data section: %w", err)
+	}
 
 	return g, nil
 }
@@ -111,13 +115,13 @@ func (g *GGUFFile) GetTensor(name string) ([]byte, error) {
 
 			// Seek to tensor data (Offset is relative to the start of the data section)
 			if _, err := g.file.Seek(g.dataPos+int64(t.Offset), io.SeekStart); err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to seek to tensor %s data: %w", name, err)
 			}
 
 			// Read tensor data
 			data := make([]byte, size)
 			if _, err := io.ReadFull(g.file, data); err != nil {
-				return nil, err
+				return nil, fmt.Errorf("failed to read tensor %s data: %w", name, err)
 			}
 
 			return data, nil

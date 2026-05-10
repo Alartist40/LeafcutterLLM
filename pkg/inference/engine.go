@@ -214,10 +214,18 @@ func (e *Engine) forward(ctx context.Context, input *tensor.Tensor) (*tensor.Ten
 		h = addTensors(h, ffnOut)
 
 		// ── 9. Unload weights (keep only the KV tensors) ────────────────────
-		attn.Unload()  //nolint:errcheck
-		ffn.Unload()   //nolint:errcheck
-		preNorm.Unload()  //nolint:errcheck
-		postNorm.Unload() //nolint:errcheck
+		if err := attn.Unload(); err != nil {
+			return nil, fmt.Errorf("layer %d attn unload: %w", idx, err)
+		}
+		if err := ffn.Unload(); err != nil {
+			return nil, fmt.Errorf("layer %d ffn unload: %w", idx, err)
+		}
+		if err := preNorm.Unload(); err != nil {
+			return nil, fmt.Errorf("layer %d pre-norm unload: %w", idx, err)
+		}
+		if err := postNorm.Unload(); err != nil {
+			return nil, fmt.Errorf("layer %d post-norm unload: %w", idx, err)
+		}
 	}
 
 	// ── Final norm (model.norm) ─────────────────────────────────────────────
