@@ -35,9 +35,39 @@ type CheckPoint struct {
 
 // ─── LoadCheckPoint ───────────────────────────────────────────────────────────
 
-// LoadCheckPoint reads config.json at modelPath and returns a fully initialised
-// CheckPoint with a RealLayerLoader wired in.
+// LoadCheckPoint reads config.json at modelPath (safetensors) or parses a GGUF file
+// and returns a fully initialised CheckPoint.
 func LoadCheckPoint(modelPath string) (*CheckPoint, error) {
+	// Check if it's a GGUF file
+	if strings.HasSuffix(modelPath, ".gguf") {
+		return loadGGUFCheckpoint(modelPath)
+	}
+
+	// Otherwise, assume safetensors directory
+	return loadSafetensorsCheckpoint(modelPath)
+}
+
+func loadGGUFCheckpoint(path string) (*CheckPoint, error) {
+	// Import gguf package from internal
+	// Wait, internal is only accessible within the same module.
+	// This file is in pkg/model, so it can access internal/gguf.
+
+	// Implementation of loadGGUFCheckpoint
+	loader, cfg, err := newGGUFLayerLoader(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CheckPoint{
+		Architecture: "llama", // GGUF is primarily LLaMA-based
+		VocabSize:    cfg.VocabSize,
+		LayerCount:   cfg.NumHiddenLayers,
+		Config:       cfg,
+		LayerLoader:  loader,
+	}, nil
+}
+
+func loadSafetensorsCheckpoint(modelPath string) (*CheckPoint, error) {
 	configPath := filepath.Join(modelPath, "config.json")
 	if _, err := os.Stat(configPath); os.IsNotExist(err) {
 		return nil, fmt.Errorf("model config not found at %s", configPath)

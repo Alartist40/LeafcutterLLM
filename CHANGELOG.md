@@ -5,6 +5,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.5.0] — 2026-05-10 (Universal Model Support & Hardware Intelligence)
+
+### Added
+
+#### Model Loading & Formats
+- **GGUF Format Support**: Added native support for llama.cpp GGUF models.
+  - Implemented high-performance GGUF parser in `internal/gguf`.
+  - On-the-fly dequantization for Q4_0 and Q8_0 tensors to Float32.
+  - Automatic metadata extraction for model configuration.
+- **Auto-Detection System**: New model discovery logic that scans the `/models` directory.
+  - Supports both multi-file Safetensors directories and single-file GGUF models.
+  - Automatic selection of the first available model if none is specified.
+  - `--list` flag to view all discovered models.
+
+#### Hardware Intelligence
+- **Hardware Compatibility System**: Intelligent detection of system RAM and CPU.
+  - Accurate memory estimation for LeafcutterLLM's layer-by-layer architecture.
+  - **The Leafcutter Advantage**: Displays the memory savings vs. traditional engines (typically 8x-12x reduction).
+  - Compatibility verdicts: ✅ Compatible, ⚠️ Marginal, or ❌ Incompatible.
+  - `--check-only` flag to verify compatibility without loading the model.
+  - Context-aware suggestions for improving performance on limited hardware.
+
+#### Project Structure
+- **Unified `/models` Directory**: Created a standard location for users to place their LLM models.
+  - Included `models/README.md` with instructions and download links.
+
+### Changed
+- **Server Entry Point**: Updated `cmd/server/main.go` to integrate model discovery and hardware checking.
+- **Model Loader**: Refactored `pkg/model/loader.go` to support both Safetensors and GGUF backends transparently.
+
+---
+
 ## [0.4.0] — 2026-04-23 (Phase 6: Production Ready)
 
 ### Added

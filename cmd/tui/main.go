@@ -116,6 +116,39 @@ func (s *sessionStats) print() {
     fmt.Printf("%s────────────────────────────────────────────────────%s\n\n", cyan, reset)
 }
 
+func printCompatibilityTUI(report *model.CompatibilityReport) {
+    fmt.Printf("\n%s── Hardware Compatibility Check ──────────────────%s\n", cyan, reset)
+    fmt.Printf("  CPU Cores:       %s%d%s\n", bold, report.Hardware.NumCPU, reset)
+    fmt.Printf("  Total RAM:       %s%s%s\n", bold, formatSize(report.Hardware.TotalRAM), reset)
+    fmt.Printf("  Available RAM:   %s%s%s\n\n", bold, formatSize(report.Hardware.AvailableRAM), reset)
+    
+    fmt.Printf("  %s🌿 LeafcutterLLM Advantage:%s\n", green, reset)
+    fmt.Printf("  Traditional:     %s needed ❌\n", formatSize(report.ModelSize.PeakMemory))
+    fmt.Printf("  LeafcutterLLM:   %s needed ✅\n", formatSize(report.ModelSize.LeafcutterPeak))
+    fmt.Printf("  Savings:         %s%.1fx reduction!%s\n\n", bold+green, report.MemorySavingsX, reset)
+
+    if report.CanRun {
+        fmt.Printf("  %s✅ COMPATIBLE%s\n", green+bold, reset)
+    } else {
+        fmt.Printf("  %s❌ INCOMPATIBLE%s\n", red+bold, reset)
+        fmt.Printf("  %s\n", report.Warning)
+    }
+    fmt.Printf("%s────────────────────────────────────────────────────%s\n\n", cyan, reset)
+}
+
+func formatSize(bytes int64) string {
+    const unit = 1024
+    if bytes < unit {
+        return fmt.Sprintf("%d B", bytes)
+    }
+    div, exp := int64(unit), 0
+    for n := bytes / unit; n >= unit; n /= unit {
+        div *= unit
+        exp++
+    }
+    return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
 // ── Spinner ───────────────────────────────────────────────────────────────────
 
 func newSpinner(label string) (stop func()) {
@@ -142,9 +175,11 @@ func newSpinner(label string) (stop func()) {
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 func main() {
-    modelPath  := flag.String("model", "", "Path to HuggingFace safetensors model directory")
+    modelPath  := flag.String("model", "", "Path to model (auto-detects if empty)")
+    modelsDir  := flag.String("models-dir", "models", "Directory to scan for models")
     maxTokens  := flag.Int("max-tokens", 128, "Maximum tokens to generate per request")
     draftPath  := flag.String("draft", "", "Optional: path to draft model for speculative decoding")
+    checkOnly  := flag.Bool("check-only", false, "Check hardware compatibility and exit")
     flag.Parse()
 
     // Setup context and signal handling
@@ -163,6 +198,47 @@ func main() {
 
     clearScreen()
     printBanner()
+
+    // ── Discover and Check Hardware ──────────────────────────────────────────
+    discovered, _ := model.DiscoverModels(*modelsDir)
+    
+    var selectedModel model.ModelInfo
+    if *modelPath == "" && len(discovered) > 0 {
+        selectedModel = discovered[0]
+        *modelPath = selectedModel.Path
+    } else if *modelPath != "" {
+        // Use provided path
+        found := false
+        for _, m := range discovered {
+            if m.Path == *modelPath || m.Name == *modelPath {
+                selectedModel = m
+                *modelPath = m.Path
+                found = true
+                break
+            }
+        }
+        if !found {
+            selectedModel = model.ModelInfo{Path: *modelPath, Name: *modelPath}
+        }
+    }
+
+    if *modelPath != "" {
+        compat, err := model.CheckCompatibility(selectedModel, 4)
+        if err == nil {
+            if *checkOnly {
+                printCompatibilityTUI(compat)
+                return
+            }
+            if !compat.CanRun {
+                fmt.Printf("\n%s  ERROR: Insufficient hardware to run %s%s\n", red, selectedModel.Name, reset)
+                fmt.Printf("  %s%s%s\n\n", yellow, compat.Warning, reset)
+                os.Exit(1)
+            }
+            if compat.Warning != "" {
+                fmt.Printf("  %s⚠ %s%s\n", yellow, compat.Warning, reset)
+            }
+        }
+    }
 
     // ── Load model ────────────────────────────────────────────────────────────
     var engine *inference.Engine

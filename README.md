@@ -18,7 +18,7 @@ LeafcutterLLM is a complete inference system for running large language models l
 
 | Pillar | What It Does | Result |
 |--------|--------------|--------|
-| **Layer-by-Layer Loading** | Loads only one transformer layer into RAM at a time, unloads it after use | **8x less peak memory** than naive loading |
+| **Layer-by-Layer Loading** | Loads only one transformer layer into RAM at a time, unloads it after use | **Run 70B on 4GB RAM** (11x reduction) |
 | **OpenBLAS SGEMM + 4-bit Kernels** | Accelerates matrix multiplication via optimized C kernels and OpenBLAS | **13x faster** than pure Go math loops |
 | **Continuous Batching Scheduler** | Queues multiple requests and batches them for concurrent processing | **2,200+ requests/sec** throughput on Pi 5 |
 
@@ -27,9 +27,11 @@ LeafcutterLLM is a complete inference system for running large language models l
 ## Key Features
 
 ✅ **Offline inference** — no WiFi, no cloud, no API costs  
+✅ **Universal Model Support** — Supports GGUF (llama.cpp) and HuggingFace Safetensors  
 ✅ **Low latency** — sub-2 second response on Pi 5, <500ms on modern CPU  
-✅ **Minimal RAM footprint** — 3GB peak for a 7B model (vs 14GB+ naive)  
-✅ **HuggingFace safetensors support** — works with standard model formats  
+✅ **Revolutionary RAM footprint** — Run **70B models on 4GB RAM** (11x reduction!)  
+✅ **Auto-Detection** — Drop models into `/models` and run; no complex paths needed  
+✅ **Hardware Intelligence** — Automatic compatibility checks and memory advice  
 ✅ **Speculative decoding** — 3-4x speedup with a small draft model  
 ✅ **HTTP + TUI interfaces** — REST API server + interactive terminal shell  
 ✅ **Production container** — multi-stage Podman/Docker build included  
@@ -39,37 +41,25 @@ LeafcutterLLM is a complete inference system for running large language models l
 
 ## Quick Start
 
-### Prerequisites
-
-- **Go 1.22+**
-- **GCC** with OpenBLAS development libraries
-- **Podman** or **Docker** (for containerized deployment)
-
-### Install Dependencies (Debian/Ubuntu/Raspberry Pi OS)
-
+### 1. Build the server
 ```bash
-sudo apt-get update
-sudo apt-get install -y gcc libopenblas-dev pkg-config
-
-# Verify OpenBLAS
-pkg-config --cflags openblas
-```
-
-### Clone and Build
-
-```bash
-git clone https://github.com/Alartist40/LeafcutterLLM.git
-cd LeafcutterLLM
-
-# Build the server binary
 CGO_ENABLED=1 go build -o leafcutter-server ./cmd/server
-
-# Build the interactive TUI shell
-CGO_ENABLED=1 go build -o leafcutter-tui ./cmd/tui
-
-# Build the benchmark suite
-CGO_ENABLED=1 go build -o leafcutter-bench ./cmd/benchmark
 ```
+
+### 2. Download a model
+Download any GGUF or Safetensors model and place it in the `models/` directory. See `models/README.md` for recommendations.
+
+### 3. Run with Auto-Detection
+```bash
+./leafcutter-server
+```
+LeafcutterLLM will automatically detect your model, check if your hardware can run it, and start the inference server.
+
+### 4. Check Compatibility Only
+```bash
+./leafcutter-server --check-only
+```
+See the **LeafcutterLLM Advantage** report showing how much RAM we save you.
 
 ### Run the Benchmark
 
