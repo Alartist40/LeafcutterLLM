@@ -22,12 +22,15 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/Alartist40/LeafcutterLLM/pkg/inference"
+	"github.com/Alartist40/LeafcutterLLM/pkg/model"
 	"github.com/Alartist40/LeafcutterLLM/pkg/server"
 	"github.com/Alartist40/LeafcutterLLM/pkg/tokenizer"
 )
@@ -36,7 +39,10 @@ import (
 
 var (
 	// Model flags
-	modelPath  = flag.String("model", "", "Path to target (large) model")
+	modelPath  = flag.String("model", "", "Path to model (auto-detects if empty)")
+	modelsDir  = flag.String("models-dir", "models", "Directory to scan for models")
+	listOnly   = flag.Bool("list", false, "List available models and exit")
+	checkOnly  = flag.Bool("check-only", false, "Check hardware compatibility and exit")
 	draftPath  = flag.String("draft", "", "Path to draft (small) model (optional)")
 	port       = flag.Int("port", 8080, "HTTP port to listen on")
 	maxBatch   = flag.Int("batch-size", 8, "Maximum continuous batch size")
@@ -208,6 +214,90 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmsgprefix)
 	log.SetPrefix("[leafcutter-server] ")
 
+	// Discover available models
+	discovered, err := model.DiscoverModels(*modelsDir)
+	if err != nil {
+		log.Printf("Warning: model discovery failed: %v", err)
+	}
+
+	// List models if requested
+	if *listOnly {
+		if len(discovered) == 0 {
+			fmt.Printf("No models found in %s\n", *modelsDir)
+			return
+		}
+		fmt.Println("Available models:")
+		for i, m := range discovered {
+			fmt.Printf("  %d. %s (%s, %s)\n", i+1, m.Name, m.Format, formatSize(m.SizeBytes))
+		}
+		return
+	}
+
+	// Select model
+	var selectedModel model.ModelInfo
+	if *modelPath == "" {
+		if len(discovered) == 0 {
+			log.Fatalf("No models found in %s and no model specified via --model", *modelsDir)
+		}
+		selectedModel = discovered[0]
+		log.Printf("Auto-selected model: %s (%s)", selectedModel.Name, selectedModel.Format)
+	} else {
+		// Find matching model or use path directly
+		found := false
+		for _, m := range discovered {
+			if m.Path == *modelPath || m.Name == *modelPath {
+				selectedModel = m
+				found = true
+				break
+			}
+		}
+		if !found {
+			// If not found in discovery, create a minimal ModelInfo
+			selectedModel = model.ModelInfo{
+				Name:   filepath.Base(*modelPath),
+				Path:   *modelPath,
+				Format: "safetensors", // Default
+			}
+			if strings.HasSuffix(*modelPath, ".gguf") {
+				selectedModel.Format = "gguf"
+			}
+		}
+	}
+
+	// Enhancement 3 - Hardware Compatibility Check
+	quantBits := 4 // Default assumption for compatibility estimation
+	if strings.Contains(strings.ToLower(selectedModel.Name), "q8") {
+		quantBits = 8
+	} else if strings.Contains(strings.ToLower(selectedModel.Name), "q5") {
+		quantBits = 5
+	} else if strings.Contains(strings.ToLower(selectedModel.Name), "f16") {
+		quantBits = 16
+	}
+
+	compat, err := model.CheckCompatibility(selectedModel, quantBits)
+	if err != nil {
+		log.Printf("Warning: hardware compatibility check failed: %v", err)
+	} else {
+		if *checkOnly {
+			printCompatibilityReport(compat)
+			return
+		}
+
+		if !compat.CanRun {
+			printCompatibilityReport(compat)
+			log.Fatalf("❌ Insufficient hardware to run %s. Use --check-only for details.", selectedModel.Name)
+		}
+
+		if compat.Warning != "" {
+			log.Printf("⚠️  %s", compat.Warning)
+		} else {
+			log.Printf("✅ Hardware compatible (%.0f%% safety margin)", compat.SafetyMargin*100)
+		}
+	}
+
+	// Update modelPath to the selected one
+	*modelPath = selectedModel.Path
+
 	// ── Build runner ────────────────────────────────────────────────────────────
 	runner := &modelRunner{}
 
@@ -290,4 +380,18 @@ func tokenizeSimpleFallback(text string) []int {
 	}
 	tokens = append(tokens, 2) // EOS token
 	return tokens
+}
+
+// formatSize converts bytes to a human-readable string.
+func formatSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
 }
