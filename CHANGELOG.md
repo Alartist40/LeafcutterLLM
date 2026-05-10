@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.6.0] — 2026-05-12 (Polished & Cross-Platform)
+
+### Added
+- **Windows RAM Detection**: Native support for Windows memory detection via PowerShell.
+- **Context Length Override**: New `--max-ctx` flag for both Server and TUI to manually tune memory usage (e.g., reduces KV cache size).
+- **Unit Testing**: Added comprehensive unit tests for memory estimation and compatibility logic.
+- **Config Validation**: Added strict validation for model configurations to prevent crashes on malformed metadata.
+
+### Changed
+- **Compatibility Flow**: Overrides (like context length) are now applied *before* the hardware compatibility check for accurate reporting.
+
+### Fixed
+- **Code Integrity**: Cleaned up minor bugs and improved code robustness across the `model` and `utils` packages.
+
+---
+
 ## [0.5.1] — 2026-05-11 (Critical Stability & Accuracy Update)
 
 ### Fixed

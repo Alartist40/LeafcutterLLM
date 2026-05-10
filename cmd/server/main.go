@@ -48,6 +48,7 @@ var (
 	maxBatch   = flag.Int("batch-size", 8, "Maximum continuous batch size")
 	maxWaitMs  = flag.Int("batch-wait-ms", 20, "Max milliseconds to wait before flushing a partial batch")
 	maxTokens  = flag.Int("max-tokens", 256, "Default max tokens per request")
+	maxCtx     = flag.Int("max-ctx", 0, "Override model max context length (reduces RAM usage)")
 	draftLen   = flag.Int("draft-len", 5, "Speculative decoding draft length")
 	queueDepth = flag.Int("queue-depth", 256, "Request queue depth")
 	enableSpec = flag.Bool("speculative", false, "Enable speculative decoding (requires --draft)")
@@ -264,8 +265,23 @@ func main() {
 		}
 	}
 
+	// Update modelPath to the selected one
+	*modelPath = selectedModel.Path
+
+	// Load checkpoint metadata first to get config for compatibility check
+	cp, err := model.LoadCheckPoint(*modelPath)
+	if err != nil {
+		log.Fatalf("Failed to load model: %v", err)
+	}
+
+	// Apply overrides
+	if *maxCtx > 0 {
+		cp.Config.MaxSeqLen = *maxCtx
+		log.Printf("Overriding max context length: %d", *maxCtx)
+	}
+
 	// Enhancement 3 - Hardware Compatibility Check
-	quantBits := 4 // Default assumption for compatibility estimation
+	quantBits := 4 // Default assumption
 	if strings.Contains(strings.ToLower(selectedModel.Name), "q8") {
 		quantBits = 8
 	} else if strings.Contains(strings.ToLower(selectedModel.Name), "q5") {
@@ -274,7 +290,7 @@ func main() {
 		quantBits = 16
 	}
 
-	compat, err := model.CheckCompatibility(selectedModel, quantBits)
+	compat, err := model.CheckCompatibilityWithConfig(cp.Config, quantBits)
 	if err != nil {
 		log.Printf("Warning: hardware compatibility check failed: %v", err)
 	} else {
@@ -295,11 +311,10 @@ func main() {
 		}
 	}
 
-	// Update modelPath to the selected one
-	*modelPath = selectedModel.Path
-
 	// ── Build runner ────────────────────────────────────────────────────────────
-	runner := &modelRunner{}
+	runner := &modelRunner{
+		targetEngine: inference.NewEngine(&cp.Config, cp.LayerLoader),
+	}
 
 	if *enableSpec {
 		if *draftPath == "" {

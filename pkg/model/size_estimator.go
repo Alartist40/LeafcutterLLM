@@ -18,6 +18,15 @@ type ModelSizeEstimate struct {
 
 // EstimateModelSize calculates expected RAM usage for a model
 func EstimateModelSize(cfg inference.Config, quantBits int) ModelSizeEstimate {
+	// Validate config
+	if cfg.NumHiddenLayers <= 0 || cfg.HiddenSize <= 0 || cfg.MaxSeqLen <= 0 || cfg.NumHeads <= 0 {
+		// Return a minimal estimate to avoid division by zero or negative values
+		return ModelSizeEstimate{
+			Config:    cfg,
+			QuantBits: quantBits,
+		}
+	}
+
 	est := ModelSizeEstimate{
 		Config:    cfg,
 		QuantBits: quantBits,

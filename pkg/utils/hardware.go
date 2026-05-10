@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -116,10 +117,24 @@ func detectRAMMacOS() (total, available int64, err error) {
 }
 
 func detectRAMWindows() (total, available int64, err error) {
-	// Proper Windows RAM detection would require "wmic" or "systeminfo"
-	// but those are slow and sometimes missing.
-	// For now, return error to indicate it's not implemented, instead of lying.
-	return 0, 0, fmt.Errorf("Windows RAM detection not yet implemented")
+	// Use PowerShell to get RAM info
+	// TotalVisibleMemorySize and FreePhysicalMemory are in KB
+	cmdStr := "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json"
+	out, err := runCommand("powershell", "-Command", cmdStr)
+	if err != nil {
+		return 0, 0, fmt.Errorf("Windows RAM detection (PowerShell): %w", err)
+	}
+
+	var raw struct {
+		TotalVisibleMemorySize int64 `json:"TotalVisibleMemorySize"`
+		FreePhysicalMemory     int64 `json:"FreePhysicalMemory"`
+	}
+
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+		return 0, 0, fmt.Errorf("failed to parse Windows RAM info: %w", err)
+	}
+
+	return raw.TotalVisibleMemorySize * 1024, raw.FreePhysicalMemory * 1024, nil
 }
 
 func runCommand(name string, args ...string) (string, error) {
