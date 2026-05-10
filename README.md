@@ -28,10 +28,12 @@ LeafcutterLLM is a complete inference system for running large language models l
 
 ✅ **Offline inference** — no WiFi, no cloud, no API costs  
 ✅ **Universal Model Support** — Supports GGUF (llama.cpp) and HuggingFace Safetensors  
+✅ **Cross-Platform** — Native support for Linux, macOS, and Windows  
 ✅ **Low latency** — sub-2 second response on Pi 5, <500ms on modern CPU  
 ✅ **Revolutionary RAM footprint** — Run **70B models on 4GB RAM** (11x reduction!)  
 ✅ **Auto-Detection** — Drop models into `/models` and run; no complex paths needed  
 ✅ **Hardware Intelligence** — Automatic compatibility checks and memory advice  
+✅ **Memory Tuning** — Manual control over context length to fit massive models on tiny RAM  
 ✅ **Speculative decoding** — 3-4x speedup with a small draft model  
 ✅ **HTTP + TUI interfaces** — REST API server + interactive terminal shell  
 ✅ **Production container** — multi-stage Podman/Docker build included  

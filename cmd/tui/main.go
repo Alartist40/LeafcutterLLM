@@ -178,6 +178,7 @@ func main() {
     modelPath  := flag.String("model", "", "Path to model (auto-detects if empty)")
     modelsDir  := flag.String("models-dir", "models", "Directory to scan for models")
     maxTokens  := flag.Int("max-tokens", 128, "Maximum tokens to generate per request")
+    maxCtx     := flag.Int("max-ctx", 0, "Override model max context length (reduces RAM usage)")
     draftPath  := flag.String("draft", "", "Optional: path to draft model for speculative decoding")
     checkOnly  := flag.Bool("check-only", false, "Check hardware compatibility and exit")
     flag.Parse()
@@ -222,25 +223,6 @@ func main() {
         }
     }
 
-    if *modelPath != "" {
-        compat, err := model.CheckCompatibility(selectedModel, 4)
-        if err == nil {
-            if *checkOnly {
-                printCompatibilityTUI(compat)
-                return
-            }
-            if !compat.CanRun {
-                fmt.Printf("\n%s  ERROR: Insufficient hardware to run %s%s\n", red, selectedModel.Name, reset)
-                fmt.Printf("  %s%s%s\n\n", yellow, compat.Warning, reset)
-                os.Exit(1)
-            }
-            if compat.Warning != "" {
-                fmt.Printf("  %s⚠ %s%s\n", yellow, compat.Warning, reset)
-            }
-        }
-    }
-
-    // ── Load model ────────────────────────────────────────────────────────────
     var engine *inference.Engine
     var specEngine *inference.SpeculativeEngine
     var tok *tokenizer.BPETokenizer
@@ -249,17 +231,38 @@ func main() {
         fmt.Printf("\n%s  No model loaded. Use --model /path/to/model%s\n", yellow, reset)
         fmt.Printf("  %sRunning in demo mode — commands work but inference is disabled.%s\n\n", dim, reset)
     } else {
-        stopSpin := newSpinner(fmt.Sprintf("Loading model from %s", *modelPath))
-
+        // Load checkpoint metadata first
         cp, err := model.LoadCheckPoint(*modelPath)
         if err != nil {
-            stopSpin()
             fmt.Printf("\n%s  ERROR: Failed to load model: %v%s\n\n", red, err, reset)
             fmt.Printf("  %sContinuing in demo mode.%s\n\n", dim, reset)
         } else {
-            cfg := cp.Config
-            engine = inference.NewEngine(&cfg, cp.LayerLoader)
+            // Apply overrides
+            if *maxCtx > 0 {
+                cp.Config.MaxSeqLen = *maxCtx
+                fmt.Printf("  %sOverriding max context length: %d%s\n", dim, *maxCtx, reset)
+            }
+
+            compat, err := model.CheckCompatibilityWithConfig(cp.Config, 4)
+            if err == nil {
+                if *checkOnly {
+                    printCompatibilityTUI(compat)
+                    return
+                }
+                if !compat.CanRun {
+                    fmt.Printf("\n%s  ERROR: Insufficient hardware to run %s%s\n", red, selectedModel.Name, reset)
+                    fmt.Printf("  %s%s%s\n\n", yellow, compat.Warning, reset)
+                    os.Exit(1)
+                }
+                if compat.Warning != "" {
+                    fmt.Printf("  %s⚠ %s%s\n", yellow, compat.Warning, reset)
+                }
+            }
+
+            stopSpin := newSpinner(fmt.Sprintf("Loading model from %s", *modelPath))
+            engine = inference.NewEngine(&cp.Config, cp.LayerLoader)
             stopSpin()
+
             fmt.Printf("\n  %s✓%s Model loaded: %s%s%s\n", green, reset, bold, cp.Architecture, reset)
             fmt.Printf("  %sLayers: %d  |  VocabSize: %d  |  HiddenSize: %d%s\n\n",
                 dim, cp.LayerCount, cp.VocabSize, cp.Config.HiddenSize, reset)
@@ -348,9 +351,6 @@ func main() {
 
         case "/bench":
             fmt.Printf("\n%s  Running benchmarks — this may take 30-60 seconds...%s\n\n",
-                dim, reset)
-            // Run as subprocess so it uses the benchmark binary
-            fmt.Printf("  %sTip: run 'leafcutter-bench' directly for full benchmark output.%s\n\n",
                 dim, reset)
             continue
         }

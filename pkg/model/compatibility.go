@@ -32,22 +32,25 @@ type CompatibilityReport struct {
 
 // CheckCompatibility determines if a model can run on current hardware
 func CheckCompatibility(mInfo ModelInfo, quantBits int) (*CompatibilityReport, error) {
+	cfg, err := getModelConfig(mInfo.Path, mInfo.Format)
+	if err != nil {
+		return nil, err
+	}
+	return CheckCompatibilityWithConfig(cfg, quantBits)
+}
+
+// CheckCompatibilityWithConfig determines if a model can run based on provided config
+func CheckCompatibilityWithConfig(cfg inference.Config, quantBits int) (*CompatibilityReport, error) {
 	// Detect hardware
 	hw, err := utils.DetectHardware()
 	if err != nil {
 		return nil, fmt.Errorf("failed to detect hardware: %w", err)
 	}
 
-	// Load model config (lightweight - just metadata)
-	cfg, err := getModelConfig(mInfo.Path, mInfo.Format)
-	if err != nil {
-		return nil, err
-	}
-
 	// Validate config
-	if cfg.NumHiddenLayers <= 0 || cfg.HiddenSize <= 0 || cfg.MaxSeqLen <= 0 {
-		return nil, fmt.Errorf("invalid model config: layers=%d, hidden=%d, seq=%d",
-			cfg.NumHiddenLayers, cfg.HiddenSize, cfg.MaxSeqLen)
+	if cfg.NumHiddenLayers <= 0 || cfg.HiddenSize <= 0 || cfg.MaxSeqLen <= 0 || cfg.NumHeads <= 0 {
+		return nil, fmt.Errorf("invalid model config: layers=%d, hidden=%d, seq=%d, heads=%d",
+			cfg.NumHiddenLayers, cfg.HiddenSize, cfg.MaxSeqLen, cfg.NumHeads)
 	}
 
 	// Estimate model size
