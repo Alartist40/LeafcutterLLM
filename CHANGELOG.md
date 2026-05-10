@@ -5,6 +5,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.5.1] — 2026-05-11 (Critical Stability & Accuracy Update)
+
+### Fixed
+- **Memory Estimation**: Corrected critical bugs in memory formulas.
+  - Fixed KV cache calculation to use `head_dim` instead of `hidden_size` (preventing massive overestimation).
+  - Fixed layer size estimation to use actual quantization bits instead of assuming Float32.
+  - Eliminated double-counting of embeddings and special layers in peak memory.
+- **Error Handling**: 
+  - Implemented proper error checking for weight unloading to prevent silent memory leaks.
+  - Added validation for model configurations to prevent division by zero or negative allocations.
+  - Added bounds checking in GGUF dequantization to prevent crashes on truncated files.
+- **Hardware Detection**: 
+  - Implemented real RAM detection for **macOS** using `sysctl` and `vm_stat`.
+  - Added proper error reporting for unimplemented platforms instead of returning hardcoded dummy values.
+- **GGUF Loader**: 
+  - Improved metadata extraction to handle single-element arrays and architecture-specific keys.
+  - Added descriptive error messages for unsupported K-quantization formats.
+
+### Changed
+- **Compatibility Report**: Enhanced the "LeafcutterLLM Advantage" display with more accurate metrics and better safety margin logic.
+
+---
+
 ## [0.5.0] — 2026-05-10 (Universal Model Support & Hardware Intelligence)
 
 ### Added

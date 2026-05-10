@@ -44,6 +44,12 @@ func CheckCompatibility(mInfo ModelInfo, quantBits int) (*CompatibilityReport, e
 		return nil, err
 	}
 
+	// Validate config
+	if cfg.NumHiddenLayers <= 0 || cfg.HiddenSize <= 0 || cfg.MaxSeqLen <= 0 {
+		return nil, fmt.Errorf("invalid model config: layers=%d, hidden=%d, seq=%d",
+			cfg.NumHiddenLayers, cfg.HiddenSize, cfg.MaxSeqLen)
+	}
+
 	// Estimate model size
 	estimate := EstimateModelSize(cfg, quantBits)
 
@@ -53,8 +59,10 @@ func CheckCompatibility(mInfo ModelInfo, quantBits int) (*CompatibilityReport, e
 	}
 
 	// LeafcutterLLM Advantage: How much we save vs naive loading
-	if estimate.LeafcutterPeak > 0 {
+	if estimate.LeafcutterPeak > 0 && estimate.PeakMemory > estimate.LeafcutterPeak {
 		report.MemorySavingsX = float64(estimate.PeakMemory) / float64(estimate.LeafcutterPeak)
+	} else {
+		report.MemorySavingsX = 1.0
 	}
 
 	// Required RAM for LeafcutterLLM
