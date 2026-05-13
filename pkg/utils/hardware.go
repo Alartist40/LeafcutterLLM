@@ -117,12 +117,23 @@ func detectRAMMacOS() (total, available int64, err error) {
 }
 
 func detectRAMWindows() (total, available int64, err error) {
+	// Try PowerShell first (modern Windows)
+	total, available, err = detectRAMWindowsPowerShell()
+	if err == nil {
+		return total, available, nil
+	}
+
+	// Fallback to wmic (older Windows)
+	return detectRAMWindowsWMIC()
+}
+
+func detectRAMWindowsPowerShell() (total, available int64, err error) {
 	// Use PowerShell to get RAM info
 	// TotalVisibleMemorySize and FreePhysicalMemory are in KB
 	cmdStr := "Get-CimInstance Win32_OperatingSystem | Select-Object TotalVisibleMemorySize, FreePhysicalMemory | ConvertTo-Json"
 	out, err := runCommand("powershell", "-Command", cmdStr)
 	if err != nil {
-		return 0, 0, fmt.Errorf("Windows RAM detection (PowerShell): %w", err)
+		return 0, 0, err
 	}
 
 	var raw struct {
@@ -131,10 +142,43 @@ func detectRAMWindows() (total, available int64, err error) {
 	}
 
 	if err := json.Unmarshal([]byte(out), &raw); err != nil {
-		return 0, 0, fmt.Errorf("failed to parse Windows RAM info: %w", err)
+		return 0, 0, err
 	}
 
 	return raw.TotalVisibleMemorySize * 1024, raw.FreePhysicalMemory * 1024, nil
+}
+
+func detectRAMWindowsWMIC() (total, available int64, err error) {
+	// Get Total Physical Memory
+	out, err := runCommand("wmic", "ComputerSystem", "get", "TotalPhysicalMemory", "/value")
+	if err == nil {
+		lines := strings.Split(out, "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "TotalPhysicalMemory=") {
+				valStr := strings.TrimSpace(strings.TrimPrefix(line, "TotalPhysicalMemory="))
+				total, _ = strconv.ParseInt(valStr, 10, 64)
+			}
+		}
+	}
+
+	// Get Available Physical Memory
+	out, err = runCommand("wmic", "OS", "get", "FreePhysicalMemory", "/value")
+	if err == nil {
+		lines := strings.Split(out, "\n")
+		for _, line := range lines {
+			if strings.HasPrefix(line, "FreePhysicalMemory=") {
+				valStr := strings.TrimSpace(strings.TrimPrefix(line, "FreePhysicalMemory="))
+				available, _ = strconv.ParseInt(valStr, 10, 64)
+				available *= 1024 // wmic returns KB for this
+			}
+		}
+	}
+
+	if total == 0 {
+		return 0, 0, fmt.Errorf("wmic failed to detect RAM")
+	}
+
+	return total, available, nil
 }
 
 func runCommand(name string, args ...string) (string, error) {

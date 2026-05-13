@@ -537,17 +537,25 @@ If you use LeafcutterLLM in research or production, please cite:
 
 ## Roadmap
 
-### v0.5.0 (Next Release)
-- [ ] GGUF format support
-- [ ] Distributed inference across multiple Pi nodes
-- [ ] WebSocket streaming responses
-- [ ] Grafana dashboards for performance monitoring
+# Current Release: v0.7.0 (2026-05-13)
+
+## What's New
+✅ **GGUF format support** (v0.5.0) — Run llama.cpp models directly.
+✅ **Hardware intelligence** (v0.5.0) — Automatic memory advice.
+✅ **Cross-platform RAM detection** (v0.6.0) — Native support for Linux, macOS, and Windows.
+✅ **Progressive testing framework** (v0.7.0) — Automated performance validation.
+✅ **Benchmark API endpoint** (v0.7.0) — Programmatic performance measurement.
+
+### v0.8.0 (Next)
+- [ ] **Distributed inference** across multiple Raspberry Pi nodes.
+- [ ] **Metal Performance Shaders (MPS)** for macOS acceleration.
+- [ ] **Grafana/Prometheus** monitoring integration.
+- [ ] **K-Quantization** support for GGUF models.
 
 ### v1.0.0 (Stable Release)
-- [ ] CUDA backend for NVIDIA GPUs
-- [ ] Metal Performance Shaders for macOS
-- [ ] Production-hardened error handling
-- [ ] Official Rust bindings
+- [ ] **CUDA backend** for NVIDIA GPUs.
+- [ ] **Production-hardened** error handling and security.
+- [ ] **Official Rust bindings** for high-performance integration.
 
 ---
 

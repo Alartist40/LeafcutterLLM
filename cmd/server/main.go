@@ -56,7 +56,7 @@ var (
 	showVer    = flag.Bool("version", false, "Print version and exit")
 )
 
-const serverVersion = "leafcutter-server v0.4.0 (Turbo Engine: Q4+Speculative+Batching)"
+const serverVersion = "leafcutter-server v0.7.0 (Turbo Engine: Q4+Speculative+Batching)"
 
 // ─── HTTP request/response DTOs ────────────────────────────────────────────────
 
@@ -140,9 +140,10 @@ func (r *modelRunner) runSingle(ctx context.Context, req *server.InferRequest) (
 // ─── HTTP handlers ─────────────────────────────────────────────────────────────
 
 type apiServer struct {
-	scheduler *server.Scheduler
-	tokenizer *tokenizer.BPETokenizer
-	counter   atomic.Int64
+	scheduler  *server.Scheduler
+	tokenizer  *tokenizer.BPETokenizer
+	counter    atomic.Int64
+	benchMutex sync.Mutex
 }
 
 func (s *apiServer) handleGenerate(w http.ResponseWriter, r *http.Request) {
@@ -209,6 +210,13 @@ func (s *apiServer) handleBenchmark(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Prevent concurrent benchmarks which would stack up RAM monitoring goroutines
+	if !s.benchMutex.TryLock() {
+		http.Error(w, "benchmark already in progress", http.StatusConflict)
+		return
+	}
+	defer s.benchMutex.Unlock()
 
 	var req BenchmarkRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

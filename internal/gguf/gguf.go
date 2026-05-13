@@ -114,7 +114,20 @@ func (g *GGUFFile) GetTensor(name string) ([]byte, error) {
 			size := calculateTensorSize(t.Dimensions, t.Type)
 
 			// Seek to tensor data (Offset is relative to the start of the data section)
-			if _, err := g.file.Seek(g.dataPos+int64(t.Offset), io.SeekStart); err != nil {
+			absOffset := g.dataPos + int64(t.Offset)
+			if absOffset < 0 {
+				return nil, fmt.Errorf("invalid tensor offset for %s: %d", name, absOffset)
+			}
+			
+			stat, err := g.file.Stat()
+			if err != nil {
+				return nil, err
+			}
+			if absOffset+size > stat.Size() {
+				return nil, fmt.Errorf("tensor %s data at offset %d exceeds file size %d", name, absOffset+size, stat.Size())
+			}
+
+			if _, err := g.file.Seek(absOffset, io.SeekStart); err != nil {
 				return nil, fmt.Errorf("failed to seek to tensor %s data: %w", name, err)
 			}
 

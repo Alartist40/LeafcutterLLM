@@ -30,19 +30,26 @@ echo "Starting Leafcutter server..."
 SERVER_PID=$!
 
 # Wait for server to start
+echo "Waiting for server to start..."
 MAX_RETRIES=30
 RETRY_COUNT=0
-while ! curl -s http://localhost:"$PORT"/health > /dev/null; do
+while true; do
+    if ! kill -0 $SERVER_PID 2>/dev/null; then
+        echo "❌ Server process died. Check /tmp/leafcutter.log"
+        exit 1
+    fi
+    if curl -s http://localhost:"$PORT"/health > /dev/null; then
+        echo "✅ Server is healthy."
+        break
+    fi
     sleep 1
     RETRY_COUNT=$((RETRY_COUNT + 1))
     if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
-        echo "❌ Server failed to start. Check /tmp/leafcutter.log"
-        kill $SERVER_PID
+        echo "❌ Server failed to start within $MAX_RETRIES seconds."
+        kill $SERVER_PID 2>/dev/null
         exit 1
     fi
 done
-
-echo "✅ Server started."
 
 # Test single request
 echo "Testing single request..."
