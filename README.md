@@ -34,6 +34,7 @@ LeafcutterLLM is a complete inference system for running large language models l
 ✅ **Auto-Detection** — Drop models into `/models` and run; no complex paths needed  
 ✅ **Hardware Intelligence** — Automatic compatibility checks and memory advice  
 ✅ **Memory Tuning** — Manual control over context length to fit massive models on tiny RAM  
+✅ **Testing Framework** — Automated suite for benchmarking models from 0.5B to 46B  
 ✅ **Speculative decoding** — 3-4x speedup with a small draft model  
 ✅ **HTTP + TUI interfaces** — REST API server + interactive terminal shell  
 ✅ **Production container** — multi-stage Podman/Docker build included  
@@ -62,6 +63,27 @@ LeafcutterLLM will automatically detect your model, check if your hardware can r
 ./leafcutter-server --check-only
 ```
 See the **LeafcutterLLM Advantage** report showing how much RAM we save you.
+
+### Automated Testing
+
+LeafcutterLLM includes a comprehensive progressive testing framework to validate performance across different model sizes.
+
+1. **Setup models:**
+   ```bash
+   bash scripts/download_models.sh
+   ```
+
+2. **Run all benchmarks:**
+   ```bash
+   bash scripts/benchmark_all_models.sh
+   ```
+
+3. **Generate report:**
+   ```bash
+   python3 scripts/generate_graphs.py
+   ```
+
+Results will be saved in the `results/` directory with detailed JSON metrics.
 
 ### Run the Benchmark
 
