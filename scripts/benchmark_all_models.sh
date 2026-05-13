@@ -49,16 +49,30 @@ for MODEL_SPEC in "${MODELS[@]}"; do
   # Wait for server to start
   MAX_RETRIES=30
   RETRY_COUNT=0
-  while ! curl -s http://localhost:"$PORT"/health > /dev/null; do
+  SERVER_OK=false
+  while true; do
+      if ! kill -0 $SERVER_PID 2>/dev/null; then
+          echo "❌ Server process died. Check /tmp/leafcutter.log"
+          break
+      fi
+      if curl -s http://localhost:"$PORT"/health > /dev/null; then
+          echo "✅ Server started."
+          SERVER_OK=true
+          break
+      fi
       sleep 1
       RETRY_COUNT=$((RETRY_COUNT + 1))
       if [ "$RETRY_COUNT" -ge "$MAX_RETRIES" ]; then
-          echo "❌ Server failed to start. Check /tmp/leafcutter.log"
-          kill $SERVER_PID
-          continue 2
+          echo "❌ Server failed to start within $MAX_RETRIES seconds."
+          kill $SERVER_PID 2>/dev/null
+          break
       fi
   done
   
+  if [ "$SERVER_OK" = false ]; then
+      continue
+  fi
+
   # Run tests and collect metrics
   echo "Running benchmark..."
   curl -s -X POST http://localhost:"$PORT"/benchmark \
