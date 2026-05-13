@@ -5,6 +5,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.7.0] — 2026-05-13 (Progressive Testing Framework)
+
+### Added
+- **Progressive Testing Framework**: Comprehensive strategy for validating models from 0.5B to 46B parameters.
+- **Benchmark API Endpoint**: New `/benchmark` endpoint on the server for automated performance measurement.
+- **Dedicated Test Suite**: Self-contained `test-suite` binary for deep metric collection without a running server.
+- **Automated Testing Scripts**: 
+  - `scripts/download_models.sh`: One-click setup for testing lineup.
+  - `scripts/test_single_model.sh`: Standardized single-model validation.
+  - `scripts/benchmark_all_models.sh`: Full pipeline for cross-model comparison.
+  - `scripts/generate_graphs.py`: Python-based visualization for latency, RAM, and throughput.
+- **Model Lineup**: Curated list of 10 models optimized for Leafcutter's layer-by-layer architecture.
+
+### Changed
+- **Server Internal**: Enhanced peak RAM tracking and throughput calculation during benchmarks.
+
+### Fixed
+- **Stability**: Improved shutdown handling during automated test runs.
+
+---
+
 ## [0.6.0] — 2026-05-12 (Polished & Cross-Platform)
 
 ### Added
