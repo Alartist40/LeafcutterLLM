@@ -1,16 +1,24 @@
 //! f32 tensor implementation with pluggable compute backend
 
 use crate::backend::{default_backend, set_global_backend, Backend};
+use crate::kernels::q4_0::Matrix as Q4Matrix;
 use crate::kernels::q8_0::Matrix as Q8Matrix;
+
+/// Native quantized weight data attached to a Tensor.
+/// When present, matmul dispatches to a format-specific kernel
+/// for memory-bandwidth savings. All other ops use `data` (f32).
+#[derive(Clone)]
+pub enum QuantizedData {
+    Q4_0(Q4Matrix),
+    Q8_0(Q8Matrix),
+}
 
 #[derive(Clone)]
 pub struct Tensor {
     pub shape: Vec<usize>,
     pub data: Vec<f32>,
-    /// Optional Q8_0 quantized weights. When present, matmul uses
-    /// native INT8 GEMM for ~4× memory bandwidth savings on the
-    /// weight matrix. All other ops still use `data` (f32).
-    q8_data: Option<Q8Matrix>,
+    /// Optional quantized weights for fast matmul.
+    q_data: Option<QuantizedData>,
     backend: &'static dyn Backend,
 }
 
@@ -19,6 +27,7 @@ impl std::fmt::Debug for Tensor {
         f.debug_struct("Tensor")
             .field("shape", &self.shape)
             .field("data_len", &self.data.len())
+            .field("quantized", &self.q_data.is_some())
             .field("backend", &"<dyn Backend>")
             .finish()
     }
@@ -31,7 +40,7 @@ impl Tensor {
         Self {
             shape,
             data: vec![0.0; size],
-            q8_data: None,
+            q_data: None,
             backend: default_backend(),
         }
     }
@@ -42,7 +51,7 @@ impl Tensor {
         Self {
             shape,
             data,
-            q8_data: None,
+            q_data: None,
             backend: default_backend(),
         }
     }
@@ -50,7 +59,7 @@ impl Tensor {
     /// Create a tensor with a specific backend.
     pub fn from_vec_with_backend(data: Vec<f32>, shape: Vec<usize>, backend: &'static dyn Backend) -> Self {
         assert_eq!(data.len(), shape.iter().product::<usize>());
-        Self { shape, data, q8_data: None, backend }
+        Self { shape, data, q_data: None, backend }
     }
 
     /// Create a tensor from Q8_0 quantized weights.
@@ -61,14 +70,27 @@ impl Tensor {
         Self {
             shape,
             data,
-            q8_data: Some(q8),
+            q_data: Some(QuantizedData::Q8_0(q8)),
             backend: default_backend(),
         }
     }
 
-    /// Returns true if this tensor has native Q8_0 data for fast matmul.
-    pub fn has_q8_data(&self) -> bool {
-        self.q8_data.is_some()
+    /// Create a tensor from Q4_0 quantized weights.
+    /// Stores both Q4_0 (for fast INT4 matmul) and f32 (for other ops).
+    pub fn from_q4_0(q4: Q4Matrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q4.rows * q4.cols, shape.iter().product::<usize>());
+        let data = q4.dequantize();
+        Self {
+            shape,
+            data,
+            q_data: Some(QuantizedData::Q4_0(q4)),
+            backend: default_backend(),
+        }
+    }
+
+    /// Returns true if this tensor has native quantized data for fast matmul.
+    pub fn is_quantized(&self) -> bool {
+        self.q_data.is_some()
     }
 
     /// Set the global backend for all new Tensors.
@@ -90,12 +112,21 @@ impl Tensor {
         let n = other.shape[1];
         assert_eq!(k, other.shape[0]);
 
-        // Fast path: if other has Q8_0 weights, use native INT8 GEMM
-        if let Some(ref q8) = other.q8_data {
-            assert_eq!(q8.rows, k);
-            assert_eq!(q8.cols, n);
+        // Fast path: if other has quantized weights, use native GEMM
+        if let Some(ref q) = other.q_data {
             let mut result = vec![0.0f32; m * n];
-            crate::kernels::int8_gemm::q8_0_matmul(&self.data, q8, &mut result, m, k, n);
+            match q {
+                QuantizedData::Q8_0(q8) => {
+                    assert_eq!(q8.rows, k);
+                    assert_eq!(q8.cols, n);
+                    crate::kernels::int8_gemm::q8_0_matmul(&self.data, q8, &mut result, m, k, n);
+                }
+                QuantizedData::Q4_0(q4) => {
+                    assert_eq!(q4.rows, k);
+                    assert_eq!(q4.cols, n);
+                    crate::kernels::int8_gemm::q4_0_matmul(&self.data, q4, &mut result, m, k, n);
+                }
+            }
             return Self::from_vec_with_backend(result, vec![m, n], self.backend);
         }
 
@@ -136,7 +167,7 @@ impl Tensor {
         Self {
             shape,
             data: self.data.clone(),
-            q8_data: None, // reshape invalidates Q8_0 layout
+            q_data: None, // reshape invalidates quantized block layout
             backend: self.backend,
         }
     }
@@ -152,7 +183,7 @@ impl Tensor {
                 result[j * m + i] = self.data[i * n + j];
             }
         }
-        // Transpose invalidates Q8_0 block layout
+        // Transpose invalidates quantized block layout
         Self::from_vec_with_backend(result, vec![n, m], self.backend)
     }
 }

@@ -36,6 +36,8 @@ pub enum QuantFormat {
     F32 = 0,
     /// Q8_0 per-block quantization (32 int8 + f16 scale per block)
     Q8_0 = 1,
+    /// Q4_0 per-block quantization (32 4-bit + f16 scale per block)
+    Q4_0 = 2,
 }
 
 impl QuantFormat {
@@ -43,6 +45,7 @@ impl QuantFormat {
         match v {
             0 => Some(QuantFormat::F32),
             1 => Some(QuantFormat::Q8_0),
+            2 => Some(QuantFormat::Q4_0),
             _ => None,
         }
     }
