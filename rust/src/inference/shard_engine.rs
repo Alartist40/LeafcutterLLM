@@ -60,6 +60,16 @@ impl ShardEngine {
         })
     }
 
+    /// Clear the KV cache (e.g., between conversations).
+    pub fn reset_kv_cache(&mut self) {
+        self.kv_cache.clear();
+    }
+
+    /// Report KV cache memory usage in megabytes.
+    pub fn kv_cache_memory_mb(&self) -> f64 {
+        self.kv_cache.memory_bytes() as f64 / (1024.0 * 1024.0)
+    }
+
     /// Autoregressive generation.
     pub fn generate(&mut self, tokens: &[usize], max_tokens: usize, temperature: f32, top_p: f32) -> Vec<usize> {
         self.kv_cache.clear();
