@@ -62,7 +62,7 @@ pub fn attention_forward(
     apply_rotary_emb(&mut q, seq_len, params.num_heads, params.head_dim, params.rope_theta);
     apply_rotary_emb(&mut k, seq_len, params.num_kv_heads, params.head_dim, params.rope_theta);
 
-    // Update KV cache
+    // Update KV cache (stores as f16 for 2× RAM savings)
     kv_cache.append(layer_idx, k.clone(), v.clone());
     let (k_cached, v_cached) = kv_cache.get(layer_idx).unwrap();
 
