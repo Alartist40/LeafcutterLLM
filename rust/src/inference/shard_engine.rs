@@ -325,4 +325,96 @@ mod tests {
         // Forward pass completed successfully — all values should be finite
         assert!(logits.iter().all(|v| v.is_finite()), "Non-finite values in logits: {:?}", logits);
     }
+
+    /// Same as test_shard_engine_forward but with Q8_0 quantized shards.
+    /// Dimensions must be multiples of 32 for native INT8 GEMM.
+    #[test]
+    fn test_shard_engine_forward_q8_0() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().to_str().unwrap();
+
+        let hidden = 32;
+        let intermediate = 64;
+        let vocab = 32;
+        let num_layers = 2;
+
+        let config = ModelConfig {
+            hidden_size: hidden,
+            num_hidden_layers: num_layers,
+            num_attention_heads: 4,
+            num_key_value_heads: 4,
+            intermediate_size: intermediate,
+            max_seq_len: 128,
+            vocab_size: vocab,
+            rope_theta: 10000.0,
+        };
+
+        let writer = ShardWriter::with_quant(config.clone(), output_dir, crate::shard::QuantFormat::Q8_0);
+
+        // Write layer shards
+        let mut layer_files = Vec::new();
+        for i in 0..num_layers {
+            let weights = create_identity_weights(hidden, intermediate);
+            let (filename, size) = writer.write_layer_shard(i, &weights).unwrap();
+            layer_files.push(LayerManifest { idx: i, file: filename, size });
+        }
+
+        // Write special shards
+        let mut embed = HashMap::new();
+        let mut embed_data = vec![0.0f32; vocab * hidden];
+        for i in 0..vocab {
+            embed_data[i * hidden] = i as f32;
+        }
+        embed.insert("model.embed_tokens.weight".to_string(), Tensor::from_vec(embed_data, vec![vocab, hidden]));
+        let (embed_file, embed_size) = writer.write_special_shard("embed", &embed).unwrap();
+
+        let mut norm = HashMap::new();
+        norm.insert("model.norm.weight".to_string(), ones_vector(hidden));
+        let (norm_file, norm_size) = writer.write_special_shard("norm", &norm).unwrap();
+
+        let mut lm_head = HashMap::new();
+        let mut lm_data = vec![0.0f32; hidden * vocab];
+        for i in 0..vocab.min(hidden) {
+            lm_data[i * vocab + i] = 1.0;
+        }
+        lm_head.insert("lm_head.weight".to_string(), Tensor::from_vec(lm_data, vec![hidden, vocab]));
+        let (lm_head_file, lm_head_size) = writer.write_special_shard("lm_head", &lm_head).unwrap();
+
+        let manifest = Manifest {
+            model: "test-q8".to_string(),
+            num_layers,
+            hidden_size: hidden,
+            vocab_size: vocab,
+            num_attention_heads: 4,
+            num_key_value_heads: 4,
+            intermediate_size: intermediate,
+            max_seq_len: 128,
+            rope_theta: 10000.0,
+            shard_dir: output_dir.to_string(),
+            layers: layer_files,
+            special: SpecialManifest {
+                embed: embed_file,
+                embed_size,
+                norm: norm_file,
+                norm_size,
+                lm_head: lm_head_file,
+                lm_head_size,
+            },
+        };
+
+        let manifest_path = dir.path().join("manifest.json");
+        std::fs::write(&manifest_path, serde_json::to_string_pretty(&manifest).unwrap()).unwrap();
+
+        // Load engine and run forward
+        let mut engine = ShardEngine::load(manifest_path.to_str().unwrap()).unwrap();
+        let logits = engine.forward(&[3]);
+
+        assert_eq!(logits.len(), vocab);
+        assert!(logits.iter().all(|v| v.is_finite()), "Non-finite values in Q8_0 logits: {:?}", logits);
+
+        // Verify that loaded weight tensors actually carry Q8_0 metadata
+        let layer0 = engine.loader.load_layer(0).unwrap();
+        let q_proj = layer0.get("self_attn.q_proj.weight").unwrap();
+        assert!(q_proj.has_q8_data(), "Q8_0 shard should load weights with Q8_0 metadata");
+    }
 }

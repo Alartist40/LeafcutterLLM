@@ -331,12 +331,10 @@ fn parse_shard_from_mmap(mmap: &[u8]) -> Result<HashMap<String, Tensor>, Box<dyn
                     ).into());
                 }
                 let blocks = crate::kernels::q8_0::blocks_from_bytes(data_bytes);
-                let rows = shape[0];
-                let cols = shape[1];
-                // Only create a Q8_0 Tensor if cols is a multiple of 32.
-                // Real model weights always satisfy this; small test tensors may not.
-                if cols % 32 == 0 && shape.len() == 2 {
-                    let q8 = Q8Matrix { rows, cols, blocks };
+                // Only create a Q8_0 Tensor if it's a 2D matrix with cols multiple of 32.
+                // 1D tensors (norm weights, biases) just get dequantized to f32.
+                if shape.len() == 2 && shape[1] % 32 == 0 {
+                    let q8 = Q8Matrix { rows: shape[0], cols: shape[1], blocks };
                     tensors.insert(meta.name, Tensor::from_q8_0(q8, shape));
                 } else {
                     let mut out = vec![0.0f32; element_count];
