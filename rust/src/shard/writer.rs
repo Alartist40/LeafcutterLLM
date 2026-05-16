@@ -359,17 +359,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output_dir = dir.path().to_str().unwrap();
 
-        // Create fake layer weights (must be multiple of 32 elements for Q8_0)
+        // Create fake layer weights (cols must be multiple of 32 for native Q8_0 matmul)
         let mut weights = HashMap::new();
         let q_data: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1 - 3.2).collect();
-        weights.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(q_data.clone(), vec![8, 8]));
+        weights.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(q_data.clone(), vec![2, 32]));
 
         let config = ModelConfig {
-            hidden_size: 8,
+            hidden_size: 32,
             num_hidden_layers: 1,
             num_attention_heads: 1,
             num_key_value_heads: 1,
-            intermediate_size: 8,
+            intermediate_size: 32,
             max_seq_len: 128,
             vocab_size: 100,
             rope_theta: 10000.0,
@@ -382,11 +382,11 @@ mod tests {
         let manifest = Manifest {
             model: "test".to_string(),
             num_layers: 1,
-            hidden_size: 8,
+            hidden_size: 32,
             vocab_size: 100,
             num_attention_heads: 1,
             num_key_value_heads: 1,
-            intermediate_size: 8,
+            intermediate_size: 32,
             max_seq_len: 128,
             rope_theta: 10000.0,
             shard_dir: output_dir.to_string(),
@@ -406,13 +406,27 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         let q = loaded.get("self_attn.q_proj.weight").unwrap();
-        assert_eq!(q.shape, vec![8, 8]);
+        assert_eq!(q.shape, vec![2, 32]);
 
         // Check roundtrip error is small (< 1% relative)
         for i in 0..q.data.len() {
             let err = (q.data[i] - q_data[i]).abs();
             assert!(err < 0.1, "Q8_0 roundtrip error too large at {}: got {}, expected {}, err={}",
                 i, q.data[i], q_data[i], err);
+        }
+
+        // Verify the tensor carries native Q8_0 metadata for fast matmul
+        assert!(q.has_q8_data(), "Q8_0-loaded tensor should carry Q8_0 metadata");
+
+        // Verify INT8 GEMM path produces the same result as f32 matmul
+        // a [4, 2] @ q [2, 32] -> [4, 32]
+        let a = Tensor::from_vec((0..8).map(|i| (i as f32) * 0.1).collect(), vec![4, 2]);
+        let c_q8 = a.matmul(q);
+        let q_f32 = Tensor::from_vec(q.data.clone(), q.shape.clone());
+        let c_f32 = a.matmul(&q_f32);
+        for i in 0..c_q8.data.len() {
+            assert!((c_q8.data[i] - c_f32.data[i]).abs() < 1e-3,
+                "INT8 GEMM mismatch at {}: q8={}, f32={}", i, c_q8.data[i], c_f32.data[i]);
         }
     }
 }

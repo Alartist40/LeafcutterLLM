@@ -1,6 +1,7 @@
 //! ShardLoader — mmap-based layer loading with explicit eviction and cache
 
 use crate::model::tensor::Tensor;
+use crate::kernels::q8_0::Matrix as Q8Matrix;
 use super::format::{ShardHeader, ShardTensorMeta};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -305,7 +306,9 @@ fn parse_shard_from_mmap(mmap: &[u8]) -> Result<HashMap<String, Tensor>, Box<dyn
         let data_bytes = &mmap[start..end];
         let element_count = meta.element_count();
 
-        let data = match header.quant_format {
+        let shape: Vec<usize> = meta.dims.iter().map(|&d| d as usize).collect();
+
+        match header.quant_format {
             super::format::QuantFormat::F32 => {
                 if data_bytes.len() != element_count * 4 {
                     return Err(format!(
@@ -317,7 +320,7 @@ fn parse_shard_from_mmap(mmap: &[u8]) -> Result<HashMap<String, Tensor>, Box<dyn
                 for (i, chunk) in data_bytes.chunks_exact(4).enumerate() {
                     out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                 }
-                out
+                tensors.insert(meta.name, Tensor::from_vec(out, shape));
             }
             super::format::QuantFormat::Q8_0 => {
                 let expected_bytes = (element_count / 32) * 34;
@@ -327,14 +330,21 @@ fn parse_shard_from_mmap(mmap: &[u8]) -> Result<HashMap<String, Tensor>, Box<dyn
                         meta.name, data_bytes.len(), expected_bytes
                     ).into());
                 }
-                let mut out = vec![0.0f32; element_count];
-                crate::kernels::dequantize_q8_0(data_bytes, &mut out);
-                out
+                let blocks = crate::kernels::q8_0::blocks_from_bytes(data_bytes);
+                let rows = shape[0];
+                let cols = shape[1];
+                // Only create a Q8_0 Tensor if cols is a multiple of 32.
+                // Real model weights always satisfy this; small test tensors may not.
+                if cols % 32 == 0 && shape.len() == 2 {
+                    let q8 = Q8Matrix { rows, cols, blocks };
+                    tensors.insert(meta.name, Tensor::from_q8_0(q8, shape));
+                } else {
+                    let mut out = vec![0.0f32; element_count];
+                    crate::kernels::dequantize_q8_0(data_bytes, &mut out);
+                    tensors.insert(meta.name, Tensor::from_vec(out, shape));
+                }
             }
         };
-
-        let shape: Vec<usize> = meta.dims.iter().map(|&d| d as usize).collect();
-        tensors.insert(meta.name, Tensor::from_vec(data, shape));
     }
 
     Ok(tensors)
