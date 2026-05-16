@@ -1,0 +1,29 @@
+# Binaries
+bin/
+leafcutter-server
+atta
+benchmark
+leafcutter-bench
+leafcutter-tui
+server
+test-suite
+tui
+
+# Build artifacts
+coverage.out
+rust/target/
+
+# Models and large files
+*.gguf
+*.crdownload
+
+# Logs and results
+logs/
+results/
+
+# Go backup
+go-backup/
+
+# OS generated files
+.DS_Store
+.env

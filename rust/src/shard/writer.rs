@@ -1,0 +1,326 @@
+//! ShardWriter — splits a GGUF model into per-layer shard files
+//!
+//! This is a **one-time preprocessing step**.  After splitting, the
+//! original GGUF can be kept or archived; inference uses the shards.
+
+use crate::model::loader::{GGUFModel, ModelConfig};
+use crate::model::tensor::Tensor;
+use super::format::{ShardHeader, ShardTensorMeta, align_up, DATA_ALIGN};
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Seek, Write};
+use std::path::Path;
+
+pub struct ShardWriter {
+    pub config: ModelConfig,
+    pub output_dir: String,
+}
+
+impl ShardWriter {
+    pub fn new(config: ModelConfig, output_dir: &str) -> Self {
+        std::fs::create_dir_all(output_dir).ok();
+        Self {
+            config,
+            output_dir: output_dir.to_string(),
+        }
+    }
+
+    /// Write a single layer's weights to a `.shard` file.
+    pub fn write_layer_shard(
+        &self,
+        layer_idx: usize,
+        weights: &HashMap<String, Tensor>,
+    ) -> std::io::Result<(String, u64)> {
+        let filename = format!("layer_{:03}.shard", layer_idx);
+        let path = Path::new(&self.output_dir).join(&filename);
+        let file = File::create(&path)?;
+        let mut writer = BufWriter::new(file);
+
+        // Collect metadata and compute layout
+        let tensor_count = weights.len() as u32;
+        let mut metas: Vec<(String, &Tensor, ShardTensorMeta)> = Vec::new();
+
+        // Header size
+        let mut current_offset = ShardHeader::SIZE as u64;
+
+        // First pass: compute metadata sizes
+        for (name, tensor) in weights.iter() {
+            let name_bytes = name.as_bytes().len() as u64;
+            let meta_size = 4 + name_bytes + 4 + (tensor.shape.len() as u64) * 8 + 8 + 8;
+            current_offset += meta_size;
+        }
+
+        // Align to data section boundary
+        let data_start = align_up(current_offset, DATA_ALIGN);
+        current_offset = data_start;
+
+        // Second pass: assign data offsets and build metadata
+        for (name, tensor) in weights.iter() {
+            let data_size = (tensor.data.len() * 4) as u64;
+            let meta = ShardTensorMeta {
+                name: name.clone(),
+                rank: tensor.shape.len() as u32,
+                dims: tensor.shape.iter().map(|&d| d as u64).collect(),
+                data_offset: current_offset,
+                data_size,
+            };
+            metas.push((name.clone(), tensor, meta));
+            current_offset += data_size;
+        }
+
+        // Write header
+        let header = ShardHeader::new(tensor_count, data_start);
+        header.write(&mut writer)?;
+
+        // Write metadata
+        for (_, _, meta) in &metas {
+            meta.write(&mut writer)?;
+        }
+
+        // Pad to data_start
+        let padding = data_start - writer.stream_position()?;
+        if padding > 0 {
+            writer.write_all(&vec![0u8; padding as usize])?;
+        }
+
+        // Write tensor data
+        for (_, tensor, meta) in &metas {
+            debug_assert_eq!(writer.stream_position()?, meta.data_offset);
+            for &val in &tensor.data {
+                writer.write_all(&val.to_le_bytes())?;
+            }
+        }
+
+        writer.flush()?;
+        let file_size = std::fs::metadata(&path)?.len();
+        Ok((filename, file_size))
+    }
+
+    /// Write special weights (embed, norm, lm_head) to individual shard files.
+    pub fn write_special_shard(
+        &self,
+        name: &str,
+        weights: &HashMap<String, Tensor>,
+    ) -> std::io::Result<(String, u64)> {
+        let filename = format!("{}.shard", name);
+        let path = Path::new(&self.output_dir).join(&filename);
+        let file = File::create(&path)?;
+        let mut writer = BufWriter::new(file);
+
+        let tensor_count = weights.len() as u32;
+        let mut metas: Vec<ShardTensorMeta> = Vec::new();
+
+        let mut current_offset = ShardHeader::SIZE as u64;
+        for (tensor_name, tensor) in weights.iter() {
+            let name_bytes = tensor_name.as_bytes().len() as u64;
+            let meta_size = 4 + name_bytes + 4 + (tensor.shape.len() as u64) * 8 + 8 + 8;
+            current_offset += meta_size;
+        }
+
+        let data_start = align_up(current_offset, DATA_ALIGN);
+        current_offset = data_start;
+
+        for (tensor_name, tensor) in weights.iter() {
+            let data_size = (tensor.data.len() * 4) as u64;
+            let meta = ShardTensorMeta {
+                name: tensor_name.clone(),
+                rank: tensor.shape.len() as u32,
+                dims: tensor.shape.iter().map(|&d| d as u64).collect(),
+                data_offset: current_offset,
+                data_size,
+            };
+            metas.push(meta);
+            current_offset += data_size;
+        }
+
+        let header = ShardHeader::new(tensor_count, data_start);
+        header.write(&mut writer)?;
+
+        for meta in &metas {
+            meta.write(&mut writer)?;
+        }
+
+        let padding = data_start - writer.stream_position()?;
+        if padding > 0 {
+            writer.write_all(&vec![0u8; padding as usize])?;
+        }
+
+        for (tensor_name, tensor) in weights.iter() {
+            let meta = metas.iter().find(|m| m.name == *tensor_name).unwrap();
+            debug_assert_eq!(writer.stream_position()?, meta.data_offset);
+            for &val in &tensor.data {
+                writer.write_all(&val.to_le_bytes())?;
+            }
+        }
+
+        writer.flush()?;
+        let file_size = std::fs::metadata(&path)?.len();
+        Ok((filename, file_size))
+    }
+}
+
+/// Convenience: split an entire GGUF model into shards.
+pub fn split_gguf_model(
+    model_path: &str,
+    output_dir: &str,
+) -> Result<super::loader::Manifest, Box<dyn std::error::Error>> {
+    println!("Loading GGUF model: {}", model_path);
+    let model = GGUFModel::load(model_path)?;
+    let config = model.config.clone();
+
+    let writer = ShardWriter::new(config.clone(), output_dir);
+
+    // Write layer shards
+    let mut layer_files = Vec::new();
+    println!("Splitting {} layers...", config.num_hidden_layers);
+    for layer_idx in 0..config.num_hidden_layers {
+        let weights = model.load_layer(layer_idx)?;
+        let (filename, size) = writer.write_layer_shard(layer_idx, &weights)?;
+        layer_files.push(super::loader::LayerManifest {
+            idx: layer_idx,
+            file: filename,
+            size,
+        });
+        if (layer_idx + 1) % 10 == 0 || layer_idx == config.num_hidden_layers - 1 {
+            println!("  Layer {}/{} done", layer_idx + 1, config.num_hidden_layers);
+        }
+    }
+
+    // Write special shards
+    println!("Writing special weights...");
+    let special_weights = model.load_special()?;
+
+    // Split special weights into individual files for simplicity
+    let embed_weights: HashMap<String, Tensor> = special_weights
+        .iter()
+        .filter(|(k, _)| k.contains("embed"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let (embed_file, embed_size) = writer.write_special_shard("embed", &embed_weights)?;
+
+    let norm_weights: HashMap<String, Tensor> = special_weights
+        .iter()
+        .filter(|(k, _)| k.contains("norm"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let (norm_file, norm_size) = writer.write_special_shard("norm", &norm_weights)?;
+
+    let lm_head_weights: HashMap<String, Tensor> = special_weights
+        .iter()
+        .filter(|(k, _)| k.contains("lm_head"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let (lm_head_file, lm_head_size) = writer.write_special_shard("lm_head", &lm_head_weights)?;
+
+    let manifest = super::loader::Manifest {
+        model: config_to_model_name(model_path),
+        num_layers: config.num_hidden_layers,
+        hidden_size: config.hidden_size,
+        vocab_size: config.vocab_size,
+        num_attention_heads: config.num_attention_heads,
+        num_key_value_heads: config.num_key_value_heads,
+        intermediate_size: config.intermediate_size,
+        max_seq_len: config.max_seq_len,
+        rope_theta: config.rope_theta,
+        shard_dir: output_dir.to_string(),
+        layers: layer_files,
+        special: super::loader::SpecialManifest {
+            embed: embed_file,
+            embed_size,
+            norm: norm_file,
+            norm_size,
+            lm_head: lm_head_file,
+            lm_head_size,
+        },
+    };
+
+    // Write manifest JSON
+    let manifest_path = Path::new(output_dir).join("manifest.json");
+    let manifest_json = serde_json::to_string_pretty(&manifest)?;
+    std::fs::write(&manifest_path, manifest_json)?;
+    println!("Manifest written to: {}", manifest_path.display());
+
+    Ok(manifest)
+}
+
+fn config_to_model_name(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard::loader::{ShardLoader, Manifest, LayerManifest, SpecialManifest};
+    use std::collections::HashMap;
+
+    #[test]
+    fn test_shard_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().to_str().unwrap();
+
+        // Create fake layer weights
+        let mut weights = HashMap::new();
+        weights.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(
+            vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]
+        ));
+        weights.insert("mlp.gate_proj.weight".to_string(), Tensor::from_vec(
+            vec![0.5, 1.5, 2.5, 3.5], vec![2, 2]
+        ));
+        weights.insert("input_layernorm.weight".to_string(), Tensor::from_vec(
+            vec![1.0, 1.0], vec![2]
+        ));
+
+        let config = ModelConfig {
+            hidden_size: 2,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 2,
+            max_seq_len: 128,
+            vocab_size: 100,
+            rope_theta: 10000.0,
+        };
+
+        let writer = ShardWriter::new(config, output_dir);
+        let (filename, size) = writer.write_layer_shard(0, &weights).unwrap();
+        assert!(size > 0);
+
+        // Create a minimal manifest for the loader
+        let manifest = Manifest {
+            model: "test".to_string(),
+            num_layers: 1,
+            hidden_size: 2,
+            vocab_size: 100,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 2,
+            max_seq_len: 128,
+            rope_theta: 10000.0,
+            shard_dir: output_dir.to_string(),
+            layers: vec![LayerManifest { idx: 0, file: filename, size }],
+            special: SpecialManifest {
+                embed: "embed.shard".to_string(),
+                embed_size: 0,
+                norm: "norm.shard".to_string(),
+                norm_size: 0,
+                lm_head: "lm_head.shard".to_string(),
+                lm_head_size: 0,
+            },
+        };
+
+        let loader = ShardLoader::from_manifest(manifest);
+        let loaded = loader.load_layer(0).unwrap();
+
+        assert_eq!(loaded.len(), 3);
+        let q = loaded.get("self_attn.q_proj.weight").unwrap();
+        assert_eq!(q.shape, vec![2, 2]);
+        assert_eq!(q.data, vec![1.0, 2.0, 3.0, 4.0]);
+
+        let gate = loaded.get("mlp.gate_proj.weight").unwrap();
+        assert_eq!(gate.data, vec![0.5, 1.5, 2.5, 3.5]);
+    }
+}
