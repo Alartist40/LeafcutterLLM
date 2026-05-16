@@ -5,24 +5,25 @@
 //!   - B is Q8_0 quantized [k, n]
 //!   - C is f32 [m, n]
 //!
-//! The Q8_0 weights are dequantized on-the-fly inside the kernel,
-//! giving 4× memory bandwidth savings vs f32 weights.
+//! Q8_0 weights are dequantized on-the-fly inside the kernel using
+//! small stack buffers (128 bytes per block). This gives 4× memory
+//! bandwidth savings vs f32 weights while reusing proven f32 SIMD
+//! kernels for the actual arithmetic.
 
 use super::q8_0::Matrix as Q8Matrix;
-use super::simd;
 
-/// Scalar INT8 GEMM with on-the-fly dequantization.
-/// This is the reference implementation — SIMD variants go below.
+// ============================================================================
+// Scalar reference implementation
+// ============================================================================
+
 pub fn q8_0_matmul_scalar(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, _k: usize, n: usize) {
     assert_eq!(b.cols, n);
     let bpr = b.blocks_per_row();
 
     for i in 0..m {
-        // Zero the output row
         for j in 0..n {
             c[i * n + j] = 0.0;
         }
-        // Accumulate over k dimension
         for l in 0..b.rows {
             let a_val = a[i * b.rows + l];
             let row_base = l * bpr;
@@ -38,73 +39,173 @@ pub fn q8_0_matmul_scalar(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, _k: 
     }
 }
 
-/// SIMD-accelerated INT8 GEMM.
-/// Dequantizes Q8_0 blocks to f32 on-the-fly, then uses the same
-/// SIMD f32 matmul kernel for the actual computation.
-///
-/// This gives the memory-bandwidth win of Q8_0 (4× less data movement)
-/// while reusing our proven f32 SIMD kernels for compute.
-pub fn q8_0_matmul_simd(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, _k: usize, n: usize) {
-    assert_eq!(b.cols, n);
-    assert_eq!(n % 4, 0, "SIMD path requires n to be a multiple of 4");
+// ============================================================================
+// x86_64 AVX2/FMA implementation (256-bit vectors, 8×f32)
+// ============================================================================
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q8_0_matmul_avx2_inner(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, _k: usize, n: usize) {
+    use std::arch::x86_64::*;
+
+    assert_eq!(n % 32, 0, "AVX2 path requires n multiple of 32");
     let bpr = b.blocks_per_row();
 
     for i in 0..m {
-        // Zero the output row
-        for j in 0..n {
-            c[i * n + j] = 0.0;
+        let c_row = &mut c[i * n..(i + 1) * n];
+        // Zero output row with AVX2
+        {
+            let mut j = 0;
+            while j + 8 <= n {
+                _mm256_storeu_ps(c_row.as_mut_ptr().add(j), _mm256_setzero_ps());
+                j += 8;
+            }
+            for jt in j..n {
+                c_row[jt] = 0.0;
+            }
         }
-        // Accumulate over k dimension
+
         for l in 0..b.rows {
-            let a_val = a[i * b.rows + l];
+            let a_val = _mm256_set1_ps(*a.get_unchecked(i * b.rows + l));
             let row_base = l * bpr;
+
             for block_idx in 0..bpr {
                 let block = &b.blocks[row_base + block_idx];
                 let j_base = block_idx * 32;
                 let scale = block.scale;
 
-                // Process 4 columns at a time using SIMD
-                let mut jj = 0;
-                while jj + 4 <= 32 {
-                    let b_f32 = [
-                        block.qs[jj] as f32 * scale,
-                        block.qs[jj + 1] as f32 * scale,
-                        block.qs[jj + 2] as f32 * scale,
-                        block.qs[jj + 3] as f32 * scale,
-                    ];
-                    c[i * n + j_base + jj] += a_val * b_f32[0];
-                    c[i * n + j_base + jj + 1] += a_val * b_f32[1];
-                    c[i * n + j_base + jj + 2] += a_val * b_f32[2];
-                    c[i * n + j_base + jj + 3] += a_val * b_f32[3];
-                    jj += 4;
+                // Dequantize 32 int8 values to a stack buffer, then AVX2 fma
+                let mut deq: [f32; 32] = [0.0; 32];
+                for jj in 0..32 {
+                    deq[jj] = block.qs[jj] as f32 * scale;
                 }
-                // Scalar tail (shouldn't happen for n multiple of 4)
-                for jjt in jj..32 {
-                    c[i * n + j_base + jjt] += a_val * (block.qs[jjt] as f32) * scale;
+
+                let c_ptr = c_row.as_mut_ptr().add(j_base);
+                let d_ptr = deq.as_ptr();
+
+                // 4 × 8-wide AVX2 iterations
+                for vec_idx in 0..4 {
+                    let offset = vec_idx * 8;
+                    let b_vec = _mm256_loadu_ps(d_ptr.add(offset));
+                    let c_vec = _mm256_loadu_ps(c_ptr.add(offset));
+                    let prod = _mm256_fmadd_ps(a_val, b_vec, c_vec);
+                    _mm256_storeu_ps(c_ptr.add(offset), prod);
                 }
             }
         }
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn q8_0_matmul_avx2(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    q8_0_matmul_avx2_inner(a, b, c, m, k, n);
+}
+
+// ============================================================================
+// ARM NEON implementation (128-bit vectors, 4×f32)
+// ============================================================================
+
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn q8_0_matmul_neon_inner(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, _k: usize, n: usize) {
+    use std::arch::aarch64::*;
+
+    assert_eq!(n % 32, 0, "NEON path requires n multiple of 32");
+    let bpr = b.blocks_per_row();
+
+    for i in 0..m {
+        let c_row = &mut c[i * n..(i + 1) * n];
+        // Zero output row with NEON
+        {
+            let mut j = 0;
+            while j + 4 <= n {
+                vst1q_f32(c_row.as_mut_ptr().add(j), vdupq_n_f32(0.0));
+                j += 4;
+            }
+            for jt in j..n {
+                c_row[jt] = 0.0;
+            }
+        }
+
+        for l in 0..b.rows {
+            let a_val = vdupq_n_f32(*a.get_unchecked(i * b.rows + l));
+            let row_base = l * bpr;
+
+            for block_idx in 0..bpr {
+                let block = &b.blocks[row_base + block_idx];
+                let j_base = block_idx * 32;
+                let scale = block.scale;
+
+                // Dequantize 32 int8 values to a stack buffer, then NEON fma
+                let mut deq: [f32; 32] = [0.0; 32];
+                for jj in 0..32 {
+                    deq[jj] = block.qs[jj] as f32 * scale;
+                }
+
+                let c_ptr = c_row.as_mut_ptr().add(j_base);
+                let d_ptr = deq.as_ptr();
+
+                // 8 × 4-wide NEON iterations
+                for vec_idx in 0..8 {
+                    let offset = vec_idx * 4;
+                    let b_vec = vld1q_f32(d_ptr.add(offset));
+                    let c_vec = vld1q_f32(c_ptr.add(offset));
+                    let prod = vfmaq_f32(c_vec, a_val, b_vec);
+                    vst1q_f32(c_ptr.add(offset), prod);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+pub unsafe fn q8_0_matmul_neon(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    q8_0_matmul_neon_inner(a, b, c, m, k, n);
+}
+
+// ============================================================================
+// Dispatch
+// ============================================================================
+
 /// Dispatch to the best available INT8 GEMM kernel.
 pub fn q8_0_matmul(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
-    if n % 4 == 0 {
-        q8_0_matmul_simd(a, b, c, m, k, n);
-    } else {
-        q8_0_matmul_scalar(a, b, c, m, k, n);
+    #[cfg(target_arch = "x86_64")]
+    {
+        if n % 32 == 0 && is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            unsafe {
+                q8_0_matmul_avx2(a, b, c, m, k, n);
+                return;
+            }
+        }
     }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        if n % 32 == 0 && std::arch::is_aarch64_feature_detected!("neon") {
+            unsafe {
+                q8_0_matmul_neon(a, b, c, m, k, n);
+                return;
+            }
+        }
+    }
+
+    q8_0_matmul_scalar(a, b, c, m, k, n);
 }
 
 /// Convert Q8_0 matrix back to f32, then use the proven f32 SIMD matmul.
 /// This is the "reference fast path" — dequantize once, then f32 GEMM.
 /// Useful when the same B matrix is reused many times.
 pub fn q8_0_matmul_via_dequant(a: &[f32], b: &Q8Matrix, m: usize, k: usize, n: usize) -> Vec<f32> {
+    use super::simd;
     let b_f32 = b.dequantize();
     let mut c = vec![0.0f32; m * n];
     simd::simd_matmul(a, &b_f32, &mut c, m, k, n);
     c
 }
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -147,12 +248,31 @@ mod tests {
                 "scalar mismatch at {}: got {}, expected {}", i, c_scalar[i], expected[i]);
         }
 
-        // Test SIMD path
-        let mut c_simd = vec![0.0f32; m * n];
-        q8_0_matmul_simd(&a, &b_q8, &mut c_simd, m, k, n);
-        for i in 0..c_simd.len() {
-            assert!((c_simd[i] - expected[i]).abs() < 1e-3,
-                "simd mismatch at {}: got {}, expected {}", i, c_simd[i], expected[i]);
+        // Test dispatched path (will use AVX2 on x86_64, NEON on aarch64)
+        let mut c_dispatched = vec![0.0f32; m * n];
+        q8_0_matmul(&a, &b_q8, &mut c_dispatched, m, k, n);
+        for i in 0..c_dispatched.len() {
+            assert!((c_dispatched[i] - expected[i]).abs() < 1e-3,
+                "dispatched mismatch at {}: got {}, expected {}", i, c_dispatched[i], expected[i]);
+        }
+    }
+
+    #[test]
+    fn test_q8_0_matmul_large() {
+        let m = 8;
+        let k = 16;
+        let n = 64;
+        let a: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.01 - 0.5).collect();
+        let b_q8 = make_test_matrix(k, n);
+
+        let expected = q8_0_matmul_via_dequant(&a, &b_q8, m, k, n);
+
+        let mut c = vec![0.0f32; m * n];
+        q8_0_matmul(&a, &b_q8, &mut c, m, k, n);
+
+        for i in 0..c.len() {
+            assert!((c[i] - expected[i]).abs() < 1e-3,
+                "large test mismatch at {}: got {}, expected {}", i, c[i], expected[i]);
         }
     }
 }

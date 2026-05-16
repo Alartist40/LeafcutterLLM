@@ -219,8 +219,44 @@ mod arch {
 
 /// Matrix multiplication C = A × B
 /// A: [m, k], B: [k, n], C: [m, n]
+// ============================================================================
+// x86_64 AVX2/FMA implementation (256-bit vectors, 8×f32)
+// ============================================================================
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn avx2_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    use std::arch::x86_64::*;
+    for i in 0..m {
+        let mut j = 0;
+        while j + 8 <= n {
+            let mut acc = _mm256_setzero_ps();
+            for l in 0..k {
+                let a_val = _mm256_set1_ps(*a.get_unchecked(i * k + l));
+                let b_vec = _mm256_loadu_ps(b.as_ptr().add(l * n + j));
+                acc = _mm256_fmadd_ps(a_val, b_vec, acc);
+            }
+            _mm256_storeu_ps(c.as_mut_ptr().add(i * n + j), acc);
+            j += 8;
+        }
+        // scalar tail
+        for j_rem in j..n {
+            let mut sum = 0.0f32;
+            for l in 0..k {
+                sum += a[i * k + l] * b[l * n + j_rem];
+            }
+            c[i * n + j_rem] = sum;
+        }
+    }
+}
+
 pub fn simd_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                avx2_matmul(a, b, c, m, k, n);
+                return;
+            }
+        }
         arch::matmul(a, b, c, m, k, n);
     }
 }
