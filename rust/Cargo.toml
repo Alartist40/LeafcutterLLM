@@ -33,6 +33,7 @@ bytes = "1.5"
 uuid = { version = "1.6", features = ["v4"] }
 clap = { version = "4.5", features = ["derive"] }
 rand = "0.8"
+rayon = "1.10"
 tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-regex"] }
 
 [dev-dependencies]
