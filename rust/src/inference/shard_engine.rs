@@ -415,6 +415,6 @@ mod tests {
         // Verify that loaded weight tensors actually carry Q8_0 metadata
         let layer0 = engine.loader.load_layer(0).unwrap();
         let q_proj = layer0.get("self_attn.q_proj.weight").unwrap();
-        assert!(q_proj.has_q8_data(), "Q8_0 shard should load weights with Q8_0 metadata");
+        assert!(q_proj.is_quantized(), "Q8_0 shard should load weights with Q8_0 metadata");
     }
 }

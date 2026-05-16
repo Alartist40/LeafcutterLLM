@@ -4,6 +4,7 @@
 //! simd.rs provides architecture-specific SIMD matmul and element-wise ops.
 
 pub mod int8_gemm;
+pub mod q4_0;
 pub mod q8_0;
 pub mod simd;
 

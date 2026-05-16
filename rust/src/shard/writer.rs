@@ -39,6 +39,10 @@ impl ShardWriter {
                 assert_eq!(element_count % 32, 0, "Q8_0 requires element count to be multiple of 32");
                 ((element_count / 32) * 34) as u64
             }
+            QuantFormat::Q4_0 => {
+                assert_eq!(element_count % 32, 0, "Q4_0 requires element count to be multiple of 32");
+                ((element_count / 32) * 18) as u64
+            }
         }
     }
 
@@ -53,6 +57,10 @@ impl ShardWriter {
             QuantFormat::Q8_0 => {
                 let q8_bytes = crate::kernels::q8_0::quantize_f32_to_q8_0(&tensor.data);
                 writer.write_all(&q8_bytes)?;
+            }
+            QuantFormat::Q4_0 => {
+                let q4_bytes = crate::kernels::q4_0::quantize_f32_to_q4_0(&tensor.data);
+                writer.write_all(&q4_bytes)?;
             }
         }
         Ok(())
@@ -416,7 +424,7 @@ mod tests {
         }
 
         // Verify the tensor carries native Q8_0 metadata for fast matmul
-        assert!(q.has_q8_data(), "Q8_0-loaded tensor should carry Q8_0 metadata");
+        assert!(q.is_quantized(), "Q8_0-loaded tensor should carry Q8_0 metadata");
 
         // Verify INT8 GEMM path produces the same result as f32 matmul
         // a [4, 2] @ q [2, 32] -> [4, 32]
@@ -427,6 +435,79 @@ mod tests {
         for i in 0..c_q8.data.len() {
             assert!((c_q8.data[i] - c_f32.data[i]).abs() < 1e-3,
                 "INT8 GEMM mismatch at {}: q8={}, f32={}", i, c_q8.data[i], c_f32.data[i]);
+        }
+    }
+
+    #[test]
+    fn test_q4_0_shard_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().to_str().unwrap();
+
+        let mut weights = HashMap::new();
+        let q_data: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1 - 3.2).collect();
+        weights.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(q_data.clone(), vec![2, 32]));
+
+        let config = ModelConfig {
+            hidden_size: 32,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 32,
+            max_seq_len: 128,
+            vocab_size: 100,
+            rope_theta: 10000.0,
+        };
+
+        let writer = ShardWriter::with_quant(config.clone(), output_dir, crate::shard::QuantFormat::Q4_0);
+        let (filename, size) = writer.write_layer_shard(0, &weights).unwrap();
+        assert!(size > 0);
+
+        let manifest = Manifest {
+            model: "test".to_string(),
+            num_layers: 1,
+            hidden_size: 32,
+            vocab_size: 100,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 32,
+            max_seq_len: 128,
+            rope_theta: 10000.0,
+            shard_dir: output_dir.to_string(),
+            layers: vec![LayerManifest { idx: 0, file: filename, size }],
+            special: SpecialManifest {
+                embed: "embed.shard".to_string(),
+                embed_size: 0,
+                norm: "norm.shard".to_string(),
+                norm_size: 0,
+                lm_head: "lm_head.shard".to_string(),
+                lm_head_size: 0,
+            },
+        };
+
+        let loader = ShardLoader::from_manifest(manifest);
+        let loaded = loader.load_layer(0).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        let q = loaded.get("self_attn.q_proj.weight").unwrap();
+        assert_eq!(q.shape, vec![2, 32]);
+
+        // Q4_0 has higher error tolerance (~0.5 max)
+        for i in 0..q.data.len() {
+            let err = (q.data[i] - q_data[i]).abs();
+            assert!(err < 0.5, "Q4_0 roundtrip error too large at {}: got {}, expected {}, err={}",
+                i, q.data[i], q_data[i], err);
+        }
+
+        assert!(q.is_quantized(), "Q4_0-loaded tensor should carry quantized metadata");
+
+        // Verify Q4_0 GEMM path
+        let a = Tensor::from_vec((0..8).map(|i| (i as f32) * 0.1).collect(), vec![4, 2]);
+        let c_q4 = a.matmul(q);
+        let q_f32 = Tensor::from_vec(q.data.clone(), q.shape.clone());
+        let c_f32 = a.matmul(&q_f32);
+        for i in 0..c_q4.data.len() {
+            assert!((c_q4.data[i] - c_f32.data[i]).abs() < 1e-3,
+                "Q4_0 GEMM mismatch at {}: q4={}, f32={}", i, c_q4.data[i], c_f32.data[i]);
         }
     }
 }

@@ -331,7 +331,7 @@ fn parse_shard_from_mmap(mmap: &[u8]) -> Result<HashMap<String, Tensor>, Box<dyn
                     ).into());
                 }
                 let blocks = crate::kernels::q8_0::blocks_from_bytes(data_bytes);
-                // Only create a Q8_0 Tensor if it's a 2D matrix with cols multiple of 32.
+                // Only create a quantized Tensor if it's a 2D matrix with cols multiple of 32.
                 // 1D tensors (norm weights, biases) just get dequantized to f32.
                 if shape.len() == 2 && shape[1] % 32 == 0 {
                     let q8 = Q8Matrix { rows: shape[0], cols: shape[1], blocks };
@@ -339,6 +339,24 @@ fn parse_shard_from_mmap(mmap: &[u8]) -> Result<HashMap<String, Tensor>, Box<dyn
                 } else {
                     let mut out = vec![0.0f32; element_count];
                     crate::kernels::dequantize_q8_0(data_bytes, &mut out);
+                    tensors.insert(meta.name, Tensor::from_vec(out, shape));
+                }
+            }
+            super::format::QuantFormat::Q4_0 => {
+                let expected_bytes = (element_count / 32) * 18;
+                if data_bytes.len() != expected_bytes {
+                    return Err(format!(
+                        "Shard corrupt: tensor '{}' Q4_0 size mismatch ({} bytes vs {} expected)",
+                        meta.name, data_bytes.len(), expected_bytes
+                    ).into());
+                }
+                let blocks = crate::kernels::q4_0::blocks_from_bytes(data_bytes);
+                if shape.len() == 2 && shape[1] % 32 == 0 {
+                    let q4 = crate::kernels::q4_0::Matrix { rows: shape[0], cols: shape[1], blocks };
+                    tensors.insert(meta.name, Tensor::from_q4_0(q4, shape));
+                } else {
+                    let mut out = vec![0.0f32; element_count];
+                    crate::kernels::dequantize_q4_0(data_bytes, &mut out);
                     tensors.insert(meta.name, Tensor::from_vec(out, shape));
                 }
             }
