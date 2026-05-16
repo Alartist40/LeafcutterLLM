@@ -8,6 +8,6 @@ pub mod format;
 pub mod loader;
 pub mod writer;
 
-pub use format::{ShardHeader, ShardTensorMeta};
+pub use format::{ShardHeader, ShardTensorMeta, QuantFormat};
 pub use loader::{ShardLoader, Manifest};
 pub use writer::{ShardWriter, split_gguf_model};

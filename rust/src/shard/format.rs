@@ -54,17 +54,19 @@ pub struct ShardHeader {
     pub version: u32,
     pub tensor_count: u32,
     pub data_start: u64,
+    pub quant_format: QuantFormat,
 }
 
 impl ShardHeader {
     pub const SIZE: usize = 32;
 
-    pub fn new(tensor_count: u32, data_start: u64) -> Self {
+    pub fn new(tensor_count: u32, data_start: u64, quant_format: QuantFormat) -> Self {
         Self {
             magic: *SHARD_MAGIC,
             version: SHARD_VERSION,
             tensor_count,
             data_start,
+            quant_format,
         }
     }
 
@@ -73,7 +75,8 @@ impl ShardHeader {
         writer.write_all(&self.version.to_le_bytes())?;
         writer.write_all(&self.tensor_count.to_le_bytes())?;
         writer.write_all(&self.data_start.to_le_bytes())?;
-        writer.write_all(&[0u8; 8])?; // reserved
+        writer.write_all(&[self.quant_format as u8])?;
+        writer.write_all(&[0u8; 7])?; // reserved
         Ok(())
     }
 
@@ -94,12 +97,14 @@ impl ShardHeader {
 
         let mut reserved = [0u8; 8];
         reader.read_exact(&mut reserved)?;
+        let quant_format = QuantFormat::from_u8(reserved[0]).unwrap_or(QuantFormat::F32);
 
         Ok(Self {
             magic,
             version,
             tensor_count,
             data_start,
+            quant_format,
         })
     }
 
@@ -184,7 +189,7 @@ mod tests {
 
     #[test]
     fn test_header_roundtrip() {
-        let header = ShardHeader::new(5, 4096);
+        let header = ShardHeader::new(5, 4096, QuantFormat::F32);
         let mut buf = Vec::new();
         header.write(&mut buf).unwrap();
         assert_eq!(buf.len(), ShardHeader::SIZE);

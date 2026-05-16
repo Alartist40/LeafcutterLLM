@@ -5,7 +5,7 @@
 
 use crate::model::loader::{GGUFModel, ModelConfig};
 use crate::model::tensor::Tensor;
-use super::format::{ShardHeader, ShardTensorMeta, align_up, DATA_ALIGN};
+use super::format::{ShardHeader, ShardTensorMeta, QuantFormat, align_up, DATA_ALIGN};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Seek, Write};
@@ -14,15 +14,48 @@ use std::path::Path;
 pub struct ShardWriter {
     pub config: ModelConfig,
     pub output_dir: String,
+    pub quant_format: QuantFormat,
 }
 
 impl ShardWriter {
     pub fn new(config: ModelConfig, output_dir: &str) -> Self {
+        Self::with_quant(config, output_dir, QuantFormat::F32)
+    }
+
+    pub fn with_quant(config: ModelConfig, output_dir: &str, quant_format: QuantFormat) -> Self {
         std::fs::create_dir_all(output_dir).ok();
         Self {
             config,
             output_dir: output_dir.to_string(),
+            quant_format,
         }
+    }
+
+    /// Compute the on-disk data size for a tensor given the quantization format.
+    fn tensor_data_size(&self, element_count: usize) -> u64 {
+        match self.quant_format {
+            QuantFormat::F32 => (element_count * 4) as u64,
+            QuantFormat::Q8_0 => {
+                assert_eq!(element_count % 32, 0, "Q8_0 requires element count to be multiple of 32");
+                ((element_count / 32) * 34) as u64
+            }
+        }
+    }
+
+    /// Write tensor data in the configured quantization format.
+    fn write_tensor_data<W: Write>(&self, writer: &mut W, tensor: &Tensor) -> std::io::Result<()> {
+        match self.quant_format {
+            QuantFormat::F32 => {
+                for &val in &tensor.data {
+                    writer.write_all(&val.to_le_bytes())?;
+                }
+            }
+            QuantFormat::Q8_0 => {
+                let q8_bytes = crate::kernels::q8_0::quantize_f32_to_q8_0(&tensor.data);
+                writer.write_all(&q8_bytes)?;
+            }
+        }
+        Ok(())
     }
 
     /// Write a single layer's weights to a `.shard` file.
@@ -56,7 +89,7 @@ impl ShardWriter {
 
         // Second pass: assign data offsets and build metadata
         for (name, tensor) in weights.iter() {
-            let data_size = (tensor.data.len() * 4) as u64;
+            let data_size = self.tensor_data_size(tensor.data.len());
             let meta = ShardTensorMeta {
                 name: name.clone(),
                 rank: tensor.shape.len() as u32,
@@ -69,7 +102,7 @@ impl ShardWriter {
         }
 
         // Write header
-        let header = ShardHeader::new(tensor_count, data_start);
+        let header = ShardHeader::new(tensor_count, data_start, self.quant_format);
         header.write(&mut writer)?;
 
         // Write metadata
@@ -86,9 +119,7 @@ impl ShardWriter {
         // Write tensor data
         for (_, tensor, meta) in &metas {
             debug_assert_eq!(writer.stream_position()?, meta.data_offset);
-            for &val in &tensor.data {
-                writer.write_all(&val.to_le_bytes())?;
-            }
+            self.write_tensor_data(&mut writer, tensor)?;
         }
 
         writer.flush()?;
@@ -121,7 +152,7 @@ impl ShardWriter {
         current_offset = data_start;
 
         for (tensor_name, tensor) in weights.iter() {
-            let data_size = (tensor.data.len() * 4) as u64;
+            let data_size = self.tensor_data_size(tensor.data.len());
             let meta = ShardTensorMeta {
                 name: tensor_name.clone(),
                 rank: tensor.shape.len() as u32,
@@ -133,7 +164,7 @@ impl ShardWriter {
             current_offset += data_size;
         }
 
-        let header = ShardHeader::new(tensor_count, data_start);
+        let header = ShardHeader::new(tensor_count, data_start, self.quant_format);
         header.write(&mut writer)?;
 
         for meta in &metas {
@@ -148,9 +179,7 @@ impl ShardWriter {
         for (tensor_name, tensor) in weights.iter() {
             let meta = metas.iter().find(|m| m.name == *tensor_name).unwrap();
             debug_assert_eq!(writer.stream_position()?, meta.data_offset);
-            for &val in &tensor.data {
-                writer.write_all(&val.to_le_bytes())?;
-            }
+            self.write_tensor_data(&mut writer, tensor)?;
         }
 
         writer.flush()?;
@@ -163,12 +192,13 @@ impl ShardWriter {
 pub fn split_gguf_model(
     model_path: &str,
     output_dir: &str,
+    quant_format: super::format::QuantFormat,
 ) -> Result<super::loader::Manifest, Box<dyn std::error::Error>> {
     println!("Loading GGUF model: {}", model_path);
     let model = GGUFModel::load(model_path)?;
     let config = model.config.clone();
 
-    let writer = ShardWriter::new(config.clone(), output_dir);
+    let writer = ShardWriter::with_quant(config.clone(), output_dir, quant_format);
 
     // Write layer shards
     let mut layer_files = Vec::new();
@@ -322,5 +352,67 @@ mod tests {
 
         let gate = loaded.get("mlp.gate_proj.weight").unwrap();
         assert_eq!(gate.data, vec![0.5, 1.5, 2.5, 3.5]);
+    }
+
+    #[test]
+    fn test_q8_0_shard_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().to_str().unwrap();
+
+        // Create fake layer weights (must be multiple of 32 elements for Q8_0)
+        let mut weights = HashMap::new();
+        let q_data: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1 - 3.2).collect();
+        weights.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(q_data.clone(), vec![8, 8]));
+
+        let config = ModelConfig {
+            hidden_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 8,
+            max_seq_len: 128,
+            vocab_size: 100,
+            rope_theta: 10000.0,
+        };
+
+        let writer = ShardWriter::with_quant(config, output_dir, crate::shard::QuantFormat::Q8_0);
+        let (filename, size) = writer.write_layer_shard(0, &weights).unwrap();
+        assert!(size > 0);
+
+        let manifest = Manifest {
+            model: "test".to_string(),
+            num_layers: 1,
+            hidden_size: 8,
+            vocab_size: 100,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            intermediate_size: 8,
+            max_seq_len: 128,
+            rope_theta: 10000.0,
+            shard_dir: output_dir.to_string(),
+            layers: vec![LayerManifest { idx: 0, file: filename, size }],
+            special: SpecialManifest {
+                embed: "embed.shard".to_string(),
+                embed_size: 0,
+                norm: "norm.shard".to_string(),
+                norm_size: 0,
+                lm_head: "lm_head.shard".to_string(),
+                lm_head_size: 0,
+            },
+        };
+
+        let loader = ShardLoader::from_manifest(manifest);
+        let loaded = loader.load_layer(0).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        let q = loaded.get("self_attn.q_proj.weight").unwrap();
+        assert_eq!(q.shape, vec![8, 8]);
+
+        // Check roundtrip error is small (< 1% relative)
+        for i in 0..q.data.len() {
+            let err = (q.data[i] - q_data[i]).abs();
+            assert!(err < 0.1, "Q8_0 roundtrip error too large at {}: got {}, expected {}, err={}",
+                i, q.data[i], q_data[i], err);
+        }
     }
 }
