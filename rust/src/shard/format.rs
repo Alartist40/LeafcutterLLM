@@ -29,6 +29,25 @@ pub const SHARD_MAGIC: &[u8; 8] = b"LEAFSHDR";
 pub const SHARD_VERSION: u32 = 1;
 pub const DATA_ALIGN: u64 = 4096;
 
+/// Quantization format stored in the shard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantFormat {
+    /// Raw f32 values (no quantization)
+    F32 = 0,
+    /// Q8_0 per-block quantization (32 int8 + f16 scale per block)
+    Q8_0 = 1,
+}
+
+impl QuantFormat {
+    pub fn from_u8(v: u8) -> Option<Self> {
+        match v {
+            0 => Some(QuantFormat::F32),
+            1 => Some(QuantFormat::Q8_0),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ShardHeader {
     pub magic: [u8; 8],
