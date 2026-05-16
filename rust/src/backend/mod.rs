@@ -9,6 +9,7 @@
 //!   Tensor::set_global_backend(&Q8_CPU_BACKEND); // quantized
 
 pub mod cpu;
+pub mod wgpu;
 
 /// Abstract compute backend.
 ///
