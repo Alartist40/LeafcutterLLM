@@ -85,6 +85,42 @@ impl Matrix {
     }
 }
 
+/// Quantize a slice of f32 values to Q8_0 blocks.
+/// Returns raw bytes in GGUF Q8_0 format.
+pub fn quantize_f32_to_q8_0(data: &[f32]) -> Vec<u8> {
+    assert_eq!(data.len() % Block::K, 0, "data length must be multiple of 32");
+    let num_blocks = data.len() / Block::K;
+    let mut out = vec![0u8; num_blocks * Block::BYTES];
+
+    for b in 0..num_blocks {
+        let block_start = b * Block::K;
+        let block_slice = &data[block_start..block_start + Block::K];
+
+        // Find max absolute value for scale
+        let max_abs = block_slice.iter().map(|&v| v.abs()).fold(0.0f32, f32::max);
+        let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 0.0 };
+
+        // Write scale as f16
+        let scale_f16 = half::f16::from_f32(scale);
+        let scale_bytes = scale_f16.to_le_bytes();
+        let out_base = b * Block::BYTES;
+        out[out_base] = scale_bytes[0];
+        out[out_base + 1] = scale_bytes[1];
+
+        // Quantize each value
+        for i in 0..Block::K {
+            let q = if scale > 0.0 {
+                (block_slice[i] / scale).round().clamp(-127.0, 127.0) as i8
+            } else {
+                0i8
+            };
+            out[out_base + 2 + i] = q as u8;
+        }
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +146,22 @@ mod tests {
         block.dequantize(&mut out);
         assert!((out[0] - 0.0).abs() < 1e-3);
         assert!((out[31] - 15.5).abs() < 1e-3); // 31 * 0.5
+    }
+
+    #[test]
+    fn test_quantize_dequantize_roundtrip() {
+        let data: Vec<f32> = (0..64).map(|i| (i as f32 - 32.0) * 0.1).collect();
+        let q8_bytes = quantize_f32_to_q8_0(&data);
+        assert_eq!(q8_bytes.len(), 2 * Block::BYTES);
+
+        // Dequantize back
+        let mut out = vec![0.0f32; 64];
+        crate::kernels::dequantize_q8_0(&q8_bytes, &mut out);
+
+        // Check roundtrip error is small
+        for i in 0..64 {
+            let err = (out[i] - data[i]).abs();
+            assert!(err < 0.1, "large error at {}: got {}, expected {}, err={}", i, out[i], data[i], err);
+        }
     }
 }
