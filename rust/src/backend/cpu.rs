@@ -12,7 +12,13 @@ pub struct CpuBackend;
 impl Backend for CpuBackend {
     fn matmul(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut result = vec![0.0f32; m * n];
-        simd::simd_matmul(a, b, &mut result, m, k, n);
+        // Use parallel matmul for large matrices to utilize all CPU cores.
+        // Threshold: 4096 output elements (~64×64) is where threading pays off.
+        if m * n >= 4096 {
+            simd::simd_matmul_parallel(a, b, &mut result, m, k, n);
+        } else {
+            simd::simd_matmul(a, b, &mut result, m, k, n);
+        }
         result
     }
 

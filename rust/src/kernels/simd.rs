@@ -248,6 +248,24 @@ pub unsafe fn avx2_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usiz
     }
 }
 
+/// Recursively split the m dimension for parallel matmul.
+/// Each half gets independent slices of A and C; B is read-only and shared.
+fn simd_matmul_par(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    const MIN_ROWS_PER_TASK: usize = 4;
+    if m <= MIN_ROWS_PER_TASK {
+        unsafe { arch::matmul(a, b, c, m, k, n); }
+        return;
+    }
+    let mid = m / 2;
+    let (a_left, a_right) = a.split_at(mid * k);
+    let (c_left, c_right) = c.split_at_mut(mid * n);
+    rayon::join(
+        || simd_matmul_par(a_left, b, c_left, mid, k, n),
+        || simd_matmul_par(a_right, b, c_right, m - mid, k, n),
+    );
+}
+
+/// Single-threaded SIMD matmul.
 pub fn simd_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     unsafe {
         #[cfg(target_arch = "x86_64")]
@@ -259,6 +277,37 @@ pub fn simd_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: u
         }
         arch::matmul(a, b, c, m, k, n);
     }
+}
+
+/// Multi-threaded SIMD matmul using rayon.
+/// Splits the m dimension across available CPU cores.
+pub fn simd_matmul_parallel(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    unsafe {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+                simd_matmul_par_avx2(a, b, c, m, k, n);
+                return;
+            }
+        }
+        simd_matmul_par(a, b, c, m, k, n);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn simd_matmul_par_avx2(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
+    const MIN_ROWS_PER_TASK: usize = 4;
+    if m <= MIN_ROWS_PER_TASK {
+        unsafe { avx2_matmul(a, b, c, m, k, n); }
+        return;
+    }
+    let mid = m / 2;
+    let (a_left, a_right) = a.split_at(mid * k);
+    let (c_left, c_right) = c.split_at_mut(mid * n);
+    rayon::join(
+        || simd_matmul_par_avx2(a_left, b, c_left, mid, k, n),
+        || simd_matmul_par_avx2(a_right, b, c_right, m - mid, k, n),
+    );
 }
 
 /// Element-wise addition: out = a + b
@@ -432,5 +481,54 @@ mod tests {
         let sum = simd_sum_sq(&data);
         let expected: f32 = data.iter().map(|x| x * x).sum();
         assert!((sum - expected).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_parallel_matmul_correctness() {
+        let m = 128;
+        let k = 256;
+        let n = 128;
+        let a: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.001).collect();
+        let b: Vec<f32> = (0..(k * n)).map(|i| (i as f32) * 0.001).collect();
+
+        let mut c_single = vec![0.0f32; m * n];
+        simd_matmul(&a, &b, &mut c_single, m, k, n);
+
+        let mut c_parallel = vec![0.0f32; m * n];
+        simd_matmul_parallel(&a, &b, &mut c_parallel, m, k, n);
+
+        for i in 0..c_single.len() {
+            assert!((c_single[i] - c_parallel[i]).abs() < 1e-4,
+                "Parallel matmul mismatch at {}: single={}, par={}", i, c_single[i], c_parallel[i]);
+        }
+    }
+
+    #[test]
+    #[ignore = "Benchmark: measures parallel speedup"]
+    fn bench_parallel_matmul_speedup() {
+        let m = 512;
+        let k = 512;
+        let n = 512;
+        let a: Vec<f32> = (0..(m * k)).map(|i| (i as f32) * 0.001).collect();
+        let b: Vec<f32> = (0..(k * n)).map(|i| (i as f32) * 0.001).collect();
+
+        let iters = 10;
+
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut c = vec![0.0f32; m * n];
+            simd_matmul(&a, &b, &mut c, m, k, n);
+        }
+        let single_ms = start.elapsed().as_millis() as f64 / iters as f64;
+
+        let start = std::time::Instant::now();
+        for _ in 0..iters {
+            let mut c = vec![0.0f32; m * n];
+            simd_matmul_parallel(&a, &b, &mut c, m, k, n);
+        }
+        let par_ms = start.elapsed().as_millis() as f64 / iters as f64;
+
+        println!("matmul {}x{}x{}: single={:.1}ms, parallel={:.1}ms, speedup={:.2}x",
+            m, k, n, single_ms, par_ms, single_ms / par_ms);
     }
 }
