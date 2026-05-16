@@ -3,6 +3,8 @@
 //! Converts GGUF quantized blocks to f32 tensors for computation.
 //! simd.rs provides architecture-specific SIMD matmul and element-wise ops.
 
+pub mod int8_gemm;
+pub mod q8_0;
 pub mod simd;
 
 use half::f16;
