@@ -170,4 +170,37 @@ cargo build --release --features openblas
 All changes committed and pushed to:
 `https://github.com/Alartist40/LeafcutterLLM.git`
 
-Commit: `cc62d1e` — "Performance: OpenBLAS backend + Q4_K GEMM + mmap embed lookup"
+Commit: `109b06f` — "feat: IQ4_NL, Q5_K, Q6_K direct quantized GEMM kernels + row-dequantize hybrid optimization"
+
+---
+
+## Session History
+
+### Phase 6 (2026-05-19) — IQ4_NL / Q5_K / Q6_K Direct GEMM
+**Commit:** `109b06f`  
+**Goal:** Unlock 7× RAM savings on ~90% of remaining model weights by implementing direct quantized GEMM for IQ4_NL and Q6_K (plus Q5_K as bonus).
+
+| # | Feature | Key File(s) | Impact |
+|---|---------|-------------|--------|
+| 1 | IQ4_NL block parser + GEMM | `src/kernels/iq4_nl.rs`, `iq4_nl_gemm.rs` | 168 tensors in 9B model stay quantized (was f32 fallback) |
+| 2 | Q6_K block parser + GEMM | `src/kernels/q6_k.rs`, `q6_k_gemm.rs` | 1 tensor in 9B model stays quantized |
+| 3 | Q5_K block parser + GEMM | `src/kernels/q5_k.rs`, `q5_k_gemm.rs` | 32 tensors in 9B model stay quantized |
+| 4 | Row-dequantize hybrid | `src/kernels/quant_gemm_common.rs` | Dequantize full B row → temp buffer → SIMD FMA; faster than block-by-block |
+| 5 | Tensor + Loader wiring | `src/model/tensor.rs`, `src/model/loader.rs` | All K-quant types (Q4_K, Q5_K, Q6_K, IQ4_NL) use native GEMM |
+| 6 | Warning cleanup | `src/inference/attention.rs`, `ssm.rs`, `simd.rs`, `gguf.rs`, `loader.rs`, `wgpu.rs` | 104 tests pass, 0 compiler warnings |
+
+**Validation:**
+- All kernels numerically verified against reference dequantize-then-matmul on real Qwen3.5-9B-IQ4_NL weights (max error < 1e-6)
+- 9B model loads, runs single forward pass (26s), zero NaN/Inf
+- 20-token generation: 0.11 tok/sec (9B), 0.50 tok/sec (2B-Q4_K_M)
+
+### Phase 5 (2026-05-19) — OpenBLAS + Q4_K GEMM + Mmap Embed
+**Commit:** `cc62d1e`  
+**Goal:** Competitive speed and memory; enable 9B models without OOM.
+
+| # | Feature | Key File(s) | Impact |
+|---|---------|-------------|--------|
+| 1 | OpenBLAS backend | `src/backend/openblas.rs` | 1.6× tok/sec speedup on all models |
+| 2 | Q4_K direct GEMM | `src/kernels/q4_k.rs`, `q4_k_gemm.rs` | 2.4× total speedup on Q4_K models; 7× memory savings |
+| 3 | Memory-mapped embed lookup | `src/model/gguf.rs`, `src/inference/engine.rs` | Eliminates 2–8GB embed RAM; 9B models no longer OOM |
+| 4 | Lazy lm_head projection | `src/inference/engine.rs` | Parallel dot-product over vocab; no f32 lm_head in RAM |
