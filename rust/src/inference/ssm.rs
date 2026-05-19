@@ -38,6 +38,8 @@ pub fn ssm_forward(
     hidden_states: &Tensor,
     weights: &HashMap<String, Tensor>,
     _config: &SSMConfig,
+    ssm_cache: &mut crate::cache::ssm_state::SSMStateCache,
+    layer_idx: usize,
 ) -> Tensor {
     let seq_len = hidden_states.shape[0];
     let hidden_size = hidden_states.shape[1];
@@ -54,13 +56,16 @@ pub fn ssm_forward(
 
     // 2. Causal conv1d — only apply if shape matches
     let x_conv = if let Some(conv_w) = weights.get("ssm_conv1d.weight") {
-        if conv_w.shape.len() >= 2 && conv_w.shape[1] == inner_size {
-            causal_conv1d(&x_inner, conv_w, conv_w.shape[0])
+        let conv_state = ssm_cache.get_conv(layer_idx);
+        let (out, new_state) = if conv_w.shape.len() >= 2 && conv_w.shape[1] == inner_size {
+            causal_conv1d_cached(&x_inner, conv_w, conv_w.shape[0], &conv_state)
         } else if conv_w.shape.len() == 1 {
-            causal_conv1d(&x_inner, conv_w, _config.conv_kernel.min(conv_w.data.len()))
+            causal_conv1d_cached(&x_inner, conv_w, _config.conv_kernel.min(conv_w.data.len()), &conv_state)
         } else {
-            x_inner.clone()
-        }
+            (x_inner.clone(), vec![])
+        };
+        ssm_cache.set_conv(layer_idx, new_state);
+        out
     } else {
         x_inner.clone()
     };
@@ -107,7 +112,11 @@ pub fn ssm_forward(
         .unwrap_or_else(|| vec![-1.0f32; _config.state_size]);
 
     // 7. Selective scan on inner_size channels
-    let y = selective_scan(&x_conv, &b_proj, &c_proj, &dt_proj, &a_vec, inner_size);
+    // Retrieve previous state from cache (or zeros if first call)
+    let initial_state = ssm_cache.get(layer_idx, inner_size);
+    let (y, final_state) = selective_scan(&x_conv, &b_proj, &c_proj, &dt_proj, &a_vec, inner_size, Some(&initial_state));
+    // Store final state back to cache for next token
+    ssm_cache.set(layer_idx, final_state);
 
     // 8. Optional gating (attn_gate.weight)
     let y_gated = if let Some(gate_w) = weights.get("self_attn.gate_proj.weight")
@@ -217,7 +226,7 @@ fn causal_conv1d(x: &Tensor, weight: &Tensor, kernel_size: usize) -> Tensor {
             for k in 0..kernel_size.min(t + 1) {
                 let x_val = x.data[(t - k) * channels + c];
                 let w_val = if weight.shape.len() == 1 {
-                    weight.data[k % weight.data.len()]
+                    weight.data[k]
                 } else {
                     weight.data[k * weight.shape[1] + c]
                 };
@@ -229,6 +238,61 @@ fn causal_conv1d(x: &Tensor, weight: &Tensor, kernel_size: usize) -> Tensor {
     Tensor::from_vec(out, x.shape.clone())
 }
 
+/// Causal conv1d with state caching for autoregressive generation.
+/// `conv_state` holds the last (kernel_size - 1) inputs per channel.
+/// Returns (output, updated_conv_state).
+fn causal_conv1d_cached(
+    x: &Tensor,
+    weight: &Tensor,
+    kernel_size: usize,
+    conv_state: &[f32],
+) -> (Tensor, Vec<f32>) {
+    let seq_len = x.shape[0];
+    let channels = x.shape[1];
+    let state_len = conv_state.len() / channels; // number of cached steps per channel
+
+    // Build full input: [cached_steps, ..., current_steps]
+    let full_seq_len = state_len + seq_len;
+    let mut full_input = vec![0.0f32; full_seq_len * channels];
+    for c in 0..channels {
+        for s in 0..state_len {
+            full_input[s * channels + c] = conv_state[s * channels + c];
+        }
+        for t in 0..seq_len {
+            full_input[(state_len + t) * channels + c] = x.data[t * channels + c];
+        }
+    }
+
+    let mut out = vec![0.0f32; seq_len * channels];
+    for c in 0..channels {
+        for t in 0..seq_len {
+            let mut sum = 0.0f32;
+            let global_t = state_len + t;
+            for k in 0..kernel_size.min(global_t + 1) {
+                let x_val = full_input[(global_t - k) * channels + c];
+                let w_val = if weight.shape.len() == 1 {
+                    weight.data[k]
+                } else {
+                    weight.data[k * weight.shape[1] + c]
+                };
+                sum += x_val * w_val;
+            }
+            out[t * channels + c] = sum;
+        }
+    }
+
+    // Update cache: keep last (kernel_size - 1) inputs
+    let keep = (kernel_size - 1).min(full_seq_len);
+    let mut new_state = vec![0.0f32; keep * channels];
+    for c in 0..channels {
+        for s in 0..keep {
+            new_state[s * channels + c] = full_input[(full_seq_len - keep + s) * channels + c];
+        }
+    }
+
+    (Tensor::from_vec(out, x.shape.clone()), new_state)
+}
+
 fn selective_scan(
     x: &Tensor,
     b: &Tensor,
@@ -236,13 +300,15 @@ fn selective_scan(
     delta: &Tensor,
     a_vec: &[f32],
     inner: usize,
-) -> Tensor {
+    initial_state: Option<&[f32]>,
+) -> (Tensor, Vec<f32>) {
     let seq_len = x.shape[0];
     let mut y = vec![0.0f32; seq_len * inner];
+    let mut final_state = vec![0.0f32; inner];
 
     for i in 0..inner {
         let a_i = a_vec.get(i % a_vec.len()).copied().unwrap_or(-1.0f32);
-        let mut h = 0.0f32;
+        let mut h = initial_state.map(|s| s[i]).unwrap_or(0.0f32);
         for t in 0..seq_len {
             let dt = delta.data[t * inner + i].max(0.001);
             let x_t = x.data[t * inner + i];
@@ -255,9 +321,10 @@ fn selective_scan(
             h = a_bar * h + b_bar * x_t;
             y[t * inner + i] = c_t * h;
         }
+        final_state[i] = h;
     }
 
-    Tensor::from_vec(y, vec![seq_len, inner])
+    (Tensor::from_vec(y, vec![seq_len, inner]), final_state)
 }
 
 #[cfg(test)]
@@ -297,7 +364,8 @@ mod tests {
         let hidden_states = Tensor::from_vec(vec![0.1; 2 * hidden], vec![2, hidden]);
         let config = SSMConfig { state_size: 4, inner_size: inner, time_step_rank: 4, conv_kernel: 4, group_count: 1 };
 
-        let out = ssm_forward(&hidden_states, &weights, &config);
+        let mut cache = crate::cache::ssm_state::SSMStateCache::new();
+        let out = ssm_forward(&hidden_states, &weights, &config, &mut cache, 0);
         assert_eq!(out.shape, vec![2, hidden]);
         assert!(out.data.iter().all(|&v| v.is_finite()));
     }

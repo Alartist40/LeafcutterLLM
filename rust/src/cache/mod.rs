@@ -5,6 +5,8 @@
 //! Uses HashMap keyed by layer index to support sparse hybrid architectures
 //! (e.g. Qwen3.5 where only some layers use attention).
 
+pub mod ssm_state;
+
 use crate::model::tensor::Tensor;
 use half::f16;
 use std::collections::HashMap;

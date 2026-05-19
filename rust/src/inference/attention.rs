@@ -36,12 +36,12 @@ impl Default for AttentionParams {
     }
 }
 
-pub fn apply_rotary_emb(x: &mut Tensor, seq_len: usize, num_heads: usize, head_dim: usize, theta: f32) {
+pub fn apply_rotary_emb(x: &mut Tensor, seq_len: usize, num_heads: usize, head_dim: usize, theta: f32, position_offset: usize) {
     for i in 0..seq_len {
         for h in 0..num_heads {
             for d in 0..head_dim / 2 {
                 let freq = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
-                let angle = i as f32 * freq;
+                let angle = (position_offset + i) as f32 * freq;
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
 
@@ -66,6 +66,7 @@ pub fn attention_forward(
     params: &AttentionParams,
     kv_cache: &mut KVCache,
     layer_idx: usize,
+    position_offset: usize,
 ) -> Tensor {
     let seq_len = hidden_states.shape[0];
 
@@ -166,8 +167,8 @@ pub fn attention_forward(
     // -------------------------------------------------------------------------
     // RoPE
     // -------------------------------------------------------------------------
-    apply_rotary_emb(&mut q, seq_len, params.num_heads, params.head_dim, params.rope_theta);
-    apply_rotary_emb(&mut k, seq_len, params.num_kv_heads, params.kv_head_dim, params.rope_theta);
+    apply_rotary_emb(&mut q, seq_len, params.num_heads, params.head_dim, params.rope_theta, position_offset);
+    apply_rotary_emb(&mut k, seq_len, params.num_kv_heads, params.kv_head_dim, params.rope_theta, position_offset);
 
     // -------------------------------------------------------------------------
     // KV Cache (M5: compressed dimensions)
@@ -269,7 +270,7 @@ mod tests {
             ..Default::default()
         };
 
-        let out = attention_forward(&hidden_states, &weights, &params, &mut kv_cache, 0);
+        let out = attention_forward(&hidden_states, &weights, &params, &mut kv_cache, 0, 0);
         assert_eq!(out.shape, vec![2, hidden]);
     }
 
@@ -287,7 +288,7 @@ mod tests {
             ..Default::default()
 };
 
-        let out = attention_forward(&hidden_states, &weights, &params, &mut kv_cache, 0);
+        let out = attention_forward(&hidden_states, &weights, &params, &mut kv_cache, 0, 0);
         assert_eq!(out.shape, vec![2, hidden]);
     }
 
@@ -308,7 +309,7 @@ mod tests {
             ..Default::default()
         };
 
-        let out = attention_forward(&hidden_states, &weights, &params, &mut kv_cache, 0);
+        let out = attention_forward(&hidden_states, &weights, &params, &mut kv_cache, 0, 0);
         assert_eq!(out.shape, vec![2, hidden]);
         let (k, _v) = kv_cache.get(0).unwrap();
         assert_eq!(k.shape, vec![2, kv_heads, kv_head_dim]);

@@ -139,7 +139,7 @@ impl ShardEngine {
             let normed = hidden.rms_norm(pre_norm_weight, 1e-5);
 
             // Attention
-            let attn_out = attention_forward(&normed, &layer_weights, &attn_params, &mut self.kv_cache, layer_idx);
+            let attn_out = attention_forward(&normed, &layer_weights, &attn_params, &mut self.kv_cache, layer_idx, 0);
             hidden = hidden.add(&attn_out);
 
             // Post-attention RMSNorm

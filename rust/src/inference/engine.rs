@@ -9,7 +9,7 @@
 
 use crate::model::loader::{GGUFModel, ModelConfig};
 use crate::model::tensor::Tensor;
-use crate::cache::KVCache;
+use crate::cache::{KVCache, ssm_state::SSMStateCache};
 use crate::inference::attention::{attention_forward, AttentionParams};
 use crate::inference::sampler::sample_top_p;
 use crate::inference::ssm::{ssm_forward, SSMConfig};
@@ -30,6 +30,11 @@ pub struct Engine {
     /// Layer weight cache: layer_idx -> weights HashMap.
     /// Avoids reloading layers from disk on every forward pass.
     pub layer_cache: HashMap<usize, HashMap<String, Tensor>>,
+    /// SSM state cache: persistent hidden state for Mamba-style layers.
+    pub ssm_cache: SSMStateCache,
+    /// Current sequence position offset for RoPE. Tracks total tokens processed
+    /// across forward calls within a generation session.
+    seq_offset: usize,
 }
 
 impl Engine {
@@ -126,14 +131,19 @@ impl Engine {
             speculative_head,
             lm_head_tied,
             layer_cache: HashMap::new(),
+            ssm_cache: SSMStateCache::new(),
+            seq_offset: 0,
         })
     }
 
     pub fn generate(&mut self, tokens: &[usize], max_tokens: usize, temperature: f32, top_p: f32) -> Vec<usize> {
         self.kv_cache.clear();
+        self.ssm_cache.clear();
+        self.seq_offset = 0;
 
         // Prefill
         let mut logits = self.forward(tokens);
+        self.seq_offset = tokens.len();
         let mut next_token = sample_top_p(&logits, temperature, top_p);
         let mut generated = vec![next_token];
 
@@ -144,6 +154,7 @@ impl Engine {
         // Decode loop
         for _ in 0..max_tokens - 1 {
             logits = self.forward(&[next_token]);
+            self.seq_offset += 1;
             next_token = sample_top_p(&logits, temperature, top_p);
             generated.push(next_token);
 
@@ -185,11 +196,11 @@ impl Engine {
 
             if has_standard_attn {
                 // Standard attention layer
-                let attn_out = attention_forward(&normed, layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx);
+                let attn_out = attention_forward(&normed, layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
                 hidden = hidden.add(&attn_out);
             } else if has_ssm {
                 // SSM layer (Mamba-style)
-                let ssm_out = ssm_forward(&normed, layer_weights, &self.ssm_config);
+                let ssm_out = ssm_forward(&normed, layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
                 hidden = hidden.add(&ssm_out);
             }
 

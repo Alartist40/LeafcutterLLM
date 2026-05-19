@@ -161,7 +161,7 @@ fn test_find_nan_source() {
         }
         
         let attn_out = leafcutter::inference::attention::attention_forward(
-            &normed, &layer_weights, &attn_params, &mut engine.kv_cache, layer_idx);
+            &normed, &layer_weights, &attn_params, &mut engine.kv_cache, layer_idx, 0);
         if attn_out.data.iter().any(|&v| v.is_nan()) {
             println!("Layer {}: NaN AFTER attention", layer_idx);
             break;
@@ -246,7 +246,7 @@ fn test_debug_layer1_ffn() {
     // Run layer 0
     let w0 = engine.model.load_layer(0).unwrap();
     let n0 = hidden.rms_norm(w0.get("input_layernorm.weight").unwrap(), 1e-5);
-    let a0 = leafcutter::inference::attention::attention_forward(&n0, &w0, &attn_params, &mut engine.kv_cache, 0);
+    let a0 = leafcutter::inference::attention::attention_forward(&n0, &w0, &attn_params, &mut engine.kv_cache, 0, 0);
     hidden = hidden.add(&a0);
     let n0 = hidden.rms_norm(w0.get("post_attention_layernorm.weight").unwrap(), 1e-5);
     let g0 = n0.matmul(w0.get("mlp.gate_proj.weight").unwrap());
@@ -270,7 +270,7 @@ fn test_debug_layer1_ffn() {
         n1.data.iter().filter(|&&v| v.is_nan()).count(),
         n1.data.iter().filter(|&&v| v.is_infinite()).count());
     
-    let a1 = leafcutter::inference::attention::attention_forward(&n1, &w1, &attn_params, &mut engine.kv_cache, 1);
+    let a1 = leafcutter::inference::attention::attention_forward(&n1, &w1, &attn_params, &mut engine.kv_cache, 1, 0);
     println!("Layer 1 attn_out: nan={} inf={}", 
         a1.data.iter().filter(|&&v| v.is_nan()).count(),
         a1.data.iter().filter(|&&v| v.is_infinite()).count());
