@@ -3,6 +3,7 @@
 //! Converts GGUF quantized blocks to f32 tensors for computation.
 //! simd.rs provides architecture-specific SIMD matmul and element-wise ops.
 
+pub mod bitnet_lut;
 pub mod int8_gemm;
 pub mod q4_0;
 pub mod q8_0;
@@ -179,6 +180,23 @@ pub fn dequantize_q6_k(data: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Dequantize Q8_K blocks to f32
+pub fn dequantize_q8_k(data: &[u8], out: &mut [f32]) {
+    let bytes_per_block = 292;
+    let num_blocks = out.len() / QK_K;
+
+    for i in 0..num_blocks {
+        let block = &data[i * bytes_per_block..(i + 1) * bytes_per_block];
+        let d = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
+        let qs = &block[4..260];
+
+        let base = i * QK_K;
+        for j in 0..QK_K {
+            out[base + j] = d * (qs[j] as i8) as f32;
+        }
+    }
+}
+
 /// Non-linear lookup table for IQ4_NL (improved 4-bit quantization).
 ///
 /// Source: llama.cpp ggml-common.h
@@ -215,6 +233,44 @@ pub fn dequantize_iq4_nl(data: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Dequantize IQ5_0 blocks to f32.
+///
+/// Block layout (162 bytes for 256 values = 5.06 bpw):
+///   - bytes 0..1: scale as f16
+///   - bytes 2..161: 256 5-bit values packed into 160 bytes
+///
+/// Values are unpacked and centered: value = (q - 15.5) * scale
+pub fn dequantize_iq5_0(data: &[u8], out: &mut [f32]) {
+    const BLOCK_SIZE: usize = 256;
+    const GROUP_SIZE: usize = 162; // 2 (scale) + 160 (5-bit packed)
+    let num_blocks = out.len() / BLOCK_SIZE;
+
+    for i in 0..num_blocks {
+        let start = i * GROUP_SIZE;
+        let block = &data[start..start + GROUP_SIZE];
+        let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let qs = &block[2..162];
+
+        for j in 0..BLOCK_SIZE {
+            let start_bit = j * 5;
+            let start_byte = start_bit / 8;
+            let bit_offset = start_bit % 8;
+            let available = 8 - bit_offset;
+
+            let q = if available >= 5 {
+                (qs[start_byte] >> bit_offset) & 0x1F
+            } else {
+                let low = (qs[start_byte] >> bit_offset) & ((1u8 << available) - 1);
+                let need = 5 - available;
+                let high = qs[start_byte + 1] & ((1u8 << need) - 1);
+                low | (high << available)
+            };
+
+            out[i * BLOCK_SIZE + j] = (q as f32 - 15.5) * scale;
+        }
+    }
+}
+
 #[cfg(test)]
 
 #[cfg(test)]
@@ -246,6 +302,15 @@ mod tests {
         let data = vec![0u8; 210];
         let mut out = vec![0.0f32; 256];
         dequantize_q6_k(&data, &mut out);
+        // With zero data, d=0, so all outputs should be 0
+        assert!(out.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn test_q8_k_block_size() {
+        let data = vec![0u8; 292];
+        let mut out = vec![0.0f32; 256];
+        dequantize_q8_k(&data, &mut out);
         // With zero data, d=0, so all outputs should be 0
         assert!(out.iter().all(|&v| v == 0.0));
     }

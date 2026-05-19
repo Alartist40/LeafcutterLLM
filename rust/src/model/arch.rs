@@ -71,8 +71,19 @@ impl ModelArchitecture {
         matches!(self,
             ModelArchitecture::Llama |
             ModelArchitecture::Qwen2 |
+            ModelArchitecture::Qwen35 |
             ModelArchitecture::Mistral
         )
+    }
+
+    /// Whether this architecture uses SSM (State Space Model) layers.
+    pub fn uses_ssm(self) -> bool {
+        matches!(self, ModelArchitecture::Qwen35)
+    }
+
+    /// Whether this architecture uses fused QKV projections.
+    pub fn uses_fused_qkv(self) -> bool {
+        matches!(self, ModelArchitecture::Qwen35 | ModelArchitecture::Phi)
     }
 
     /// Standard transformer layer weight mappings for this architecture.
@@ -81,18 +92,44 @@ impl ModelArchitecture {
     /// for `blk.N.{gguf_suffix}` in the GGUF and map it to the engine
     /// key `{engine_name}`.
     pub fn layer_mappings(self) -> &'static [(&'static str, &'static str)] {
-        // Default standard transformer mapping
-        &[
-            ("attn_q.weight",     "self_attn.q_proj.weight"),
-            ("attn_k.weight",     "self_attn.k_proj.weight"),
-            ("attn_v.weight",     "self_attn.v_proj.weight"),
-            ("attn_output.weight","self_attn.o_proj.weight"),
-            ("ffn_gate.weight",   "mlp.gate_proj.weight"),
-            ("ffn_up.weight",     "mlp.up_proj.weight"),
-            ("ffn_down.weight",   "mlp.down_proj.weight"),
-            ("attn_norm.weight",  "input_layernorm.weight"),
-            ("ffn_norm.weight",   "post_attention_layernorm.weight"),
-        ]
+        match self {
+            ModelArchitecture::Qwen35 => &[
+                // Attention (full attention layers)
+                ("attn_q.weight",     "self_attn.q_proj.weight"),
+                ("attn_k.weight",     "self_attn.k_proj.weight"),
+                ("attn_v.weight",     "self_attn.v_proj.weight"),
+                ("attn_output.weight","self_attn.o_proj.weight"),
+                // Fused attention (SSM layers use fused QKV)
+                ("attn_qkv.weight",   "self_attn.qkv_proj.weight"),
+                ("attn_gate.weight",  "self_attn.gate_proj.weight"),
+                // FFN
+                ("ffn_gate.weight",   "mlp.gate_proj.weight"),
+                ("ffn_up.weight",     "mlp.up_proj.weight"),
+                ("ffn_down.weight",   "mlp.down_proj.weight"),
+                // Norms
+                ("attn_norm.weight",  "input_layernorm.weight"),
+                ("post_attention_norm.weight", "post_attention_layernorm.weight"),
+                // SSM
+                ("ssm_alpha.weight",  "ssm_alpha.weight"),
+                ("ssm_beta.weight",   "ssm_beta.weight"),
+                ("ssm_conv1d.weight", "ssm_conv1d.weight"),
+                ("ssm_dt.bias",       "ssm_dt.bias"),
+                ("ssm_norm.weight",   "ssm_norm.weight"),
+                ("ssm_out.weight",    "ssm_out.weight"),
+                ("ssm_a",             "ssm_a"),
+            ],
+            _ => &[
+                ("attn_q.weight",     "self_attn.q_proj.weight"),
+                ("attn_k.weight",     "self_attn.k_proj.weight"),
+                ("attn_v.weight",     "self_attn.v_proj.weight"),
+                ("attn_output.weight","self_attn.o_proj.weight"),
+                ("ffn_gate.weight",   "mlp.gate_proj.weight"),
+                ("ffn_up.weight",     "mlp.up_proj.weight"),
+                ("ffn_down.weight",   "mlp.down_proj.weight"),
+                ("attn_norm.weight",  "input_layernorm.weight"),
+                ("ffn_norm.weight",   "post_attention_layernorm.weight"),
+            ],
+        }
     }
 
     /// Extra weight suffixes that may appear in this architecture but
@@ -100,13 +137,12 @@ impl ModelArchitecture {
     pub fn known_extra_suffixes(self) -> &'static [&'static str] {
         match self {
             ModelArchitecture::Qwen35 => &[
-                "attn_gate.weight",
-                "attn_qkv.weight",
-                "post_attention_norm.weight",
                 "attn_q_norm.weight",
                 "attn_k_norm.weight",
-                "attn_q.weight",
-                "attn_v.weight",
+                "nextn.eh_proj.weight",
+                "nextn.enorm.weight",
+                "nextn.hnorm.weight",
+                "nextn.shared_head_norm.weight",
             ],
             ModelArchitecture::Llama => &[
                 "attn_norm.bias",
@@ -127,6 +163,8 @@ impl ModelArchitecture {
 pub struct CapabilityReport {
     pub architecture: ModelArchitecture,
     pub arch_supported: bool,
+    pub uses_ssm: bool,
+    pub uses_fused_qkv: bool,
     pub quant_summary: super::quant::QuantSummary,
     pub missing_tensors: Vec<String>,
     pub extra_tensors: Vec<String>,
@@ -145,6 +183,8 @@ impl CapabilityReport {
             ),
         ];
 
+        lines.push(format!("\n  SSM layers  : {}", if self.uses_ssm { "YES ✅" } else { "NO" }));
+        lines.push(format!("  Fused QKV   : {}", if self.uses_fused_qkv { "YES ✅" } else { "NO" }));
         lines.push("\n  Quantization:".to_string());
         lines.push(self.quant_summary.report());
 

@@ -44,10 +44,13 @@ impl ShardEngine {
             num_hidden_layers: manifest.num_layers,
             num_attention_heads: manifest.num_attention_heads,
             num_key_value_heads: manifest.num_key_value_heads,
+            head_dim: manifest.hidden_size / manifest.num_attention_heads,
+            kv_head_dim: manifest.hidden_size / manifest.num_attention_heads,
             intermediate_size: manifest.intermediate_size,
             max_seq_len: manifest.max_seq_len,
             vocab_size: manifest.vocab_size,
             rope_theta: manifest.rope_theta,
+            ..Default::default()
         };
 
         let kv_cache = KVCache::new(config.num_hidden_layers);
@@ -109,8 +112,10 @@ impl ShardEngine {
         let attn_params = AttentionParams {
             num_heads: self.config.num_attention_heads,
             num_kv_heads: self.config.num_key_value_heads,
-            head_dim: self.config.hidden_size / self.config.num_attention_heads,
+            head_dim: self.config.head_dim,
+            kv_head_dim: self.config.kv_head_dim,
             rope_theta: self.config.rope_theta,
+            ..Default::default()
         };
 
         // Transformer layers — load one at a time, compute, evict
@@ -262,10 +267,13 @@ mod tests {
             num_hidden_layers: num_layers,
             num_attention_heads: 2,
             num_key_value_heads: 2,
+            head_dim: hidden / 2,
+            kv_head_dim: hidden / 2,
             intermediate_size: intermediate,
             max_seq_len: 128,
             vocab_size: vocab,
             rope_theta: 10000.0,
+            ..Default::default()
         };
 
         let writer = ShardWriter::new(config.clone(), output_dir);
@@ -353,10 +361,13 @@ mod tests {
             num_hidden_layers: num_layers,
             num_attention_heads: 4,
             num_key_value_heads: 4,
+            head_dim: hidden / 4,
+            kv_head_dim: hidden / 4,
             intermediate_size: intermediate,
             max_seq_len: 128,
             vocab_size: vocab,
             rope_theta: 10000.0,
+            ..Default::default()
         };
 
         let writer = ShardWriter::with_quant(config.clone(), output_dir, crate::shard::QuantFormat::Q8_0);

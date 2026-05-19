@@ -15,10 +15,13 @@ pub struct ModelConfig {
     pub num_hidden_layers: usize,
     pub num_attention_heads: usize,
     pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub kv_head_dim: usize,
     pub intermediate_size: usize,
     pub max_seq_len: usize,
     pub vocab_size: usize,
     pub rope_theta: f32,
+    pub attention_interval: usize,
 }
 
 impl Default for ModelConfig {
@@ -28,10 +31,13 @@ impl Default for ModelConfig {
             num_hidden_layers: 32,
             num_attention_heads: 32,
             num_key_value_heads: 32,
+            head_dim: 128,
+            kv_head_dim: 128,
             intermediate_size: 11008,
             max_seq_len: 4096,
             vocab_size: 32000,
             rope_theta: 10000.0,
+            attention_interval: 1,
         }
     }
 }
@@ -58,12 +64,41 @@ impl GGUFModel {
 
         // Check which required tensors are missing
         let mut missing = Vec::new();
-        for layer_idx in 0..self.config.num_hidden_layers.min(4) {
-            // Sample first few layers to keep it fast
+        let sample_layers = self.config.num_hidden_layers.min(4);
+        for layer_idx in 0..sample_layers {
             let prefix = format!("blk.{}", layer_idx);
+            // For hybrid architectures, detect layer type from actual tensors
+            let has_ssm = self.file.get_tensor_info(&format!("{}.ssm_alpha.weight", prefix)).is_some()
+                || self.file.get_tensor_info(&format!("{}.ssm_out.weight", prefix)).is_some();
+            let has_fused_qkv = self.file.get_tensor_info(&format!("{}.attn_qkv.weight", prefix)).is_some();
+            let has_separate_attn = self.file.get_tensor_info(&format!("{}.attn_q.weight", prefix)).is_some();
+
             for (gguf_suffix, _engine_name) in mappings.iter() {
                 let name = format!("{}.{}", prefix, gguf_suffix);
                 if self.file.get_tensor_info(&name).is_none() {
+                    // For hybrid models, don't flag missing attention tensors on SSM layers
+                    if self.architecture == ModelArchitecture::Qwen35 {
+                        if has_ssm && (gguf_suffix.starts_with("attn_q.weight")
+                            || gguf_suffix.starts_with("attn_k.weight")
+                            || gguf_suffix.starts_with("attn_v.weight")
+                            || gguf_suffix.starts_with("attn_output.weight")) {
+                            continue;
+                        }
+                        if has_separate_attn && (*gguf_suffix == "attn_qkv.weight"
+                            || *gguf_suffix == "attn_gate.weight") {
+                            continue;
+                        }
+                        if has_ssm && *gguf_suffix == "ssm_a" {
+                            // ssm_a may not have .weight suffix; check with just prefix
+                            if self.file.get_tensor_info(&format!("{}.ssm_a", prefix)).is_some() {
+                                continue;
+                            }
+                        }
+                        // SSM tensors are optional on attention layers
+                        if has_separate_attn && gguf_suffix.starts_with("ssm_") {
+                            continue;
+                        }
+                    }
                     missing.push(name);
                 }
             }
@@ -78,9 +113,13 @@ impl GGUFModel {
 
         let mut extra = Vec::new();
         for t in &self.file.tensors {
-            if t.name.starts_with("blk.") && t.name.ends_with(".weight") {
-                let _suffix = t.name.rsplitn(2, '.').next().unwrap_or("");
-                let full_suffix = t.name.splitn(3, '.').nth(2).unwrap_or("");
+            if t.name.starts_with("blk.") {
+                // Handle both .weight suffix and raw parameter names like ssm_a
+                let full_suffix = if t.name.contains(".nextn.") {
+                    t.name.splitn(3, '.').nth(2).unwrap_or("")
+                } else {
+                    t.name.splitn(3, '.').nth(2).unwrap_or("")
+                };
                 if !known_suffixes.contains(full_suffix) {
                     extra.push(t.name.clone());
                 }
@@ -96,6 +135,8 @@ impl GGUFModel {
         CapabilityReport {
             architecture: self.architecture,
             arch_supported,
+            uses_ssm: self.architecture.uses_ssm(),
+            uses_fused_qkv: self.architecture.uses_fused_qkv(),
             quant_summary,
             missing_tensors: missing,
             extra_tensors: extra,
@@ -128,6 +169,19 @@ impl GGUFModel {
             .unwrap_or(cfg.vocab_size);
         cfg.rope_theta = Self::get_meta_int(file, &[&format!("{}.rope.freq_base", prefix), "llama.rope.freq_base", "qwen2.rope.freq_base", "qwen35.rope.freq_base"])
             .map(|v| v as f32).unwrap_or(cfg.rope_theta);
+
+        // Compute head dimensions
+        cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads;
+
+        // Compressed KV dimensions (M5) — for Qwen3.5, key_length != embedding_length / head_count
+        cfg.kv_head_dim = Self::get_meta_int(file, &[&format!("{}.attention.key_length", prefix), "llama.attention.key_length", "qwen35.attention.key_length"])
+            .map(|v| v as usize)
+            .unwrap_or(cfg.head_dim);
+
+        // Attention interval (M7) — for hybrid SSM/Transformer models like Qwen3.5
+        cfg.attention_interval = Self::get_meta_int(file, &[&format!("{}.full_attention_interval", prefix), "qwen35.full_attention_interval"])
+            .map(|v| v as usize)
+            .unwrap_or(1);
 
         cfg
     }
@@ -202,7 +256,7 @@ impl GGUFModel {
         Ok(weights)
     }
 
-    fn dequantize(data: &[u8], typ: u32, shape: Vec<usize>) -> Result<Tensor, GGUError> {
+    pub fn dequantize(data: &[u8], typ: u32, shape: Vec<usize>) -> Result<Tensor, GGUError> {
         let count: usize = shape.iter().product();
         let mut out = vec![0.0f32; count];
 
@@ -227,7 +281,9 @@ impl GGUFModel {
             QuantType::Q4_K => kernels::dequantize_q4_k(data, &mut out),
             QuantType::Q5_K => kernels::dequantize_q5_k(data, &mut out),
             QuantType::Q6_K => kernels::dequantize_q6_k(data, &mut out),
+            QuantType::Q8_K => kernels::dequantize_q8_k(data, &mut out),
             QuantType::IQ4_NL => kernels::dequantize_iq4_nl(data, &mut out),
+            QuantType::IQ5_0 => kernels::dequantize_iq5_0(data, &mut out),
             _ => return Err(GGUError::InvalidTensorType(typ)),
         }
 
@@ -368,20 +424,28 @@ pub fn scan_for_corruption(file: &GGUFile) -> CorruptionReport {
                         continue;
                     }
                 }
-                _ => {
-                    // Most types: d is f16 at bytes 0-1, dmin is f16 at bytes 2-3 (if present)
+                QuantType::Q4_0 | QuantType::Q5_0 | QuantType::Q8_0 | QuantType::IQ4_NL => {
+                    // These types have ONLY a scale (f16 at bytes 0-1), no dmin
                     if block.len() >= 2 {
                         let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-                        let dmin = if block.len() >= 4 {
-                            let v = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
-                            Some(v)
-                        } else {
-                            None
-                        };
-                        (d, dmin)
+                        (d, None)
                     } else {
                         continue;
                     }
+                }
+                QuantType::Q4_1 | QuantType::Q5_1 | QuantType::Q4_K | QuantType::Q5_K => {
+                    // These types have d (f16 at 0-1) and dmin (f16 at 2-3)
+                    if block.len() >= 4 {
+                        let d = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+                        let dmin = half::f16::from_le_bytes([block[2], block[3]]).to_f32();
+                        (d, Some(dmin))
+                    } else {
+                        continue;
+                    }
+                }
+                _ => {
+                    // Unknown / unhandled types — skip corruption check
+                    continue;
                 }
             };
 
@@ -462,7 +526,7 @@ mod tests {
         println!("\n{}", report.print());
 
         assert_eq!(report.architecture, ModelArchitecture::Qwen35);
-        assert!(!report.can_run); // IQ4_NL + qwen35 not fully supported yet
+        assert!(report.can_run); // Qwen35 now fully supported with SSM + hybrid attention
     }
 }
 
@@ -575,7 +639,7 @@ fn debug_raw_bytes_layer1_gate() {
     if !std::path::Path::new(path).exists() { return; }
     let file = GGUFile::open(path).unwrap();
     
-    let t = file.tensors.iter().find(|t| t.name == "blk.1.ffn_gate.weight").unwrap();
+    let _t = file.tensors.iter().find(|t| t.name == "blk.1.ffn_gate.weight").unwrap();
     let raw = file.get_tensor_raw("blk.1.ffn_gate.weight").unwrap();
     println!("Raw data len: {}", raw.len());
     

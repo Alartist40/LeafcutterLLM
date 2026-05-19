@@ -147,6 +147,7 @@ fn test_find_nan_source() {
         num_kv_heads: engine.config.num_key_value_heads,
         head_dim: engine.config.hidden_size / engine.config.num_attention_heads,
         rope_theta: engine.config.rope_theta,
+        ..Default::default()
     };
     
     for layer_idx in 0..engine.config.num_hidden_layers {
@@ -239,6 +240,7 @@ fn test_debug_layer1_ffn() {
         num_kv_heads: engine.config.num_key_value_heads,
         head_dim: engine.config.hidden_size / engine.config.num_attention_heads,
         rope_theta: engine.config.rope_theta,
+        ..Default::default()
     };
     
     // Run layer 0

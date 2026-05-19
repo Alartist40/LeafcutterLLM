@@ -18,10 +18,26 @@ path = "src/main.rs"
 name = "split_model"
 path = "src/bin/split_model.rs"
 
+[[bin]]
+name = "diagnose_models"
+path = "src/bin/diagnose_models.rs"
+
+[[bin]]
+name = "list_tensors"
+path = "src/bin/list_tensors.rs"
+
+[[bin]]
+name = "check_meta"
+path = "src/bin/check_meta.rs"
+
+[[bin]]
+name = "check_shapes"
+path = "src/bin/check_shapes.rs"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
-tower = "0.4"
+tower = { version = "0.4", features = ["util"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 memmap2 = "0.9"
@@ -38,6 +54,8 @@ tokenizers = { version = "0.23.1", default-features = false, features = ["fancy-
 wgpu = "29.0.3"
 pollster = "0.4.0"
 bytemuck = "1.25.0"
+ureq = { version = "2", features = ["json"] }
+which = "7.0"
 
 [dev-dependencies]
 tokio-test = "0.4"

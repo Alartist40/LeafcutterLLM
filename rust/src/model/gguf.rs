@@ -418,7 +418,7 @@ mod weight_shape_tests {
 
 #[cfg(test)]
 mod ffn_tests {
-    use super::*;
+    
     use crate::model::loader::GGUFModel;
 
     #[test]

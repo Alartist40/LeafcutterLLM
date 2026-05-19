@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod backend;
+pub mod bridge;
 pub mod cache;
 pub mod inference;
 pub mod kernels;

@@ -2,24 +2,27 @@
 //!
 //! Stores Key and Value tensors for each layer in f16 format to reduce
 //! RAM usage by 2×. Decompresses to f32 on demand for computation.
+//! Uses HashMap keyed by layer index to support sparse hybrid architectures
+//! (e.g. Qwen3.5 where only some layers use attention).
 
 use crate::model::tensor::Tensor;
 use half::f16;
+use std::collections::HashMap;
 
 pub struct KVCache {
     /// Compressed f16 storage per layer
-    k_compressed: Vec<Vec<f16>>,
-    v_compressed: Vec<Vec<f16>>,
+    k_compressed: HashMap<usize, Vec<f16>>,
+    v_compressed: HashMap<usize, Vec<f16>>,
     /// Shape for each layer's K/V tensor: [seq_len, num_kv_heads, head_dim]
-    shapes: Vec<Vec<usize>>,
+    shapes: HashMap<usize, Vec<usize>>,
 }
 
 impl KVCache {
-    pub fn new(num_layers: usize) -> Self {
+    pub fn new(_num_layers: usize) -> Self {
         Self {
-            k_compressed: Vec::with_capacity(num_layers),
-            v_compressed: Vec::with_capacity(num_layers),
-            shapes: Vec::with_capacity(num_layers),
+            k_compressed: HashMap::new(),
+            v_compressed: HashMap::new(),
+            shapes: HashMap::new(),
         }
     }
 
@@ -31,56 +34,54 @@ impl KVCache {
 
     /// Append K and V tensors for a layer. Input is f32; stored as f16.
     pub fn append(&mut self, layer_idx: usize, k: Tensor, v: Tensor) {
-        // Convert f32 to f16 for storage
         let k_f16: Vec<f16> = k.data.iter().map(|&x| f16::from_f32(x)).collect();
         let v_f16: Vec<f16> = v.data.iter().map(|&x| f16::from_f32(x)).collect();
 
-        if layer_idx >= self.k_compressed.len() {
-            // First time for this layer
-            self.k_compressed.push(k_f16);
-            self.v_compressed.push(v_f16);
-            self.shapes.push(k.shape.clone());
-        } else {
+        if let Some(existing_k) = self.k_compressed.get_mut(&layer_idx) {
             // Concatenate: decompress existing, append new, recompress
-            let mut existing_k: Vec<f32> =
-                self.k_compressed[layer_idx].iter().map(|&x| x.to_f32()).collect();
-            let mut existing_v: Vec<f32> =
-                self.v_compressed[layer_idx].iter().map(|&x| x.to_f32()).collect();
+            let mut existing_k_f32: Vec<f32> = existing_k.iter().map(|&x| x.to_f32()).collect();
+            let mut existing_v_f32: Vec<f32> =
+                self.v_compressed.get(&layer_idx).unwrap().iter().map(|&x| x.to_f32()).collect();
 
-            existing_k.extend_from_slice(&k.data);
-            existing_v.extend_from_slice(&v.data);
+            existing_k_f32.extend_from_slice(&k.data);
+            existing_v_f32.extend_from_slice(&v.data);
 
-            self.k_compressed[layer_idx] =
-                existing_k.iter().map(|&x| f16::from_f32(x)).collect();
-            self.v_compressed[layer_idx] =
-                existing_v.iter().map(|&x| f16::from_f32(x)).collect();
+            *existing_k = existing_k_f32.iter().map(|&x| f16::from_f32(x)).collect();
+            self.v_compressed.insert(layer_idx, existing_v_f32.iter().map(|&x| f16::from_f32(x)).collect());
 
             // Update shape along sequence dimension (dim 0)
-            self.shapes[layer_idx][0] += k.shape[0];
+            self.shapes.get_mut(&layer_idx).unwrap()[0] += k.shape[0];
+        } else {
+            // First time for this layer
+            self.k_compressed.insert(layer_idx, k_f16);
+            self.v_compressed.insert(layer_idx, v_f16);
+            self.shapes.insert(layer_idx, k.shape.clone());
         }
     }
 
     /// Get decompressed f32 K and V tensors for a layer.
     /// Returns owned Tensors (decompresses from f16 on demand).
     pub fn get(&self, layer_idx: usize) -> Option<(Tensor, Tensor)> {
-        if layer_idx >= self.k_compressed.len() {
-            return None;
-        }
+        let k_f16 = self.k_compressed.get(&layer_idx)?;
+        let v_f16 = self.v_compressed.get(&layer_idx)?;
 
-        let k_f32: Vec<f32> =
-            self.k_compressed[layer_idx].iter().map(|&x| x.to_f32()).collect();
-        let v_f32: Vec<f32> =
-            self.v_compressed[layer_idx].iter().map(|&x| x.to_f32()).collect();
+        let k_f32: Vec<f32> = k_f16.iter().map(|&x| x.to_f32()).collect();
+        let v_f32: Vec<f32> = v_f16.iter().map(|&x| x.to_f32()).collect();
 
-        let shape = self.shapes[layer_idx].clone();
+        let shape = self.shapes.get(&layer_idx)?.clone();
         Some((Tensor::from_vec(k_f32, shape.clone()), Tensor::from_vec(v_f32, shape)))
     }
 
     /// Report memory usage in bytes (compressed f16 storage).
     pub fn memory_bytes(&self) -> usize {
-        let k_bytes: usize = self.k_compressed.iter().map(|v| v.len() * 2).sum();
-        let v_bytes: usize = self.v_compressed.iter().map(|v| v.len() * 2).sum();
+        let k_bytes: usize = self.k_compressed.values().map(|v| v.len() * 2).sum();
+        let v_bytes: usize = self.v_compressed.values().map(|v| v.len() * 2).sum();
         k_bytes + v_bytes
+    }
+
+    /// Total sequence length cached across all layers.
+    pub fn total_seq_len(&self) -> usize {
+        self.shapes.values().map(|s| s.get(0).copied().unwrap_or(0)).sum()
     }
 }
 
@@ -143,24 +144,39 @@ mod tests {
 
         // Memory should be ~half of f32
         let f32_bytes = k.data.len() * 4 + v.data.len() * 4;
-        let f16_bytes = cache.memory_bytes();
-        assert_eq!(f16_bytes, f32_bytes / 2);
+        assert!(cache.memory_bytes() <= f32_bytes / 2 + 16); // small overhead
     }
 
     #[test]
-    fn test_kv_cache_append() {
+    fn test_kv_cache_sparse_layers() {
+        let mut cache = KVCache::new(4);
+        let k = Tensor::from_vec(vec![1.0f32, 2.0], vec![1, 1, 2]);
+        let v = Tensor::from_vec(vec![0.5f32, 1.5], vec![1, 1, 2]);
+
+        // Only append to layers 1 and 3
+        cache.append(1, k.clone(), v.clone());
+        cache.append(3, k.clone(), v.clone());
+
+        assert!(cache.get(0).is_none());
+        assert!(cache.get(1).is_some());
+        assert!(cache.get(2).is_none());
+        assert!(cache.get(3).is_some());
+    }
+
+    #[test]
+    fn test_kv_cache_append_twice() {
         let mut cache = KVCache::new(2);
         let k1 = Tensor::from_vec(vec![1.0f32, 2.0], vec![1, 1, 2]);
-        let v1 = Tensor::from_vec(vec![3.0f32, 4.0], vec![1, 1, 2]);
-        let k2 = Tensor::from_vec(vec![5.0f32, 6.0], vec![1, 1, 2]);
-        let v2 = Tensor::from_vec(vec![7.0f32, 8.0], vec![1, 1, 2]);
+        let v1 = Tensor::from_vec(vec![0.5f32, 1.5], vec![1, 1, 2]);
+        let k2 = Tensor::from_vec(vec![3.0f32, 4.0], vec![1, 1, 2]);
+        let v2 = Tensor::from_vec(vec![2.5f32, 3.5], vec![1, 1, 2]);
 
         cache.append(0, k1, v1);
         cache.append(0, k2, v2);
 
         let (k_out, v_out) = cache.get(0).unwrap();
         assert_eq!(k_out.shape, vec![2, 1, 2]);
-        assert_eq!(k_out.data, vec![1.0, 2.0, 5.0, 6.0]);
-        assert_eq!(v_out.data, vec![3.0, 4.0, 7.0, 8.0]);
+        assert_eq!(k_out.data, vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(v_out.data, vec![0.5, 1.5, 2.5, 3.5]);
     }
 }

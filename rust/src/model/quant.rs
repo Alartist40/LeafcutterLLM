@@ -248,7 +248,9 @@ impl QuantType {
             QuantType::Q4_K |
             QuantType::Q5_K |
             QuantType::Q6_K |
-            QuantType::IQ4_NL
+            QuantType::Q8_K |
+            QuantType::IQ4_NL |
+            QuantType::IQ5_0
         )
     }
 

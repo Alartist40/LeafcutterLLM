@@ -321,6 +321,9 @@ mod tests {
             max_seq_len: 128,
             vocab_size: 100,
             rope_theta: 10000.0,
+        head_dim: 2,
+        kv_head_dim: 2,
+        ..Default::default()
         };
 
         let writer = ShardWriter::new(config, output_dir);
@@ -381,6 +384,9 @@ mod tests {
             max_seq_len: 128,
             vocab_size: 100,
             rope_theta: 10000.0,
+        head_dim: 2,
+        kv_head_dim: 2,
+        ..Default::default()
         };
 
         let writer = ShardWriter::with_quant(config, output_dir, crate::shard::QuantFormat::Q8_0);
@@ -456,6 +462,9 @@ mod tests {
             max_seq_len: 128,
             vocab_size: 100,
             rope_theta: 10000.0,
+        head_dim: 2,
+        kv_head_dim: 2,
+        ..Default::default()
         };
 
         let writer = ShardWriter::with_quant(config.clone(), output_dir, crate::shard::QuantFormat::Q4_0);
