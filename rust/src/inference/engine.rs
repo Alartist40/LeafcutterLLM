@@ -184,7 +184,9 @@ impl Engine {
             let layer_weights = self.layer_cache.get(&layer_idx).unwrap();
 
             // Detect layer type from actual tensor contents (most robust)
-            let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight");
+            // Qwen3.5 uses attn_q.weight (unfused) or self_attn.q_proj.weight (Llama-style)
+            let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight")
+                || layer_weights.contains_key("attn_q.weight");
             let has_ssm = layer_weights.contains_key("ssm_out.weight")
                 || layer_weights.contains_key("ssm_alpha.weight");
 

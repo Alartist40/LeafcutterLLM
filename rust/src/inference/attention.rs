@@ -59,6 +59,26 @@ pub fn apply_rotary_emb(x: &mut Tensor, seq_len: usize, num_heads: usize, head_d
     }
 }
 
+/// Apply per-head RMSNorm to Q or K before RoPE.
+/// Input is flat [seq_len * num_heads * head_dim], output is same shape.
+fn apply_per_head_rms_norm(data: &[f32], num_heads: usize, head_dim: usize, weight: &Tensor, eps: f32) -> Vec<f32> {
+    let seq_len = data.len() / (num_heads * head_dim);
+    let mut out = vec![0.0f32; data.len()];
+    for s in 0..seq_len {
+        for h in 0..num_heads {
+            let base = s * num_heads * head_dim + h * head_dim;
+            // Compute RMS
+            let sum_sq: f32 = data[base..base + head_dim].iter().map(|&x| x * x).sum();
+            let rms = (sum_sq / head_dim as f32 + eps).sqrt();
+            let scale = 1.0 / rms;
+            for d in 0..head_dim {
+                out[base + d] = data[base + d] * scale * weight.data[d];
+            }
+        }
+    }
+    out
+}
+
 /// Attention forward pass with fused QKV and compressed KV support.
 pub fn attention_forward(
     hidden_states: &Tensor,
@@ -101,9 +121,15 @@ pub fn attention_forward(
         );
         (q_tensor, k_tensor, v_tensor)
     } else {
-        let q_proj = weights.get("self_attn.q_proj.weight").expect("Missing q_proj");
-        let k_proj = weights.get("self_attn.k_proj.weight").expect("Missing k_proj");
-        let v_proj = weights.get("self_attn.v_proj.weight").expect("Missing v_proj");
+        let q_proj = weights.get("self_attn.q_proj.weight")
+            .or_else(|| weights.get("attn_q.weight"))
+            .expect("Missing q_proj");
+        let k_proj = weights.get("self_attn.k_proj.weight")
+            .or_else(|| weights.get("attn_k.weight"))
+            .expect("Missing k_proj");
+        let v_proj = weights.get("self_attn.v_proj.weight")
+            .or_else(|| weights.get("attn_v.weight"))
+            .expect("Missing v_proj");
         (
             hidden_states.matmul(q_proj),
             hidden_states.matmul(k_proj),
@@ -134,34 +160,48 @@ pub fn attention_forward(
     let k_data = k.data.clone();
 
     // -------------------------------------------------------------------------
+    // Q/K per-head RMSNorm (Qwen3.5-style) — applied before RoPE
+    // -------------------------------------------------------------------------
+    let q_normed = if let Some(q_norm_w) = weights.get("attn_q_norm.weight") {
+        apply_per_head_rms_norm(&q_data, params.num_heads, params.head_dim, q_norm_w, 1e-6)
+    } else {
+        q_data
+    };
+    let k_normed = if let Some(k_norm_w) = weights.get("attn_k_norm.weight") {
+        apply_per_head_rms_norm(&k_data, params.num_kv_heads, params.kv_head_dim, k_norm_w, 1e-6)
+    } else {
+        k_data
+    };
+
+    // -------------------------------------------------------------------------
     // Adaptive reshape to [seq_len, heads, head_dim] for RoPE
     // Qwen3.5 attention layers may have larger Q dims (e.g. 4096 vs expected 2048)
     // -------------------------------------------------------------------------
     let expected_q_dim = params.num_heads * params.head_dim;
-    let actual_q_dim = q_data.len() / seq_len;
+    let actual_q_dim = q_normed.len() / seq_len;
     let _effective_q_heads = if actual_q_dim >= expected_q_dim {
         params.num_heads
     } else {
         actual_q_dim / params.head_dim
     };
 
-    // Truncate or pad q_data to expected_q_dim
+    // Truncate or pad q_normed to expected_q_dim
     let q_data_trimmed: Vec<f32> = if actual_q_dim == expected_q_dim {
-        q_data
+        q_normed
     } else if actual_q_dim > expected_q_dim {
-        (0..seq_len).flat_map(|s| q_data[s * actual_q_dim..s * actual_q_dim + expected_q_dim].to_vec()).collect()
+        (0..seq_len).flat_map(|s| q_normed[s * actual_q_dim..s * actual_q_dim + expected_q_dim].to_vec()).collect()
     } else {
         let mut padded = vec![0.0f32; seq_len * expected_q_dim];
         for s in 0..seq_len {
             for d in 0..actual_q_dim {
-                padded[s * expected_q_dim + d] = q_data[s * actual_q_dim + d];
+                padded[s * expected_q_dim + d] = q_normed[s * actual_q_dim + d];
             }
         }
         padded
     };
 
     let mut q = Tensor::from_vec(q_data_trimmed, vec![seq_len, params.num_heads, params.head_dim]);
-    let mut k = Tensor::from_vec(k_data, vec![seq_len, params.num_kv_heads, params.kv_head_dim]);
+    let mut k = Tensor::from_vec(k_normed, vec![seq_len, params.num_kv_heads, params.kv_head_dim]);
     let v = Tensor::from_vec(v.data, vec![seq_len, params.num_kv_heads, params.kv_head_dim]);
 
     // -------------------------------------------------------------------------
