@@ -5,8 +5,17 @@
 
 pub mod bitnet_lut;
 pub mod int8_gemm;
+pub mod iq4_nl;
+pub mod iq4_nl_gemm;
 pub mod q4_0;
+pub mod q4_k;
+pub mod q4_k_gemm;
+pub mod q5_k;
+pub mod q5_k_gemm;
+pub mod q6_k;
+pub mod q6_k_gemm;
 pub mod q8_0;
+pub mod quant_gemm_common;
 pub mod simd;
 
 use half::f16;

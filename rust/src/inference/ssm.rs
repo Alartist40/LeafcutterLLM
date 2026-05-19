@@ -159,7 +159,7 @@ fn adaptive_matmul(x: &Tensor, w: &Tensor, target_hidden: usize) -> Tensor {
     let seq_len = x.shape[0];
     let src_dim = x.shape[1];
     let w_in = w.shape[0];
-    let w_out = w.shape[1];
+    let _w_out = w.shape[1];
 
     // If src_dim > w_in: pool src down to w_in
     // If src_dim < w_in: pad src up to w_in

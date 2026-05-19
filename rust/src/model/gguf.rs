@@ -9,6 +9,7 @@ use std::path::Path;
 use thiserror::Error;
 
 use super::quant::{QuantType, QuantSummary};
+// use crate::kernels;
 
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" little-endian
 pub const GGUF_VERSION: u32 = 3;
@@ -128,6 +129,60 @@ impl GGUFile {
 
     pub fn get_tensor_info(&self, name: &str) -> Option<&GGUFTensor> {
         self.tensors.iter().find(|t| t.name == name)
+    }
+
+    /// Read and dequantize a single row from a 2D tensor.
+    ///
+    /// GGUF stores 2D tensors in row-major order.  For quantized types,
+    /// each row consists of an integral number of blocks.
+    pub fn get_tensor_row_f32(&self, name: &str, row_idx: usize) -> Option<Vec<f32>> {
+        let info = self.get_tensor_info(name)?;
+        let qtype = QuantType::from_u32(info.typ)?;
+        let cols = info.dimensions[0] as usize;
+        let rows = info.dimensions.get(1).copied().unwrap_or(1) as usize;
+        if row_idx >= rows {
+            return None;
+        }
+
+        let block_size = qtype.block_size();
+        let block_bytes = qtype.block_bytes();
+        let blocks_per_row = (cols + block_size - 1) / block_size;
+        let row_bytes = blocks_per_row * block_bytes;
+
+        let tensor_start = (self.data_offset + info.offset) as usize;
+        let row_start = tensor_start + row_idx * row_bytes;
+        let raw = &self.mmap[row_start..row_start + row_bytes];
+
+        let mut out = vec![0.0f32; cols];
+        match qtype {
+            QuantType::F32 => {
+                for i in 0..cols {
+                    let b = [raw[i*4], raw[i*4+1], raw[i*4+2], raw[i*4+3]];
+                    out[i] = f32::from_le_bytes(b);
+                }
+            }
+            QuantType::F16 => {
+                for i in 0..cols {
+                    let b = [raw[i*2], raw[i*2+1]];
+                    out[i] = half::f16::from_le_bytes(b).to_f32();
+                }
+            }
+            QuantType::Q8_0 => crate::kernels::dequantize_q8_0(raw, &mut out),
+            QuantType::Q4_0 => crate::kernels::dequantize_q4_0(raw, &mut out),
+            QuantType::Q4_K => crate::kernels::dequantize_q4_k(raw, &mut out),
+            QuantType::Q5_K => crate::kernels::dequantize_q5_k(raw, &mut out),
+            QuantType::Q6_K => crate::kernels::dequantize_q6_k(raw, &mut out),
+            QuantType::Q8_K => crate::kernels::dequantize_q8_k(raw, &mut out),
+            QuantType::IQ4_NL => crate::kernels::dequantize_iq4_nl(raw, &mut out),
+            QuantType::IQ5_0 => crate::kernels::dequantize_iq5_0(raw, &mut out),
+            _ => {
+                #[cfg(debug_assertions)]
+                panic!("get_tensor_row_f32: unsupported quant type {:?} for tensor {}", qtype, name);
+                #[cfg(not(debug_assertions))]
+                return None;
+            }
+        }
+        Some(out)
     }
 
     pub fn get_metadata_int(&self, key: &str) -> Option<i64> {

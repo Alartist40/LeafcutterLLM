@@ -1,15 +1,24 @@
 //! f32 tensor implementation with pluggable compute backend
 
 use crate::backend::{default_backend, set_global_backend, Backend};
+use crate::kernels::iq4_nl::Matrix as IQ4NLMatrix;
 use crate::kernels::q4_0::Matrix as Q4Matrix;
+use crate::kernels::q4_k::Matrix as Q4KMatrix;
+use crate::kernels::q5_k::Matrix as Q5KMatrix;
+use crate::kernels::q6_k::Matrix as Q6KMatrix;
 use crate::kernels::q8_0::Matrix as Q8Matrix;
 
 /// Native quantized weight data attached to a Tensor.
 /// When present, matmul dispatches to a format-specific kernel
 /// for memory-bandwidth savings. All other ops use `data` (f32).
 #[derive(Clone)]
+#[allow(non_camel_case_types)]
 pub enum QuantizedData {
+    IQ4_NL(IQ4NLMatrix),
     Q4_0(Q4Matrix),
+    Q4_K(Q4KMatrix),
+    Q5_K(Q5KMatrix),
+    Q6_K(Q6KMatrix),
     Q8_0(Q8Matrix),
 }
 
@@ -88,6 +97,58 @@ impl Tensor {
         }
     }
 
+    /// Create a tensor from Q4_K quantized weights.
+    /// Stores both Q4_K (for fast matmul) and f32 (for other ops).
+    pub fn from_q4_k(q4: Q4KMatrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q4.rows * q4.cols, shape.iter().product::<usize>());
+        let data = q4.dequantize();
+        Self {
+            shape,
+            data,
+            q_data: Some(QuantizedData::Q4_K(q4)),
+            backend: default_backend(),
+        }
+    }
+
+    /// Create a tensor from IQ4_NL quantized weights.
+    /// Stores both IQ4_NL (for fast matmul) and f32 (for other ops).
+    pub fn from_iq4_nl(q4: IQ4NLMatrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q4.rows * q4.cols, shape.iter().product::<usize>());
+        let data = q4.dequantize();
+        Self {
+            shape,
+            data,
+            q_data: Some(QuantizedData::IQ4_NL(q4)),
+            backend: default_backend(),
+        }
+    }
+
+    /// Create a tensor from Q5_K quantized weights.
+    /// Stores both Q5_K (for fast matmul) and f32 (for other ops).
+    pub fn from_q5_k(q5: Q5KMatrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q5.rows * q5.cols, shape.iter().product::<usize>());
+        let data = q5.dequantize();
+        Self {
+            shape,
+            data,
+            q_data: Some(QuantizedData::Q5_K(q5)),
+            backend: default_backend(),
+        }
+    }
+
+    /// Create a tensor from Q6_K quantized weights.
+    /// Stores both Q6_K (for fast matmul) and f32 (for other ops).
+    pub fn from_q6_k(q6: Q6KMatrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q6.rows * q6.cols, shape.iter().product::<usize>());
+        let data = q6.dequantize();
+        Self {
+            shape,
+            data,
+            q_data: Some(QuantizedData::Q6_K(q6)),
+            backend: default_backend(),
+        }
+    }
+
     /// Returns true if this tensor has native quantized data for fast matmul.
     pub fn is_quantized(&self) -> bool {
         self.q_data.is_some()
@@ -125,6 +186,26 @@ impl Tensor {
                     assert_eq!(q4.rows, k);
                     assert_eq!(q4.cols, n);
                     crate::kernels::int8_gemm::q4_0_matmul(&self.data, q4, &mut result, m, k, n);
+                }
+                QuantizedData::Q4_K(q4) => {
+                    assert_eq!(q4.rows, k);
+                    assert_eq!(q4.cols, n);
+                    crate::kernels::q4_k_gemm::q4_k_matmul(&self.data, q4, &mut result, m, k, n);
+                }
+                QuantizedData::IQ4_NL(q4) => {
+                    assert_eq!(q4.rows, k);
+                    assert_eq!(q4.cols, n);
+                    crate::kernels::iq4_nl_gemm::iq4_nl_matmul(&self.data, q4, &mut result, m, k, n);
+                }
+                QuantizedData::Q5_K(q5) => {
+                    assert_eq!(q5.rows, k);
+                    assert_eq!(q5.cols, n);
+                    crate::kernels::q5_k_gemm::q5_k_matmul(&self.data, q5, &mut result, m, k, n);
+                }
+                QuantizedData::Q6_K(q6) => {
+                    assert_eq!(q6.rows, k);
+                    assert_eq!(q6.cols, n);
+                    crate::kernels::q6_k_gemm::q6_k_matmul(&self.data, q6, &mut result, m, k, n);
                 }
             }
             return Self::from_vec_with_backend(result, vec![m, n], self.backend);

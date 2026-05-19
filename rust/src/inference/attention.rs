@@ -138,7 +138,7 @@ pub fn attention_forward(
     // -------------------------------------------------------------------------
     let expected_q_dim = params.num_heads * params.head_dim;
     let actual_q_dim = q_data.len() / seq_len;
-    let effective_q_heads = if actual_q_dim >= expected_q_dim {
+    let _effective_q_heads = if actual_q_dim >= expected_q_dim {
         params.num_heads
     } else {
         actual_q_dim / params.head_dim

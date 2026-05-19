@@ -14,6 +14,7 @@ use crate::inference::attention::{attention_forward, AttentionParams};
 use crate::inference::sampler::sample_top_p;
 use crate::inference::ssm::{ssm_forward, SSMConfig};
 use crate::inference::speculative::SpeculativeHead;
+use rayon::prelude::*;
 use std::collections::HashMap;
 
 pub struct Engine {
@@ -24,6 +25,8 @@ pub struct Engine {
     pub attn_params: AttentionParams,
     pub ssm_config: SSMConfig,
     pub speculative_head: Option<SpeculativeHead>,
+    /// Whether lm_head is tied to token embeddings (no separate output.weight tensor).
+    lm_head_tied: bool,
 }
 
 impl Engine {
@@ -49,7 +52,7 @@ impl Engine {
         }
 
         let config = model.config.clone();
-        let special_weights = model.load_special()?;
+        let mut special_weights = model.load_special()?;
         let kv_cache = KVCache::new(config.num_hidden_layers);
 
         // Build attention params with fused QKV / compressed KV support
@@ -105,6 +108,11 @@ impl Engine {
             None
         };
 
+        // Don't keep embed or lm_head in RAM — use mmap per-row lookup instead.
+        special_weights.remove("model.embed_tokens.weight");
+        special_weights.remove("lm_head.weight");
+        let lm_head_tied = !model.file.get_tensor_info("output.weight").is_some();
+
         Ok(Self {
             model,
             config,
@@ -113,6 +121,7 @@ impl Engine {
             attn_params,
             ssm_config,
             speculative_head,
+            lm_head_tied,
         })
     }
 
@@ -146,10 +155,8 @@ impl Engine {
     pub fn forward(&mut self, tokens: &[usize]) -> Vec<f32> {
         let seq_len = tokens.len();
 
-        // Embedding lookup
-        let embed = self.special_weights.get("model.embed_tokens.weight")
-            .expect("Missing embed_tokens");
-        let mut hidden = self.embed_lookup(tokens, embed);
+        // Embedding lookup via mmap (avoids loading full embed matrix into RAM)
+        let mut hidden = self.embed_lookup_mmap(tokens);
 
         // Transformer / hybrid layers
         for layer_idx in 0..self.config.num_hidden_layers {
@@ -191,17 +198,15 @@ impl Engine {
             .expect("Missing final norm");
         hidden = hidden.rms_norm(final_norm, 1e-5);
 
-        // LM head
-        let lm_head = self.special_weights.get("lm_head.weight")
-            .expect("Missing lm_head");
-        let logits = hidden.matmul(lm_head);
-
-        // Return last token's logits
-        let vocab_size = logits.shape[1];
-        let start = (seq_len - 1) * vocab_size;
-        logits.data[start..start + vocab_size].to_vec()
+        // LM head — computed via outer-product over rows from mmap (no full matrix in RAM)
+        if self.lm_head_tied {
+            self.lm_head_tied_forward(&hidden, seq_len)
+        } else {
+            self.lm_head_separate_forward(&hidden, seq_len)
+        }
     }
 
+    /// Legacy embed lookup from a fully-materialized tensor (for tests / compatibility).
     pub fn embed_lookup(&self, tokens: &[usize], embed: &Tensor) -> Tensor {
         let hidden_size = embed.shape[1];
         let mut data = vec![0.0f32; tokens.len() * hidden_size];
@@ -212,6 +217,52 @@ impl Engine {
             }
         }
         Tensor::from_vec(data, vec![tokens.len(), hidden_size])
+    }
+
+    /// Lookup embeddings via memory-mapped file (per-token, no full matrix in RAM).
+    pub fn embed_lookup_mmap(&self, tokens: &[usize]) -> Tensor {
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+        let mut data = vec![0.0f32; tokens.len() * hidden_size];
+        for (i, &token) in tokens.iter().enumerate() {
+            let idx = token.min(vocab_size - 1);
+            let row = self.model.file.get_tensor_row_f32("token_embd.weight", idx)
+                .expect("Failed to read embedding row");
+            data[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(&row);
+        }
+        Tensor::from_vec(data, vec![tokens.len(), hidden_size])
+    }
+
+    /// Compute logits when lm_head is tied to embeddings.
+    /// Parallelized over the vocabulary using rayon.
+    fn lm_head_tied_forward(&self, hidden: &Tensor, seq_len: usize) -> Vec<f32> {
+        self.lm_head_projection(&hidden.data[(seq_len - 1) * self.config.hidden_size..seq_len * self.config.hidden_size],
+            "token_embd.weight", self.config.hidden_size, self.config.vocab_size)
+    }
+
+    /// Compute logits when lm_head is a separate tensor (output.weight).
+    /// The raw GGUF data is [vocab, hidden] (before transpose), so each row
+    /// corresponds to one vocab token's weights.  We compute dot(hidden, row_j)
+    /// for each token j — same pattern as tied embeddings.
+    fn lm_head_separate_forward(&self, hidden: &Tensor, seq_len: usize) -> Vec<f32> {
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+        let hidden_last = &hidden.data[(seq_len - 1) * hidden_size..seq_len * hidden_size];
+        self.lm_head_projection(hidden_last, "output.weight", hidden_size, vocab_size)
+    }
+
+    /// Generic lm_head projection: dot(hidden_last, embed_row) for each token.
+    fn lm_head_projection(&self, hidden_last: &[f32], tensor_name: &str, hidden_size: usize, vocab_size: usize) -> Vec<f32> {
+        let file = &self.model.file;
+        (0..vocab_size).into_par_iter().map(|token_id| {
+            let row = file.get_tensor_row_f32(tensor_name, token_id)
+                .expect("lm_head row");
+            let mut sum = 0.0f32;
+            for j in 0..hidden_size {
+                sum += hidden_last[j] * row[j];
+            }
+            sum
+        }).collect()
     }
 
     fn ffn_forward(&self, x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {

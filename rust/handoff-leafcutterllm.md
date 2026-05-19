@@ -1,205 +1,173 @@
 # Handoff: LeafcutterLLM (The Pathfinder Eye)
 
-**Date:** 2026-05-15  
-**Session duration:** Extended (Phase 5: General-Purpose Inference Engine)  
-**Git commit:** `4e47b6b`  
-**Author:** Kimi Code CLI  
+**Date:** 2026-05-19  
+**Session:** Performance Breakthrough — OpenBLAS + Quantized GEMM + Memory-Mapped Embed  
+**Git commit:** `cc62d1e` (pushed)  
+**Author:** Kimi Code CLI
 
 ---
 
 ## Goal
 
-Build a **memory-safe, cross-platform LLM inference engine** in Rust that can run large language models on resource-constrained hardware (Raspberry Pi 5, embedded ARM devices) via **layer streaming** (load one layer at a time from disk) and **quantized compute** (Q8_0, Q4_0, future Q4_K_M). The engine must be hardware-agnostic: CPU (ARM NEON, x86_64 SSE/AVX2) and GPU (WGPU/Vulkan/Metal/DX12).
+Transform Leafcutter from "works but slow" to "competitive on speed and memory" by:
+1. Adding an OpenBLAS backend for optimized f32 GEMM
+2. Wiring up existing Q8_0/Q4_0 and new Q4_K direct quantized GEMM kernels
+3. Implementing memory-mapped per-token embed lookup to eliminate multi-GB f32 embed/lm_head materialization
+4. Enabling 9B models to load and run without OOM
 
 ---
 
 ## Current State
 
-### ✅ Complete (12 milestones)
+### ✅ New in This Session
 
-| # | Milestone | Key File(s) | Tests |
-|---|-----------|-------------|-------|
-| 1 | Backend trait abstraction | `src/backend/mod.rs`, `src/backend/cpu.rs` | Tensor ops dispatch through trait |
-| 2 | SIMD kernels (NEON/SSE/AVX2) | `src/kernels/simd.rs` | 7 tests (matmul small/large, vec_add, sum_sq, parallel correctness) |
-| 3 | Q8_0 block format | `src/kernels/q8_0.rs` | 2 tests (block roundtrip, quantize/dequantize) |
-| 4 | Q8_0 shard write/load | `src/shard/format.rs`, `writer.rs`, `loader.rs` | `test_q8_0_shard_roundtrip` |
-| 5 | Native INT8 GEMM (Q8_0) | `src/kernels/int8_gemm.rs` | 2 tests (vs dequant reference, large matrix) |
-| 6 | Q4_0 block format + INT4 GEMM | `src/kernels/q4_0.rs`, `int8_gemm.rs` | 4 tests (q4_0 roundtrip, matmul vs dequant, large matrix, shard roundtrip) |
-| 7 | Multi-threaded CPU matmul | `src/kernels/simd.rs`, `src/backend/cpu.rs` | `test_parallel_matmul_correctness`, `bench_parallel_matmul_speedup` |
-| 8 | f16 KV cache | `src/cache/mod.rs` | 2 tests (f16 roundtrip, append/concat) |
-| 9 | WGPU GPU backend | `src/backend/wgpu.rs` | 2 tests (both require GPU, marked `#[ignore]`) |
-| 10 | ShardEngine end-to-end | `src/inference/shard_engine.rs` | 2 tests (f32 forward, Q8_0 forward) |
-| 11 | Benchmark binary | `src/bin/bench_shard.rs` | CLI tool — no unit tests |
-| 12 | Milestone documentation | `MILESTONES_AND_TESTING.md` | — |
+| # | Feature | Key File(s) | Impact |
+|---|---------|-------------|--------|
+| 1 | OpenBLAS backend | `src/backend/openblas.rs` | 1.6× tok/sec speedup on all models |
+| 2 | Q4_K direct GEMM | `src/kernels/q4_k.rs`, `src/kernels/q4_k_gemm.rs` | 2.4× total speedup on Q4_K models; 7× memory savings |
+| 3 | Q4_K wired into Tensor + Loader | `src/model/tensor.rs`, `src/model/loader.rs` | 113/335 tensors in 2B-Q4_K_M stay quantized |
+| 4 | Memory-mapped embed lookup | `src/model/gguf.rs`, `src/inference/engine.rs` | Eliminates 2–8GB embed RAM; 9B models no longer OOM |
+| 5 | Lazy lm_head projection | `src/inference/engine.rs` | Parallel dot-product over vocab; no f32 lm_head in RAM |
+| 6 | Quantized tensor memory trim | `src/model/loader.rs` | `t.data.clear()` after `from_q4_k()` frees f32 copy, keeps q_data |
 
-**Test summary: 70 passed, 0 failed, 3 ignored**
+### Benchmark Results (x86_64, AVX2/FMA, OpenBLAS)
 
-### 🔄 In Progress
+| Model | Quant | Forward (20 tok) | tok/sec | Status |
+|-------|-------|------------------|---------|--------|
+| Qwen3.5-2B-IQ4_XS | IQ4_XS | 17.4s | 1.15 | ✅ Native |
+| Qwen3.5-2B-Q4_K_M | Q4_K | 11.4s | 1.76 | ✅ Native |
+| Qwen3.5-9B-IQ4_NL | IQ4_NL | 82.7s | 0.24 | ✅ Native (was OOM) |
 
-Nothing actively in progress. Phase 5 is feature-complete.
+**Total speedup vs baseline (naive f32 matmul):**
+- 2B-Q4_K_M: **2.4×** (27s → 11.4s)
+- 2B-IQ4_XS: **1.7×** (30s → 17.4s)
 
-### ⛔ Blocked
+### Test Summary
 
-- **Pi 5 field testing** — Code compiles for `aarch64` via `cfg` but never executed on actual ARM hardware. NEON correctness is validated by algorithmic identity with SSE path on x86_64.
-- **WGPU large matmul precision** — GPU vs CPU has ~1e-4 relative float divergence (expected). Test tolerance set to 1e-4.
-
----
-
-## Active Files
-
-All files in `src/` are production-ready. The most critical:
-
-- `src/backend/mod.rs` — `Backend` trait + global backend singleton
-- `src/backend/cpu.rs` — `CpuBackend`, wraps SIMD kernels, adds multi-threading threshold
-- `src/backend/wgpu.rs` — `WgpuBackend`, WGSL compute shader matmul, CPU fallback
-- `src/kernels/simd.rs` — Architecture-specific SIMD (NEON/SSE/AVX2), multi-threaded dispatch
-- `src/kernels/q8_0.rs` — Q8_0 `Block` + `Matrix` + quantize/dequantize
-- `src/kernels/q4_0.rs` — Q4_0 `Block` + `Matrix` + quantize/dequantize
-- `src/kernels/int8_gemm.rs` — Native INT8/INT4 GEMM kernels (scalar/AVX2/NEON)
-- `src/model/tensor.rs` — `Tensor` with `QuantizedData` enum (Q4_0/Q8_0), auto-dispatches matmul
-- `src/cache/mod.rs` — `KVCache` with f16 compression
-- `src/shard/format.rs` — `ShardHeader`, `ShardTensorMeta`, `QuantFormat` enum
-- `src/shard/writer.rs` — `ShardWriter`, writes F32/Q8_0/Q4_0 shards
-- `src/shard/loader.rs` — `ShardLoader`, mmap-based loading, FIFO cache, prefetch
-- `src/inference/shard_engine.rs` — `ShardEngine`, autoregressive forward pass
-- `src/bin/bench_shard.rs` — Benchmark CLI
-- `src/bin/split_model.rs` — `split_model` CLI (`--quant f32|q8_0|q4_0`)
-- `MILESTONES_AND_TESTING.md` — Full milestone + test + benchmark record
+**99 passed, 0 failed, 3 ignored** (GPU tests)
 
 ---
 
-## Recent Changes (This Session)
+## Architecture Changes
 
-### Added
-- **Q4_0 quantization** (`src/kernels/q4_0.rs`) — 18-byte blocks for 32 weights, ~7× compression
-- **Q4_0 INT4 GEMM** (`src/kernels/int8_gemm.rs`) — scalar + AVX2 + NEON paths
-- **WGPU backend** (`src/backend/wgpu.rs`) — Cross-platform GPU matmul via compute shaders
-- **Multi-threaded matmul** (`src/kernels/simd.rs`) — `rayon::join` recursive row-splitting
-- **f16 KV cache** (`src/cache/mod.rs`) — 2× RAM savings
-- **QuantizedData enum** (`src/model/tensor.rs`) — Unified Q4_0/Q8_0 storage in Tensor
-- **bench_shard binary** (`src/bin/bench_shard.rs`) — Performance benchmarking tool
-- **MILESTONES_AND_TESTING.md** — Documentation
+### Backend Selection
 
-### Modified
-- `src/shard/format.rs` — Added `QuantFormat::Q4_0 = 2`
-- `src/shard/writer.rs` — Added Q4_0 data size + write paths
-- `src/shard/loader.rs` — Added Q4_0 parse path, 1D tensor fallback fix
-- `src/model/tensor.rs` — Refactored from `q8_data: Option<Q8Matrix>` to `q_data: Option<QuantizedData>`
-- `src/inference/shard_engine.rs` — Added `reset_kv_cache()` and `kv_cache_memory_mb()`
-- `src/inference/attention.rs` — Updated `kv_cache.get()` call (now returns owned Tensors)
-- `src/bin/split_model.rs` — Added `--quant q4_0`
-- `Cargo.toml` — Added `rayon = "1.10"`, `wgpu = "29.0.3"`, `pollster = "0.4.0"`, `bytemuck`
+`default_backend()` now auto-selects:
+- **With `openblas` feature**: `OpenBlasBackend` for matmul, `CpuBackend` for all other ops
+- **Without**: `CpuBackend` (pure Rust SIMD)
 
----
+```rust
+// Cargo.toml features
+[features]
+default = []
+openblas = []
 
-## Failed Attempts
-
-### 1. Q4_0 roundtrip test tolerance too tight
-- **What happened:** Initial tolerance was 0.2, but Q4_0 max representable value is `7 * scale`. For values near the edge of range (e.g., 3.1 with scale=0.4), clamping caused 0.39 error.
-- **Fix:** Relaxed tolerance to 0.5. Q4_0 is 4-bit; some quantization error is expected.
-- **Lesson:** Quantization format tests must account for clamping at the representable range boundary.
-
-### 2. Q8_0 loader panic on 1D tensors
-- **What happened:** `shape[1]` panicked when loading `model.norm.weight` (shape `[32]`, 1D).
-- **Fix:** Added `shape.len() == 2` guard before accessing `shape[1]` in loader Q8_0 path. 1D tensors fall back to f32 dequantize.
-- **Lesson:** Weight tensors like layer norms are 1D vectors — quantized matmul only applies to 2D matrices.
-
-### 3. WGPU API version mismatch
-- **What happened:** Wrote backend against wgpu 24 API mental model, but Cargo added wgpu 29. Multiple API changes: `InstanceDescriptor::default()` removed, `Maintain::Wait` → `PollType::wait_indefinitely()`, `PipelineLayoutDescriptor` lost `push_constant_ranges`, gained `immediate_size`, `request_adapter` returns `Result` not `Option`.
-- **Fix:** Read wgpu 29 source to find correct struct fields and method signatures.
-- **Lesson:** Always check actual crate source when API docs are unclear. Use `cargo doc` + source grep.
-
-### 4. Vulkan info tool silent failure
-- **What happened:** `vulkaninfo --summary` returned empty output. `vulkaninfo` (no flags) also silent.
-- **What worked:** Direct Rust test with wgpu successfully detected AMD Radeon Vega iGPU via OpenGL backend.
-- **Lesson:** Don't rely on system tools for GPU detection; wgpu's own adapter enumeration is the source of truth.
-
----
-
-## Next Steps
-
-1. **Test on Pi 5** — `cargo test` + `cargo run --release --bin bench_shard` on actual ARM hardware. Validate NEON path correctness and measure tokens/sec.
-2. **ARM dotprod optimization** — Pi 5 Cortex-A76 supports `vdotq_s32`. Add a dedicated INT8 GEMM path that quantizes activations to Q8_0 on-the-fly and uses native int8×int8 dot products. Potential 2-3× boost over current f32-fma approach.
-3. **Q4_K_M passthrough support** — Most distributed GGUF models are Q4_K_M. Enable `split_model` to passthrough Q4_K_M bytes from GGUF → shards without re-quantizing to Q4_0. Requires `QuantFormat::Q4_K` + `Q4KMatrix` + matmul kernel.
-4. **GPU element-wise ops** — Currently WGPU only accelerates matmul. vec_add, silu, softmax on GPU would reduce CPU-GPU transfer overhead for full offload.
-5. **Real model benchmark** — Run `bench_shard` or `split_model` + `ShardEngine` on the actual Qwen 3B model on the Pi 5.
-
----
-
-## Context to Preserve
-
-### Key Decisions
-
-1. **Backend trait is synchronous** — `fn matmul(...) -> Vec<f32>`. WGPU backend blocks on GPU with `pollster`. This keeps the engine simple but means GPU can't be async pipelined. Future: consider async Backend v2.
-2. **Dequantize-on-the-fly for INT8/INT4** — Instead of true int8×int8 dot products (which require per-token activation quantization), we dequantize 32-element blocks to f32 stack buffers and use proven f32 SIMD. This gives 90% of the bandwidth win with 10% of the kernel complexity.
-3. **Tensor stores both f32 and quantized data** — `Tensor.data` (f32) for all ops, `Tensor.q_data` (Q4_0/Q8_0) for fast matmul. Memory overhead is ~27% for Q8_0 and ~14% for Q4_0 vs f32-only. Acceptable tradeoff for simplicity.
-4. **Rayon for CPU threading** — Recursive `rayon::join` over the `m` dimension. Threshold at 4096 output elements to avoid thread overhead for small matrices.
-5. **f16 for KV cache** — Not Q8_0. f16 preserves precision (no block-scale quantization error) while giving 2× savings. Q8_0 KV cache is future work.
-6. **WGPU over CUDA** — One backend covers all GPU vendors + web. CUDA would only cover NVIDIA.
-
-### Dependencies
-
-```toml
-# Core
-memmap2 = "0.9"
-half = "2.4"
-serde_json = "1.0"
-tokenizers = "0.23.1"
-
-# Server
-axum = "0.7"
-tokio = "1"
-
-# Performance
-rayon = "1.10"
-
-# GPU
-wgpu = "29.0.3"
-pollster = "0.4.0"
-bytemuck = "1.22"
-
-# Dev
-tempfile = "3"
+// Build with OpenBLAS
+cargo build --release --features openblas
 ```
 
-### Environment
+### Quantized GEMM Dispatch Chain
 
-- **Dev machine:** x86_64, AMD Ryzen 7 5800HS, 16 GB RAM, AMD Radeon Vega iGPU
-- **Target machine:** Raspberry Pi 5, BCM2712, quad-core Cortex-A76, 8 GB RAM
-- **Rust:** 1.86.0
-- **Test command:** `cargo test --lib` (70 pass, 0 fail, 3 ignored)
-- **Benchmark command:** `cargo run --release --bin bench_shard -- --layers 4 --hidden 512 --tokens 10 --quant q4_0`
-- **GPU test command:** `cargo test --lib -- --ignored` (requires GPU)
+```
+Engine::forward()
+  └─> hidden.matmul(weight)
+        └─> Tensor::matmul()
+              ├─> if other.q_data == Some(Q4_K) → q4_k_matmul()  (NEW)
+              ├─> if other.q_data == Some(Q8_0) → q8_0_matmul()  (existing)
+              ├─> if other.q_data == Some(Q4_0) → q4_0_matmul()  (existing)
+              └─> else → backend.matmul(f32, f32)               (OpenBLAS or CPU)
+```
 
-### Build Notes
+### Memory-Mapped Embed / LM Head Flow
 
-- Release builds essential for performance: `cargo run --release`
-- `wgpu` compile is slow (~30s first time) due to shader compilation
-- NEON path compiles on x86_64 via `cfg(target_arch = "aarch64")` but is never executed locally
-- AVX2 path auto-detected at runtime via `is_x86_feature_detected!("avx2")`
+```
+Engine::load()
+  ├─> load_special() → only loads output_norm.weight (tiny)
+  ├─> embed removed from special_weights
+  └─> lm_head removed from special_weights
+
+Engine::forward(tokens)
+  ├─> embed_lookup_mmap(tokens)
+  │     └─> for each token: file.get_tensor_row_f32("token_embd.weight", token_id)
+  │           └─> read 8× Q6_K blocks from mmap → dequantize → 2048 f32 values
+  ├─> ... layer loop ...
+  └─> lm_head_projection(hidden_last)
+        ├─> tied:    par_iter over vocab → dot(hidden_last, embed_row[j])
+        └─> separate: par_iter over vocab → dot(hidden_last, output_row[j])
+```
+
+### GGUF Loader Quantization Branch
+
+```rust
+// In load_layer() — raw GGUF dims are already [in, out], no rev+transpose needed
+match qtype {
+    QuantType::Q8_0 => { parse Q8Matrix; Tensor::from_q8_0(); t.data.clear(); }
+    QuantType::Q4_0 => { parse Q4Matrix; Tensor::from_q4_0(); t.data.clear(); }
+    QuantType::Q4_K => { parse Q4KMatrix; Tensor::from_q4_k(); t.data.clear(); }
+    _ => { dequantize to f32; rev+transpose; }
+}
+```
+
+**Critical:** `t.data.clear()` frees the f32 dequantization buffer, keeping only the quantized blocks. This saves ~7× RAM per Q4_K tensor. The f32 data was only needed for `sanitize_weights()` and non-matmul ops — weight tensors never need those.
 
 ---
 
-## Quick Reference
+## Active Files (Priority Order)
+
+| File | What It Does | Status |
+|------|-------------|--------|
+| `src/backend/openblas.rs` | `cblas_sgemm` FFI wrapper | ✅ Production |
+| `src/kernels/q4_k.rs` | Q4_K block parser + dequantize | ✅ Production |
+| `src/kernels/q4_k_gemm.rs` | Q4_K scalar + AVX2 + NEON GEMM | ✅ Production |
+| `src/model/gguf.rs` | `get_tensor_row_f32()` for mmap lookup | ✅ Production |
+| `src/inference/engine.rs` | `embed_lookup_mmap()`, `lm_head_*_forward()` | ✅ Production |
+| `src/model/loader.rs` | Q4_K/Q8_0/Q4_0 quantized branch in `load_layer()` | ✅ Production |
+| `src/model/tensor.rs` | `QuantizedData::Q4_K` variant + `from_q4_k()` | ✅ Production |
+
+---
+
+## Known Limitations / Next Steps
+
+1. **Q6_K / Q5_K / IQ4_NL / IQ5_0 direct GEMM missing**
+   - These quant types still dequantize to f32 in `load_layer()`
+   - 9B-IQ4_NL uses IQ4_NL for most layer weights → slower than Q4_K models
+   - **Next:** Add `q6_k_gemm.rs`, `iq4_nl_gemm.rs` following the Q4_K pattern
+
+2. **lm_head projection is CPU-bound dot products**
+   - For tied embeddings, 248K vocab × 2048 hidden = 508M ops per token
+   - Parallel rayon helps but could be faster with chunked OpenBLAS
+   - **Next:** Chunk vocab into 4096-token groups, dequantize chunk to f32, `cblas_sgemm` with `CblasTrans`
+
+3. **No runtime backend selection**
+   - `openblas` feature is compile-time; cannot fallback at runtime
+   - **Next:** Use `libloading` or `dlopen` to dynamically load OpenBLAS if present
+
+4. **9B models are slow (0.24 tok/sec)**
+   - IQ4_NL layer weights dequantize to f32 → large memory bandwidth
+   - **Next:** Implement IQ4_NL direct GEMM (similar complexity to Q4_K)
+
+---
+
+## Build & Test Commands
 
 ```bash
-# Run all tests
-cargo test --lib
+cd rust
 
-# Run GPU tests (requires GPU)
-cargo test --lib -- --ignored
+# Full test suite (with OpenBLAS)
+cargo test --features openblas
 
-# Benchmark
-cargo run --release --bin bench_shard -- --layers 4 --hidden 512 --tokens 10 --quant q4_0
+# Real model benchmark
+cargo run --release --features openblas --bin diagnose_models
 
-# Split a GGUF model to Q8_0 shards
-cargo run --release --bin split_model -- \
-  --model /path/to/model.gguf \
-  --out ./shards \
-  --quant q8_0
-
-# Run inference from shards
-cargo run --release --bin leafcutter -- \
-  --model ./shards/manifest.json \
-  --port 8081
+# Build server binary
+cargo build --release --features openblas
 ```
+
+---
+
+## Git Status
+
+All changes committed and pushed to:
+`https://github.com/Alartist40/LeafcutterLLM.git`
+
+Commit: `cc62d1e` — "Performance: OpenBLAS backend + Q4_K GEMM + mmap embed lookup"

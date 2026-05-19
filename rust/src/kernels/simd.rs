@@ -282,16 +282,14 @@ pub fn simd_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: u
 /// Multi-threaded SIMD matmul using rayon.
 /// Splits the m dimension across available CPU cores.
 pub fn simd_matmul_parallel(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
-    unsafe {
-        #[cfg(target_arch = "x86_64")]
-        {
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
-                simd_matmul_par_avx2(a, b, c, m, k, n);
-                return;
-            }
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            simd_matmul_par_avx2(a, b, c, m, k, n);
+            return;
         }
-        simd_matmul_par(a, b, c, m, k, n);
     }
+    simd_matmul_par(a, b, c, m, k, n);
 }
 
 #[cfg(target_arch = "x86_64")]

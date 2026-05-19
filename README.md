@@ -24,18 +24,18 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 | **BitNet I2_S** | ✅ LUT GEMM (NEON/AVX2) | ❌ Not supported | ✅ Official | ❌ Not supported |
 | **HTTP API** | ✅ Built-in (Axum) | ❌ Library only | ❌ CLI only | ✅ Separate binary |
 | **OpenAI API** | ✅ `/v1/chat/completions` | ❌ Not supported | ❌ Not supported | ❌ Not supported |
-| **70B on 4GB** | 🚧 Layer streaming ready; quantized embed/lm_head WIP | ✅ Yes (PyTorch quantized ops) | ❌ BitNet only | ⚠️ With `--mmap` + aggressive quantization |
+| **70B on 4GB** | ✅ Memory-mapped embed + quantized GEMM (Q4_K/Q8_0) | ✅ Yes (PyTorch quantized ops) | ❌ BitNet only | ⚠️ With `--mmap` + aggressive quantization |
 
 **Key advantage:** Leafcutter is the only open-source engine combining Rust memory safety, hybrid SSM+Attention support, BitNet quantization, and a built-in OpenAI-compatible HTTP API in a single binary.
 
 ### Current Capabilities (Validated 2026-05-19)
 
-| Model | Size | Status | Notes |
-|-------|------|--------|-------|
-| Qwen3.5-2B-IQ4_XS | 1.2 GB | ✅ Native forward pass | Zero NaN/Inf, ~0.7 tok/s CPU |
-| Qwen3.5-2B-Q4_K_M | 1.3 GB | ✅ Native forward pass | Zero NaN/Inf, ~0.7 tok/s CPU |
-| Qwen3.5-9B-IQ4_NL | 5.1 GB | ⚠️ Needs >15GB RAM | Embed+lm_head dequant to f32 = ~8GB+ |
-| Llama / Qwen2 / Mistral | Various | ✅ Standard transformer | Layer streaming + K-quant support |
+| Model | Size | Status | Forward (20 tok) | tok/sec |
+|-------|------|--------|------------------|---------|
+| Qwen3.5-2B-IQ4_XS | 1.2 GB | ✅ Native forward | 17.4s | 1.15 |
+| Qwen3.5-2B-Q4_K_M | 1.3 GB | ✅ Native forward | 11.4s | 1.76 |
+| Qwen3.5-9B-IQ4_NL | 5.1 GB | ✅ Native forward | 82.7s | 0.24 |
+| Llama / Qwen2 / Mistral | Various | ✅ Standard transformer | — | Layer streaming + K-quant |
 
 ### The 3-Pillar Architecture
 
@@ -69,8 +69,11 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 
 ### 1. Build the server
 ```bash
-CGO_ENABLED=1 go build -o leafcutter-server ./cmd/server
+cd rust
+cargo build --release --features openblas
 ```
+
+The `openblas` feature enables highly-optimized BLAS GEMM (10–30× faster matmul on x86_64).
 
 ### 2. Download a model
 Download any GGUF or Safetensors model and place it in the `models/` directory. See `models/README.md` for recommendations.

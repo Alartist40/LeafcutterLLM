@@ -225,7 +225,7 @@ impl Backend for WgpuBackend {
         buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
         });
-        self.device.poll(wgpu::PollType::wait_indefinitely());
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
         rx.recv().unwrap().unwrap();
 
         let data = buffer_slice.get_mapped_range();

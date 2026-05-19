@@ -3,7 +3,7 @@
 //! Only one layer's weights are resident in RAM at any time.
 
 use super::arch::{CapabilityReport, ModelArchitecture};
-use super::gguf::{GGUFile, GGUError, calculate_tensor_size};
+use super::gguf::{GGUFile, GGUError};
 use super::quant::QuantType;
 use super::tensor::Tensor;
 use crate::kernels;
@@ -70,7 +70,7 @@ impl GGUFModel {
             // For hybrid architectures, detect layer type from actual tensors
             let has_ssm = self.file.get_tensor_info(&format!("{}.ssm_alpha.weight", prefix)).is_some()
                 || self.file.get_tensor_info(&format!("{}.ssm_out.weight", prefix)).is_some();
-            let has_fused_qkv = self.file.get_tensor_info(&format!("{}.attn_qkv.weight", prefix)).is_some();
+            let _has_fused_qkv = self.file.get_tensor_info(&format!("{}.attn_qkv.weight", prefix)).is_some();
             let has_separate_attn = self.file.get_tensor_info(&format!("{}.attn_q.weight", prefix)).is_some();
 
             for (gguf_suffix, _engine_name) in mappings.iter() {
@@ -206,12 +206,88 @@ impl GGUFModel {
             let gguf_name = format!("{}.{}", prefix, gguf_suffix);
             if let Some(raw) = self.file.get_tensor_raw(&gguf_name) {
                 if let Some(info) = self.file.get_tensor_info(&gguf_name) {
-                    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).rev().collect();
-                    let mut tensor = Self::dequantize(raw, info.typ, shape)?;
-                    // Transpose 2D weights so matmul is A @ B (not A @ B^T)
-                    if tensor.shape.len() == 2 {
-                        tensor = tensor.transpose();
-                    }
+                    let qtype = QuantType::from_u32(info.typ)
+                        .ok_or(GGUError::InvalidTensorType(info.typ))?;
+
+                    let mut tensor = match qtype {
+                        // Quantized weight matrices: raw GGUF dims are already [in, out]
+                        // which is the correct layout for matmul. Skip rev+transpose.
+                        QuantType::Q8_0 => {
+                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                            let q8 = crate::kernels::q8_0::Matrix {
+                                rows: shape[0],
+                                cols: shape[1],
+                                blocks: crate::kernels::q8_0::blocks_from_bytes(raw),
+                            };
+                            let mut t = Tensor::from_q8_0(q8, shape);
+                            t.data.clear(); // Free f32 copy, keep only quantized blocks
+                            t
+                        }
+                        QuantType::Q4_0 => {
+                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                            let q4 = crate::kernels::q4_0::Matrix {
+                                rows: shape[0],
+                                cols: shape[1],
+                                blocks: crate::kernels::q4_0::blocks_from_bytes(raw),
+                            };
+                            let mut t = Tensor::from_q4_0(q4, shape);
+                            t.data.clear();
+                            t
+                        }
+                        QuantType::Q4_K => {
+                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                            let q4 = crate::kernels::q4_k::Matrix {
+                                rows: shape[0],
+                                cols: shape[1],
+                                blocks: crate::kernels::q4_k::blocks_from_bytes(raw),
+                            };
+                            let mut t = Tensor::from_q4_k(q4, shape);
+                            t.data.clear();
+                            t
+                        }
+                        QuantType::IQ4_NL => {
+                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                            let q4 = crate::kernels::iq4_nl::Matrix {
+                                rows: shape[0],
+                                cols: shape[1],
+                                blocks: crate::kernels::iq4_nl::blocks_from_bytes(raw),
+                            };
+                            let mut t = Tensor::from_iq4_nl(q4, shape);
+                            t.data.clear();
+                            t
+                        }
+                        QuantType::Q5_K => {
+                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                            let q5 = crate::kernels::q5_k::Matrix {
+                                rows: shape[0],
+                                cols: shape[1],
+                                blocks: crate::kernels::q5_k::blocks_from_bytes(raw),
+                            };
+                            let mut t = Tensor::from_q5_k(q5, shape);
+                            t.data.clear();
+                            t
+                        }
+                        QuantType::Q6_K => {
+                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                            let q6 = crate::kernels::q6_k::Matrix {
+                                rows: shape[0],
+                                cols: shape[1],
+                                blocks: crate::kernels::q6_k::blocks_from_bytes(raw),
+                            };
+                            let mut t = Tensor::from_q6_k(q6, shape);
+                            t.data.clear();
+                            t
+                        }
+                        // Non-quantized types: use existing dequantize + transpose flow
+                        _ => {
+                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).rev().collect();
+                            let mut t = Self::dequantize(raw, info.typ, shape)?;
+                            if t.shape.len() == 2 {
+                                t = t.transpose();
+                            }
+                            t
+                        }
+                    };
                     sanitize_weights(&mut tensor);
                     weights.insert(engine_name.to_string(), tensor);
                 }
@@ -221,35 +297,19 @@ impl GGUFModel {
         Ok(weights)
     }
 
-    /// Load embedding, final norm, and lm_head
+    /// Load final norm weights.  Embedding and lm_head are NOT loaded here —
+    /// they are accessed on-demand via memory-mapped row lookup to save RAM.
     pub fn load_special(&self) -> Result<HashMap<String, Tensor>, GGUError> {
         let mut weights = HashMap::new();
-        let mappings = [
-            ("token_embd.weight", "model.embed_tokens.weight"),
-            ("output_norm.weight", "model.norm.weight"),
-            ("output.weight", "lm_head.weight"),
-        ];
 
-        for (gguf_name, engine_name) in mappings.iter() {
-            if let Some(raw) = self.file.get_tensor_raw(gguf_name) {
-                if let Some(info) = self.file.get_tensor_info(gguf_name) {
-                    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).rev().collect();
-                    let mut tensor = Self::dequantize(raw, info.typ, shape)?;
-                    // Transpose 2D weights, but NOT the embedding matrix
-                    if tensor.shape.len() == 2 && *gguf_name != "token_embd.weight" {
-                        tensor = tensor.transpose();
-                    }
-                    sanitize_weights(&mut tensor);
-                    weights.insert(engine_name.to_string(), tensor);
-                }
-            }
-        }
-
-        // If lm_head is missing, use tied embeddings (common in Qwen models)
-        if !weights.contains_key("lm_head.weight") {
-            if let Some(embed) = weights.get("model.embed_tokens.weight") {
-                // Embedding is [vocab, hidden]; lm_head needs [hidden, vocab]
-                weights.insert("lm_head.weight".to_string(), embed.transpose());
+        // Only load norm weights.  Embed and lm_head are kept in the mmap'd GGUF file
+        // and read per-token / per-row during inference.
+        if let Some(raw) = self.file.get_tensor_raw("output_norm.weight") {
+            if let Some(info) = self.file.get_tensor_info("output_norm.weight") {
+                let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                let mut tensor = Self::dequantize(raw, info.typ, shape)?;
+                sanitize_weights(&mut tensor);
+                weights.insert("model.norm.weight".to_string(), tensor);
             }
         }
 
@@ -507,7 +567,7 @@ mod tests {
         println!("Layer 0 tensors: {}", layer0.len());
 
         let special = model.load_special().expect("Failed to load special layers");
-        assert!(special.contains_key("model.embed_tokens.weight"));
+        assert!(special.contains_key("model.norm.weight"));
 
         // Print capability report
         println!("\n{}", model.capability_report().print());
@@ -698,7 +758,7 @@ fn debug_dequantize_sizes() {
     for name in ["blk.0.ffn_gate.weight", "blk.1.ffn_gate.weight"] {
         let t = file.tensors.iter().find(|t| t.name == name).unwrap();
         let raw = file.get_tensor_raw(name).unwrap();
-        let size = calculate_tensor_size(&t.dimensions, t.typ);
+        let size = super::gguf::calculate_tensor_size(&t.dimensions, t.typ);
         println!("{}: dims={:?} type={} calc_size={} raw_len={}", name, t.dimensions, t.typ, size, raw.len());
     }
 }

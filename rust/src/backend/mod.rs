@@ -11,6 +11,9 @@
 pub mod cpu;
 pub mod wgpu;
 
+#[cfg(feature = "openblas")]
+pub mod openblas;
+
 /// Abstract compute backend.
 ///
 /// All methods take slices and return owned `Vec<f32>` results.
@@ -49,9 +52,22 @@ use std::sync::OnceLock;
 
 static GLOBAL_BACKEND: OnceLock<&'static dyn Backend> = OnceLock::new();
 
-/// Get the current global backend.  Defaults to `CpuBackend`.
+/// Get the current global backend.
+///
+/// If the `openblas` feature is enabled, OpenBLAS is used as the default
+/// for matrix multiplication (all other ops still fall back to the CPU
+/// backend).  Otherwise the pure CPU backend is used.
 pub fn default_backend() -> &'static dyn Backend {
-    *GLOBAL_BACKEND.get_or_init(|| &cpu::CPU_BACKEND)
+    *GLOBAL_BACKEND.get_or_init(|| {
+        #[cfg(feature = "openblas")]
+        {
+            &openblas::OPENBLAS_BACKEND
+        }
+        #[cfg(not(feature = "openblas"))]
+        {
+            &cpu::CPU_BACKEND
+        }
+    })
 }
 
 /// Set the global backend for all new Tensors.
