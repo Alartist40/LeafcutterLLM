@@ -27,6 +27,9 @@ pub struct Engine {
     pub speculative_head: Option<SpeculativeHead>,
     /// Whether lm_head is tied to token embeddings (no separate output.weight tensor).
     lm_head_tied: bool,
+    /// Layer weight cache: layer_idx -> weights HashMap.
+    /// Avoids reloading layers from disk on every forward pass.
+    pub layer_cache: HashMap<usize, HashMap<String, Tensor>>,
 }
 
 impl Engine {
@@ -122,6 +125,7 @@ impl Engine {
             ssm_config,
             speculative_head,
             lm_head_tied,
+            layer_cache: HashMap::new(),
         })
     }
 
@@ -160,8 +164,13 @@ impl Engine {
 
         // Transformer / hybrid layers
         for layer_idx in 0..self.config.num_hidden_layers {
-            let layer_weights = self.model.load_layer(layer_idx)
-                .expect("Failed to load layer");
+            // Check layer cache first; load from disk only on miss
+            if !self.layer_cache.contains_key(&layer_idx) {
+                let weights = self.model.load_layer(layer_idx)
+                    .expect("Failed to load layer");
+                self.layer_cache.insert(layer_idx, weights);
+            }
+            let layer_weights = self.layer_cache.get(&layer_idx).unwrap();
 
             // Detect layer type from actual tensor contents (most robust)
             let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight");
@@ -176,11 +185,11 @@ impl Engine {
 
             if has_standard_attn {
                 // Standard attention layer
-                let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx);
+                let attn_out = attention_forward(&normed, layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx);
                 hidden = hidden.add(&attn_out);
             } else if has_ssm {
                 // SSM layer (Mamba-style)
-                let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config);
+                let ssm_out = ssm_forward(&normed, layer_weights, &self.ssm_config);
                 hidden = hidden.add(&ssm_out);
             }
 
@@ -189,7 +198,7 @@ impl Engine {
                 .or_else(|| layer_weights.get("ffn_norm.weight"))
                 .expect("Missing post-norm");
             let normed = hidden.rms_norm(post_norm_weight, 1e-5);
-            let ffn_out = self.ffn_forward(&normed, &layer_weights);
+            let ffn_out = Self::ffn_forward(&normed, layer_weights);
             hidden = hidden.add(&ffn_out);
         }
 
@@ -252,20 +261,16 @@ impl Engine {
     }
 
     /// Generic lm_head projection: dot(hidden_last, embed_row) for each token.
-    fn lm_head_projection(&self, hidden_last: &[f32], tensor_name: &str, hidden_size: usize, vocab_size: usize) -> Vec<f32> {
+    fn lm_head_projection(&self, hidden_last: &[f32], tensor_name: &str, _hidden_size: usize, vocab_size: usize) -> Vec<f32> {
         let file = &self.model.file;
         (0..vocab_size).into_par_iter().map(|token_id| {
             let row = file.get_tensor_row_f32(tensor_name, token_id)
                 .expect("lm_head row");
-            let mut sum = 0.0f32;
-            for j in 0..hidden_size {
-                sum += hidden_last[j] * row[j];
-            }
-            sum
+            hidden_last.iter().zip(row.iter()).map(|(a, b)| a * b).sum::<f32>()
         }).collect()
     }
 
-    fn ffn_forward(&self, x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {
+    fn ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {
         let gate = weights.get("mlp.gate_proj.weight").expect("Missing gate");
         let up = weights.get("mlp.up_proj.weight").expect("Missing up");
         let down = weights.get("mlp.down_proj.weight").expect("Missing down");

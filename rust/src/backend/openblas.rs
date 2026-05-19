@@ -12,7 +12,7 @@ use super::cpu::CPU_BACKEND;
 
 #[link(name = "openblas")]
 extern "C" {
-    fn cblas_sgemm(
+    pub fn cblas_sgemm(
         order: libc::c_int,
         trans_a: libc::c_int,
         trans_b: libc::c_int,
@@ -30,8 +30,9 @@ extern "C" {
     );
 }
 
-const CBLAS_ROW_MAJOR: libc::c_int = 101;
-const CBLAS_NO_TRANS: libc::c_int = 111;
+pub const CBLAS_ROW_MAJOR: libc::c_int = 101;
+pub const CBLAS_NO_TRANS: libc::c_int = 111;
+pub const CBLAS_TRANS: libc::c_int = 112;
 
 /// Global singleton OpenBLAS backend.
 pub static OPENBLAS_BACKEND: OpenBlasBackend = OpenBlasBackend;

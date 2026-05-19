@@ -84,8 +84,19 @@ impl Tensor {
         }
     }
 
+    /// Create a tensor from Q8_0 quantized weights WITHOUT f32 copy.
+    /// Use for weight tensors that are only consumed by matmul.
+    pub fn from_q8_0_only(q8: Q8Matrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q8.rows * q8.cols, shape.iter().product::<usize>());
+        Self {
+            shape,
+            data: Vec::new(),
+            q_data: Some(QuantizedData::Q8_0(q8)),
+            backend: default_backend(),
+        }
+    }
+
     /// Create a tensor from Q4_0 quantized weights.
-    /// Stores both Q4_0 (for fast INT4 matmul) and f32 (for other ops).
     pub fn from_q4_0(q4: Q4Matrix, shape: Vec<usize>) -> Self {
         assert_eq!(q4.rows * q4.cols, shape.iter().product::<usize>());
         let data = q4.dequantize();
@@ -97,8 +108,12 @@ impl Tensor {
         }
     }
 
+    pub fn from_q4_0_only(q4: Q4Matrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q4.rows * q4.cols, shape.iter().product::<usize>());
+        Self { shape, data: Vec::new(), q_data: Some(QuantizedData::Q4_0(q4)), backend: default_backend() }
+    }
+
     /// Create a tensor from Q4_K quantized weights.
-    /// Stores both Q4_K (for fast matmul) and f32 (for other ops).
     pub fn from_q4_k(q4: Q4KMatrix, shape: Vec<usize>) -> Self {
         assert_eq!(q4.rows * q4.cols, shape.iter().product::<usize>());
         let data = q4.dequantize();
@@ -110,8 +125,12 @@ impl Tensor {
         }
     }
 
+    pub fn from_q4_k_only(q4: Q4KMatrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q4.rows * q4.cols, shape.iter().product::<usize>());
+        Self { shape, data: Vec::new(), q_data: Some(QuantizedData::Q4_K(q4)), backend: default_backend() }
+    }
+
     /// Create a tensor from IQ4_NL quantized weights.
-    /// Stores both IQ4_NL (for fast matmul) and f32 (for other ops).
     pub fn from_iq4_nl(q4: IQ4NLMatrix, shape: Vec<usize>) -> Self {
         assert_eq!(q4.rows * q4.cols, shape.iter().product::<usize>());
         let data = q4.dequantize();
@@ -123,8 +142,12 @@ impl Tensor {
         }
     }
 
+    pub fn from_iq4_nl_only(q4: IQ4NLMatrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q4.rows * q4.cols, shape.iter().product::<usize>());
+        Self { shape, data: Vec::new(), q_data: Some(QuantizedData::IQ4_NL(q4)), backend: default_backend() }
+    }
+
     /// Create a tensor from Q5_K quantized weights.
-    /// Stores both Q5_K (for fast matmul) and f32 (for other ops).
     pub fn from_q5_k(q5: Q5KMatrix, shape: Vec<usize>) -> Self {
         assert_eq!(q5.rows * q5.cols, shape.iter().product::<usize>());
         let data = q5.dequantize();
@@ -136,8 +159,12 @@ impl Tensor {
         }
     }
 
+    pub fn from_q5_k_only(q5: Q5KMatrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q5.rows * q5.cols, shape.iter().product::<usize>());
+        Self { shape, data: Vec::new(), q_data: Some(QuantizedData::Q5_K(q5)), backend: default_backend() }
+    }
+
     /// Create a tensor from Q6_K quantized weights.
-    /// Stores both Q6_K (for fast matmul) and f32 (for other ops).
     pub fn from_q6_k(q6: Q6KMatrix, shape: Vec<usize>) -> Self {
         assert_eq!(q6.rows * q6.cols, shape.iter().product::<usize>());
         let data = q6.dequantize();
@@ -147,6 +174,11 @@ impl Tensor {
             q_data: Some(QuantizedData::Q6_K(q6)),
             backend: default_backend(),
         }
+    }
+
+    pub fn from_q6_k_only(q6: Q6KMatrix, shape: Vec<usize>) -> Self {
+        assert_eq!(q6.rows * q6.cols, shape.iter().product::<usize>());
+        Self { shape, data: Vec::new(), q_data: Some(QuantizedData::Q6_K(q6)), backend: default_backend() }
     }
 
     /// Returns true if this tensor has native quantized data for fast matmul.

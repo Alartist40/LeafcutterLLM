@@ -219,9 +219,7 @@ impl GGUFModel {
                                 cols: shape[1],
                                 blocks: crate::kernels::q8_0::blocks_from_bytes(raw),
                             };
-                            let mut t = Tensor::from_q8_0(q8, shape);
-                            t.data.clear(); // Free f32 copy, keep only quantized blocks
-                            t
+                            Tensor::from_q8_0_only(q8, shape)
                         }
                         QuantType::Q4_0 => {
                             let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
@@ -230,9 +228,7 @@ impl GGUFModel {
                                 cols: shape[1],
                                 blocks: crate::kernels::q4_0::blocks_from_bytes(raw),
                             };
-                            let mut t = Tensor::from_q4_0(q4, shape);
-                            t.data.clear();
-                            t
+                            Tensor::from_q4_0_only(q4, shape)
                         }
                         QuantType::Q4_K => {
                             let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
@@ -241,9 +237,7 @@ impl GGUFModel {
                                 cols: shape[1],
                                 blocks: crate::kernels::q4_k::blocks_from_bytes(raw),
                             };
-                            let mut t = Tensor::from_q4_k(q4, shape);
-                            t.data.clear();
-                            t
+                            Tensor::from_q4_k_only(q4, shape)
                         }
                         QuantType::IQ4_NL => {
                             let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
@@ -252,9 +246,7 @@ impl GGUFModel {
                                 cols: shape[1],
                                 blocks: crate::kernels::iq4_nl::blocks_from_bytes(raw),
                             };
-                            let mut t = Tensor::from_iq4_nl(q4, shape);
-                            t.data.clear();
-                            t
+                            Tensor::from_iq4_nl_only(q4, shape)
                         }
                         QuantType::Q5_K => {
                             let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
@@ -263,9 +255,7 @@ impl GGUFModel {
                                 cols: shape[1],
                                 blocks: crate::kernels::q5_k::blocks_from_bytes(raw),
                             };
-                            let mut t = Tensor::from_q5_k(q5, shape);
-                            t.data.clear();
-                            t
+                            Tensor::from_q5_k_only(q5, shape)
                         }
                         QuantType::Q6_K => {
                             let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
@@ -274,9 +264,7 @@ impl GGUFModel {
                                 cols: shape[1],
                                 blocks: crate::kernels::q6_k::blocks_from_bytes(raw),
                             };
-                            let mut t = Tensor::from_q6_k(q6, shape);
-                            t.data.clear();
-                            t
+                            Tensor::from_q6_k_only(q6, shape)
                         }
                         // Non-quantized types: use existing dequantize + transpose flow
                         _ => {
