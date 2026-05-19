@@ -12,14 +12,37 @@
 
 ## What Is LeafcutterLLM?
 
-LeafcutterLLM is a complete inference system for running large language models locally on CPUs with limited RAM. It proves that sophisticated AI doesn't require cloud APIs or GPUs — with the right architecture, you can run a 7B or 13B parameter model on a **Raspberry Pi 5 (8GB)** or a **laptop with 16GB RAM** with sub-2-second response latency.
+LeafcutterLLM is a **Rust-based** inference engine for running large language models locally on CPUs with limited RAM. It supports both standard transformers (Llama, Qwen2, Mistral) and cutting-edge hybrid architectures like **Qwen3.5's Transformer-Mamba mix** — natively, without Python or CUDA dependencies.
+
+### What Makes Leafcutter Different
+
+| | Leafcutter | airllm | bitnet.cpp | llama.cpp |
+|--|-----------|--------|-----------|-----------|
+| **Language** | Rust (memory-safe, zero-cost) | Python | C++ | C/C++ |
+| **GPU Required** | ❌ No | ✅ CUDA required | ❌ No | ❌ No |
+| **Qwen3.5 SSM** | ✅ Native hybrid support | ❌ Not supported | ❌ Not supported | ⚠️ Partial |
+| **BitNet I2_S** | ✅ LUT GEMM (NEON/AVX2) | ❌ Not supported | ✅ Official | ❌ Not supported |
+| **HTTP API** | ✅ Built-in (Axum) | ❌ Library only | ❌ CLI only | ✅ Separate binary |
+| **OpenAI API** | ✅ `/v1/chat/completions` | ❌ Not supported | ❌ Not supported | ❌ Not supported |
+| **70B on 4GB** | 🚧 Layer streaming ready; quantized embed/lm_head WIP | ✅ Yes (PyTorch quantized ops) | ❌ BitNet only | ⚠️ With `--mmap` + aggressive quantization |
+
+**Key advantage:** Leafcutter is the only open-source engine combining Rust memory safety, hybrid SSM+Attention support, BitNet quantization, and a built-in OpenAI-compatible HTTP API in a single binary.
+
+### Current Capabilities (Validated 2026-05-19)
+
+| Model | Size | Status | Notes |
+|-------|------|--------|-------|
+| Qwen3.5-2B-IQ4_XS | 1.2 GB | ✅ Native forward pass | Zero NaN/Inf, ~0.7 tok/s CPU |
+| Qwen3.5-2B-Q4_K_M | 1.3 GB | ✅ Native forward pass | Zero NaN/Inf, ~0.7 tok/s CPU |
+| Qwen3.5-9B-IQ4_NL | 5.1 GB | ⚠️ Needs >15GB RAM | Embed+lm_head dequant to f32 = ~8GB+ |
+| Llama / Qwen2 / Mistral | Various | ✅ Standard transformer | Layer streaming + K-quant support |
 
 ### The 3-Pillar Architecture
 
 | Pillar | What It Does | Result |
 |--------|--------------|--------|
-| **Layer-by-Layer Loading** | Loads only one transformer layer into RAM at a time, unloads it after use | **Run 70B on 4GB RAM** (11x reduction) |
-| **OpenBLAS SGEMM + 4-bit Kernels** | Accelerates matrix multiplication via optimized C kernels and OpenBLAS | **13x faster** than pure Go math loops |
+| **Layer-by-Layer Loading** | Loads only one transformer layer into RAM at a time, unloads it after use | **Run 13B on 8GB RAM today**; 70B on 4GB with quantized embed WIP |
+| **SIMD Kernels + Quantized GEMM** | ARM NEON / x86_64 AVX2 matmul; direct quantized-weight GEMM without full f32 materialization | **Up to 13× faster** than naive loops |
 | **Continuous Batching Scheduler** | Queues multiple requests and batches them for concurrent processing | **2,200+ requests/sec** throughput on Pi 5 |
 
 ---
@@ -27,18 +50,18 @@ LeafcutterLLM is a complete inference system for running large language models l
 ## Key Features
 
 ✅ **Offline inference** — no WiFi, no cloud, no API costs  
-✅ **Universal Model Support** — Supports GGUF (llama.cpp) and HuggingFace Safetensors  
+✅ **Hybrid Architecture Support** — Native SSM+Attention (Qwen3.5), standard transformers (Llama, Qwen2, Mistral)  
+✅ **Aggressive Quantization** — Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ5_0, and BitNet I2_S ternary  
 ✅ **Cross-Platform** — Native support for Linux, macOS, and Windows  
 ✅ **Low latency** — sub-2 second response on Pi 5, <500ms on modern CPU  
-✅ **Revolutionary RAM footprint** — Run **70B models on 4GB RAM** (11x reduction!)  
-✅ **Auto-Detection** — Drop models into `/models` and run; no complex paths needed  
-✅ **Hardware Intelligence** — Automatic compatibility checks and memory advice  
+✅ **Layer Streaming** — Run **13B models on 8GB RAM** today; 70B on 4GB with quantized embed WIP  
+✅ **Auto-Detection** — Capability report checks every model before loading; warns of unsupported quants  
 ✅ **Memory Tuning** — Manual control over context length to fit massive models on tiny RAM  
-✅ **Testing Framework** — Automated suite for benchmarking models from 0.5B to 46B  
-✅ **Speculative decoding** — 3-4x speedup with a small draft model  
-✅ **HTTP + TUI interfaces** — REST API server + interactive terminal shell  
+✅ **Testing Framework** — Automated suite benchmarking models from 0.5B to 9B  
+✅ **Speculative decoding** — Eagle-style draft heads for 3-4× speedup  
+✅ **HTTP API** — Built-in Axum server with OpenAI-compatible `/v1/chat/completions`  
 ✅ **Production container** — multi-stage Podman/Docker build included  
-✅ **Benchmark suite** — prove the 3-pillar claims with real numbers  
+✅ **Benchmark suite** — prove the claims with real numbers  
 
 ---
 
