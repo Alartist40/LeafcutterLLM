@@ -266,14 +266,12 @@ impl GGUFModel {
                             };
                             Tensor::from_q6_k_only(q6, shape)
                         }
-                        // Non-quantized types: use existing dequantize + transpose flow
+                        // Non-quantized types: dequantize directly with GGUF dimensions.
+                        // GGUF stores dimensions as [in, out] for weight matrices, which is
+                        // the correct layout for matmul — no rev or transpose needed.
                         _ => {
-                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).rev().collect();
-                            let mut t = Self::dequantize(raw, info.typ, shape)?;
-                            if t.shape.len() == 2 {
-                                t = t.transpose();
-                            }
-                            t
+                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                            Self::dequantize(raw, info.typ, shape)?
                         }
                     };
                     sanitize_weights(&mut tensor);
@@ -331,7 +329,7 @@ impl GGUFModel {
             QuantType::Q6_K => kernels::dequantize_q6_k(data, &mut out),
             QuantType::Q8_K => kernels::dequantize_q8_k(data, &mut out),
             QuantType::IQ4_NL => kernels::dequantize_iq4_nl(data, &mut out),
-            QuantType::IQ5_0 => kernels::dequantize_iq5_0(data, &mut out),
+            QuantType::IQ4_XS => kernels::dequantize_iq4_xs(data, &mut out),
             _ => return Err(GGUError::InvalidTensorType(typ)),
         }
 

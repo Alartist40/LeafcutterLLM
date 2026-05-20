@@ -1,8 +1,8 @@
 # LeafcutterLLM — Milestones & Testing Record
 
-**Last updated:** 2026-05-15  
-**Git commit:** `b775800`  
-**Total tests:** 70 passed, 0 failed, 3 ignored  
+**Last updated:** 2026-05-19  
+**Git commit:** `fc3ec67`  
+**Total tests:** 104 passed, 0 failed, 3 ignored  
 
 ---
 
@@ -147,12 +147,45 @@ WGPU runs on Vulkan (Linux/Windows), Metal (macOS), DX12 (Windows), and WebGPU (
 
 ---
 
+## Phase 6.5: Generation Quality Bug Hunt (2026-05-19)
+
+### Fixes Applied
+
+| Commit | Fix | Tests |
+|--------|-----|-------|
+| `567cb44` | SSM state persistence, causal conv1d cache, RoPE position offset | 104 passed |
+| `fc3ec67` | Attention layer detection for Qwen3.5 (`attn_q.weight`, `attn_k.weight`, `attn_v.weight`), Q/K per-head RMSNorm | 104 passed |
+
+### Generation Test Results
+
+```
+2B-Q4_K_M  "Hello" → top prefill: 'asso' (logit 12.39)
+                → generated: '熱çado所提供史یین史史症'
+9B-IQ4_NL  "Hello" → top prefill: 98564 (logit 10.19)
+                → generated: ' isNew clan_rsa_rsa.Creator�'
+```
+
+### Architectural Gap Discovered
+
+Qwen3.5 "SSM" layers are **not standard Mamba**. They use **Gated Delta Net** (linear attention with decay gates), which is fundamentally different from our `selective_scan` implementation:
+
+- Dual input projections (`wqkv` + `wqkv_gate`) vs. our single `attn_qkv.weight`
+- L2-normalized Q/K after convolution vs. our raw conv output
+- `softplus(alpha + bias) * exp(-A_log)` decay gate vs. our `exp(dt * a_i)`
+- Vector state per channel with `build_delta_net` vs. our scalar state
+- Gated output normalization (`norm * silu(z)`) vs. our no-gating
+
+Attention layers also differ: Qwen3.5 uses **MRoPE** (multi-section RoPE) and outputs Q+gate from a single projection.
+
+**Status:** Native Rust engine loads Qwen3.5 and produces finite logits, but coherent generation requires full Delta Net implementation. Recommend llama.cpp bridge backend for Qwen3.5 until native support is complete.
+
 ## Known Limitations
 
 1. **WGPU backend only accelerates matmul** — Element-wise ops still run on CPU. For LLM inference, matmul is 80%+ of compute time, so this is acceptable for a first implementation.
 2. **Q4_0/Q8_0 matmul requires `n % 32 == 0`** — Real model weights always satisfy this. Small test tensors may fall back to scalar path.
 3. **NEON path never executed locally** — x86_64 dev machine; ARM correctness is validated by algorithmic identity with SSE path.
 4. **WGPU tests ignored in CI** — Require GPU hardware; run manually with `cargo test -- --ignored`.
+5. **Qwen3.5 native support incomplete** — SSM layers implement Mamba selective_scan instead of Gated Delta Net. Use llama.cpp bridge for coherent Qwen3.5 generation.
 
 ---
 

@@ -242,40 +242,53 @@ pub fn dequantize_iq4_nl(data: &[u8], out: &mut [f32]) {
     }
 }
 
-/// Dequantize IQ5_0 blocks to f32.
+/// Non-linear lookup table for IQ4_NL / IQ4_XS quant types.
+/// Values are symmetric-ish around zero, optimized for language model weights.
+static KVALUES_IQ4NL: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// Dequantize IQ4_XS blocks to f32.
 ///
-/// Block layout (162 bytes for 256 values = 5.06 bpw):
-///   - bytes 0..1: scale as f16
-///   - bytes 2..161: 256 5-bit values packed into 160 bytes
+/// Block layout (136 bytes for 256 values = 4.25 bpw):
+///   - bytes 0..1:   scale `d` as f16
+///   - bytes 2..3:   scales_h as uint16_t (2 bits per sub-block scale)
+///   - bytes 4..7:   scales_l[4] (4 bits per sub-block scale)
+///   - bytes 8..135: qs[128] (4-bit values, 2 per byte)
 ///
-/// Values are unpacked and centered: value = (q - 15.5) * scale
-pub fn dequantize_iq5_0(data: &[u8], out: &mut [f32]) {
+/// Each block has 8 sub-blocks of 32 values.
+/// Sub-block scale: ls = (scales_l[ib/2] >> 4*(ib%2) & 0xf) | ((scales_h >> 2*ib) & 3) << 4
+/// Dequantized value: dl = d * (ls - 32), value = dl * kvalues_iq4nl[q]
+pub fn dequantize_iq4_xs(data: &[u8], out: &mut [f32]) {
     const BLOCK_SIZE: usize = 256;
-    const GROUP_SIZE: usize = 162; // 2 (scale) + 160 (5-bit packed)
+    const BLOCK_BYTES: usize = 136;
     let num_blocks = out.len() / BLOCK_SIZE;
 
     for i in 0..num_blocks {
-        let start = i * GROUP_SIZE;
-        let block = &data[start..start + GROUP_SIZE];
-        let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
-        let qs = &block[2..162];
+        let start = i * BLOCK_BYTES;
+        let block = &data[start..start + BLOCK_BYTES];
 
-        for j in 0..BLOCK_SIZE {
-            let start_bit = j * 5;
-            let start_byte = start_bit / 8;
-            let bit_offset = start_bit % 8;
-            let available = 8 - bit_offset;
+        let d = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let scales_h = u16::from_le_bytes([block[2], block[3]]);
+        let scales_l = &block[4..8];
+        let qs = &block[8..136];
 
-            let q = if available >= 5 {
-                (qs[start_byte] >> bit_offset) & 0x1F
-            } else {
-                let low = (qs[start_byte] >> bit_offset) & ((1u8 << available) - 1);
-                let need = 5 - available;
-                let high = qs[start_byte + 1] & ((1u8 << need) - 1);
-                low | (high << available)
-            };
+        let mut y = &mut out[i * BLOCK_SIZE..];
+        let mut qsp = 0usize;
 
-            out[i * BLOCK_SIZE + j] = (q as f32 - 15.5) * scale;
+        for ib in 0..8 {
+            let ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) as u16
+                | (((scales_h >> (2 * ib)) & 3) << 4);
+            let dl = d * (ls as f32 - 32.0);
+
+            for j in 0..16 {
+                let q_lo = qs[qsp + j] & 0xf;
+                let q_hi = qs[qsp + j] >> 4;
+                y[j]      = dl * KVALUES_IQ4NL[q_lo as usize] as f32;
+                y[j + 16] = dl * KVALUES_IQ4NL[q_hi as usize] as f32;
+            }
+            y = &mut y[32..];
+            qsp += 16;
         }
     }
 }

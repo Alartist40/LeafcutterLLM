@@ -189,3 +189,68 @@ blk.1.ffn_gate.weight:    offset=323,080,192 size=12,681,216
 - `src/inference/engine.rs` — Added corruption scan call in `Engine::load()`
 - `tests/end_to_end.rs` — Added `test_single_forward_no_nan()`
 - `TEST_REPORT.md` — This file
+
+---
+
+## 2026-05-19: Generation Quality Investigation
+
+### Symptom
+9B-IQ4_NL and 2B-Q4_K_M models produce garbled tokens:
+- `" isNew clan_rsa_rsa.Creator�"` (9B)
+- `"休闲νήgosgosgosstickatelyROT"` (2B)
+
+Forward pass shows no NaN/Inf and reasonable logit ranges, pointing to an architecture bug rather than numerical instability.
+
+### Fixes Applied (Commits `567cb44`, `fc3ec67`)
+
+| Fix | What was broken | How it was fixed |
+|-----|----------------|------------------|
+| SSM state persistence | `selective_scan` reset state `h` to zero every token | Added `initial_state` param + `SSMStateCache` per-layer |
+| Causal conv1d cache | Single-token decode lost past conv context | `causal_conv1d_cached` stores last `K-1` inputs |
+| RoPE position offset | Every new token got rotation at position 0 | Engine tracks `seq_offset`; `attention_forward` passes offset to `apply_rotary_emb` |
+| Attention layer detection | `has_standard_attn` only checked `self_attn.q_proj.weight`, missing Qwen3.5's `attn_q.weight` | Added `attn_q.weight` / `attn_k.weight` / `attn_v.weight` fallbacks |
+| Q/K per-head norm | Missing `attn_q_norm` / `attn_k_norm` application | Added `apply_per_head_rms_norm` before RoPE |
+
+**Test verification:** `cargo test --lib` → **104 passed, 0 failed, 3 ignored**.
+
+### Root Cause Discovery
+
+After the above fixes, output remained garbled. Reverse-engineering llama.cpp's `qwen35.cpp` revealed that **Qwen3.5 does not use standard Mamba**. Its "SSM" layers are actually **Gated Delta Net** (a linear attention variant) with substantial differences:
+
+**Our `ssm_forward` vs. llama.cpp `build_layer_attn_linear`:**
+
+| Component | Our Code | Correct (llama.cpp) |
+|-----------|----------|---------------------|
+| Input projection | `hidden @ attn_qkv.weight` | `build_qkvz()` = `wqkv` + `wqkv_gate` (z) |
+| Beta (B) | `hidden @ ssm_beta` | `sigmoid(hidden @ ssm_beta)` |
+| Alpha (dt) | `hidden @ ssm_dt.weight` | `softplus(hidden @ ssm_alpha + ssm_dt.bias)` |
+| Decay gate | `exp(dt * a_i)` | `softplus(alpha + bias) * exp(-A_log)` |
+| Post-conv Q/K | None | L2 normalization |
+| Core attention | `selective_scan` (scalar state) | `build_delta_net` (vector state, linear attention) |
+| Output gating | None | `RMSNorm(output) * silu(z)` |
+
+**Our `attention_forward` vs. llama.cpp `build_layer_attn`:**
+
+| Component | Our Code | Correct (llama.cpp) |
+|-----------|----------|---------------------|
+| Q projection | `self_attn.q_proj.weight` | `wq` outputs Q+gate together |
+| RoPE | Standard single-angle | MRoPE (multi-section with `rope_sections`) |
+| Attention gating | `sigmoid(gate_proj)` on Q | `sigmoid(gate)` on attention output |
+| KV cache | Standard | Same |
+
+### Conclusion
+
+The native Rust engine **loads and runs** Qwen3.5 models without numerical errors, but the forward pass architecture is incomplete. Coherent generation requires implementing the Gated Delta Net mechanism (SSM layers) and MRoPE (attention layers), which are research-grade algorithms beyond the current Mamba-style selective scan.
+
+**Workaround:** Use the llama.cpp bridge backend (`HybridEngine`) for Qwen3.5 inference. The native Rust path is suitable for standard Transformer architectures (Llama, Qwen2, Mistral) but not yet for Qwen3.5 hybrid models.
+
+---
+
+## Files Modified
+
+- `src/inference/ssm.rs` — SSM state cache, causal_conv1d cache
+- `src/inference/attention.rs` — RoPE position offset, Q/K norm, Qwen3.5 tensor name fallbacks
+- `src/inference/engine.rs` — `seq_offset` tracking, attention layer detection
+- `src/cache/ssm_state.rs` — New SSM state cache with conv state support
+- `src/bin/test_generation.rs` — Generation quality test binary
+- `tests/tokenizer_qwen35.json` — Qwen3.5 tokenizer (vocab 248,044)

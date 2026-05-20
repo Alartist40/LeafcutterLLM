@@ -349,3 +349,151 @@ fn test_single_forward_no_nan() {
     assert_eq!(nan_count, 0, "Logits contain NaN values!");
     assert_eq!(inf_count, 0, "Logits contain Inf values!");
 }
+
+#[test]
+#[ignore = "Slow: runs real inference on Llama-3.2-3B"]
+fn test_llama_logits() {
+    let model_path = "/home/xander/Documents/portfolio/AI Models/Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf";
+    let tok_path = "tests/tokenizer_llama.json";
+    if !std::path::Path::new(model_path).exists() || !std::path::Path::new(tok_path).exists() {
+        println!("Model or tokenizer not found, skipping");
+        return;
+    }
+    let tok = Tokenizer::from_file(tok_path).unwrap();
+    let mut engine = Engine::load(model_path).unwrap();
+    
+    for (label, text) in [("nobos", "Hello"), ("bos", "")] {
+        let tokens = if label == "bos" {
+            vec![128000, 9906]
+        } else {
+            tok.encode(text)
+        };
+        engine.kv_cache.clear();
+        let logits = engine.forward(&tokens);
+        
+        let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        indexed.sort_by(|(_, a), (_, b)| b.total_cmp(a));
+        println!("Top 10 logits for '{}' (tokens={:?}):", label, tokens);
+        for (i, (idx, val)) in indexed.iter().take(10).enumerate() {
+            println!("  {}: token={} logit={}", i, idx, val);
+        }
+    }
+}
+
+#[test]
+#[ignore = "Slow: runs real inference on Llama-3.2-3B"]
+fn test_llama_logits_dump() {
+    let model_path = "/home/xander/Documents/portfolio/AI Models/Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf";
+    let tok_path = "tests/tokenizer_llama.json";
+    if !std::path::Path::new(model_path).exists() || !std::path::Path::new(tok_path).exists() {
+        println!("Model or tokenizer not found, skipping");
+        return;
+    }
+    let tok = Tokenizer::from_file(tok_path).unwrap();
+    let mut engine = Engine::load(model_path).unwrap();
+    
+    for (label, tokens) in [("nobos", vec![9906usize]), ("bos", vec![128000usize, 9906])] {
+        engine.kv_cache.clear();
+        let logits = engine.forward(&tokens);
+        
+        let path = format!("/tmp/leafcutter_logits_{}.bin", label);
+        let bytes: Vec<u8> = logits.iter().flat_map(|&f| f.to_le_bytes()).collect();
+        std::fs::write(&path, &bytes).unwrap();
+        println!("Dumped {} logits to {}", label, path);
+        
+        let mut indexed: Vec<(usize, f32)> = logits.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        indexed.sort_by(|(_, a), (_, b)| b.total_cmp(a));
+        println!("Top 10 logits for '{}' (tokens={:?}):", label, tokens);
+        for (i, (idx, val)) in indexed.iter().take(10).enumerate() {
+            println!("  {}: token={} logit={}", i, idx, val);
+        }
+    }
+}
+
+#[test]
+#[ignore = "Slow: runs real inference on Llama-3.2-3B"]
+fn test_llama_embed_dump() {
+    let model_path = "/home/xander/Documents/portfolio/AI Models/Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf";
+    if !std::path::Path::new(model_path).exists() {
+        return;
+    }
+    let mut engine = Engine::load(model_path).unwrap();
+    
+    for (label, tokens) in [("nobos", vec![9906usize]), ("bos", vec![128000usize, 9906])] {
+        let hidden = engine.embed_lookup_mmap(&tokens);
+        let bytes: Vec<u8> = hidden.data.iter().flat_map(|&f| f.to_le_bytes()).collect();
+        let path = format!("/tmp/leafcutter_embed_{}.bin", label);
+        std::fs::write(&path, &bytes).unwrap();
+        println!("{} embed shape={:?} last_token_first_10={:?}", label, hidden.shape, &hidden.data[(tokens.len()-1)*3072..(tokens.len()-1)*3072+10]);
+    }
+}
+
+#[test]
+#[ignore = "Slow: runs real inference on Llama-3.2-3B"]
+fn test_embed_raw_bytes() {
+    let model_path = "/home/xander/Documents/portfolio/AI Models/Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf";
+    if !std::path::Path::new(model_path).exists() {
+        return;
+    }
+    let model = leafcutter::model::loader::GGUFModel::load(model_path).unwrap();
+    
+    let info = model.file.get_tensor_info("token_embd.weight").unwrap();
+    println!("token_embd.weight: type={} dims={:?} offset={}", info.typ, info.dimensions, info.offset);
+    println!("data_offset = {}", model.file.data_offset);
+    
+    let raw = model.file.get_tensor_raw("token_embd.weight").unwrap();
+    println!("Total raw bytes: {}", raw.len());
+    
+    // Print first few bytes of row 9906
+    let row_idx = 9906;
+    let qtype = leafcutter::model::quant::QuantType::from_u32(info.typ).unwrap();
+    let block_size = qtype.block_size();
+    let block_bytes = qtype.block_bytes();
+    let cols = info.dimensions[0] as usize;
+    let blocks_per_row = (cols + block_size - 1) / block_size;
+    let row_bytes = blocks_per_row * block_bytes;
+    let tensor_start = (model.file.data_offset + info.offset) as usize;
+    let row_start = tensor_start + row_idx * row_bytes;
+    
+    println!("Row {}: cols={}, blocks_per_row={}, row_bytes={}, tensor_start={}, row_start={}", 
+        row_idx, cols, blocks_per_row, row_bytes, tensor_start, row_start);
+    println!("First 20 bytes of row: {:?}", &raw[row_idx * row_bytes..row_idx * row_bytes + 20]);
+    
+    // Dequantize first block
+    let mut out = vec![0.0f32; cols];
+    leafcutter::kernels::dequantize_q6_k(&raw[row_idx * row_bytes..row_idx * row_bytes + row_bytes], &mut out);
+    println!("First 10 dequantized values: {:?}", &out[..10]);
+}
+
+#[test]
+#[ignore = "Slow: runs real inference on Llama-3.2-3B"]
+fn test_q6k_block_d() {
+    let model_path = "/home/xander/Documents/portfolio/AI Models/Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf";
+    if !std::path::Path::new(model_path).exists() {
+        return;
+    }
+    let model = leafcutter::model::loader::GGUFModel::load(model_path).unwrap();
+    
+    let raw = model.file.get_tensor_raw("token_embd.weight").unwrap();
+    let info = model.file.get_tensor_info("token_embd.weight").unwrap();
+    let cols = info.dimensions[0] as usize;
+    let qtype = leafcutter::model::quant::QuantType::from_u32(info.typ).unwrap();
+    let block_size = qtype.block_size();
+    let block_bytes = qtype.block_bytes();
+    let blocks_per_row = (cols + block_size - 1) / block_size;
+    let row_bytes = blocks_per_row * block_bytes;
+    
+    let row_idx = 9906;
+    let row_start = row_idx * row_bytes;
+    
+    println!("Row {} bytes: {:?}", row_idx, &raw[row_start..row_start+20]);
+    
+    // Parse first block
+    let block = &raw[row_start..row_start+210];
+    let d_bytes = [block[208], block[209]];
+    let d = half::f16::from_le_bytes(d_bytes).to_f32();
+    println!("Block 0 d = {} (bytes: {:?})", d, d_bytes);
+    
+    let scales = &block[192..208];
+    println!("Block 0 scales (as i8): {:?}", scales.iter().map(|&b| b as i8).collect::<Vec<_>>());
+}

@@ -30,13 +30,15 @@ pub enum QuantType {
     IQ2_XXS,  // 16
     IQ2_XS,   // 17
     IQ3_XXS,  // 18
-    IQ3_S,    // 19
+    IQ1_S,    // 19
     IQ4_NL,   // 20
-    IQ4_XS,   // 21
-    IQ4_K,    // 22
-    IQ5_0,    // 23
-    IQ5_NL,   // 24
-    IQ5_K,    // 25
+    IQ3_S,    // 21
+    IQ2_S,    // 22
+    IQ4_XS,   // 23
+    IQ5_0,    // 24 (legacy, actually I8 in ggml)
+    IQ5_NL,   // 25 (legacy, actually I16 in ggml)
+    IQ5_K,    // 26 (legacy, actually I32 in ggml)
+    IQ4_K,    // 27 (legacy, actually I64 in ggml)
     BF16,     // 30 (newer ggml)
 }
 
@@ -61,13 +63,15 @@ impl QuantType {
             QuantType::IQ2_XXS => 16,
             QuantType::IQ2_XS  => 17,
             QuantType::IQ3_XXS => 18,
-            QuantType::IQ3_S   => 19,
+            QuantType::IQ1_S   => 19,
             QuantType::IQ4_NL  => 20,
-            QuantType::IQ4_XS  => 21,
-            QuantType::IQ4_K   => 22,
-            QuantType::IQ5_0   => 23,
-            QuantType::IQ5_NL  => 24,
-            QuantType::IQ5_K   => 25,
+            QuantType::IQ3_S   => 21,
+            QuantType::IQ2_S   => 22,
+            QuantType::IQ4_XS  => 23,
+            QuantType::IQ5_0   => 24,
+            QuantType::IQ5_NL  => 25,
+            QuantType::IQ5_K   => 26,
+            QuantType::IQ4_K   => 27,
             QuantType::BF16    => 30,
         }
     }
@@ -92,13 +96,15 @@ impl QuantType {
             16 => Some(QuantType::IQ2_XXS),
             17 => Some(QuantType::IQ2_XS),
             18 => Some(QuantType::IQ3_XXS),
-            19 => Some(QuantType::IQ3_S),
+            19 => Some(QuantType::IQ1_S),
             20 => Some(QuantType::IQ4_NL),
-            21 => Some(QuantType::IQ4_XS),
-            22 => Some(QuantType::IQ4_K),
-            23 => Some(QuantType::IQ5_0),
-            24 => Some(QuantType::IQ5_NL),
-            25 => Some(QuantType::IQ5_K),
+            21 => Some(QuantType::IQ3_S),
+            22 => Some(QuantType::IQ2_S),
+            23 => Some(QuantType::IQ4_XS),
+            24 => Some(QuantType::IQ5_0),
+            25 => Some(QuantType::IQ5_NL),
+            26 => Some(QuantType::IQ5_K),
+            27 => Some(QuantType::IQ4_K),
             30 => Some(QuantType::BF16),
             _  => None,
         }
@@ -124,13 +130,15 @@ impl QuantType {
             QuantType::IQ2_XXS => "IQ2_XXS",
             QuantType::IQ2_XS  => "IQ2_XS",
             QuantType::IQ3_XXS => "IQ3_XXS",
-            QuantType::IQ3_S   => "IQ3_S",
+            QuantType::IQ1_S   => "IQ1_S",
             QuantType::IQ4_NL  => "IQ4_NL",
+            QuantType::IQ3_S   => "IQ3_S",
+            QuantType::IQ2_S   => "IQ2_S",
             QuantType::IQ4_XS  => "IQ4_XS",
-            QuantType::IQ4_K   => "IQ4_K",
             QuantType::IQ5_0   => "IQ5_0",
             QuantType::IQ5_NL  => "IQ5_NL",
             QuantType::IQ5_K   => "IQ5_K",
+            QuantType::IQ4_K   => "IQ4_K",
             QuantType::BF16    => "BF16",
         }
     }
@@ -156,13 +164,15 @@ impl QuantType {
             QuantType::IQ2_XXS => 2.0625,
             QuantType::IQ2_XS  => 2.3125,
             QuantType::IQ3_XXS => 3.0625,
-            QuantType::IQ3_S   => 3.4375,
+            QuantType::IQ1_S   => 1.75,
             QuantType::IQ4_NL  => 4.5,
+            QuantType::IQ3_S   => 3.4375,
+            QuantType::IQ2_S   => 2.5,
             QuantType::IQ4_XS  => 4.25,
-            QuantType::IQ4_K   => 4.25,
             QuantType::IQ5_0   => 5.0,
             QuantType::IQ5_NL  => 5.0,
             QuantType::IQ5_K   => 5.5,
+            QuantType::IQ4_K   => 4.25,
         }
     }
 
@@ -177,7 +187,8 @@ impl QuantType {
             QuantType::Q2_K | QuantType::Q3_K | QuantType::Q4_K
             | QuantType::Q5_K | QuantType::Q6_K | QuantType::Q8_K
             | QuantType::IQ2_XXS | QuantType::IQ2_XS | QuantType::IQ3_XXS
-            | QuantType::IQ3_S | QuantType::IQ4_XS | QuantType::IQ4_K
+            | QuantType::IQ1_S | QuantType::IQ3_S | QuantType::IQ2_S
+            | QuantType::IQ4_XS | QuantType::IQ4_K
             | QuantType::IQ5_0 | QuantType::IQ5_NL | QuantType::IQ5_K => 256,
         }
     }
@@ -209,19 +220,17 @@ impl QuantType {
             QuantType::IQ2_XXS => 66,   // 2 + 64
             QuantType::IQ2_XS  => 74,   // 2 + 64 + 8
             QuantType::IQ3_XXS => 98,   // 2 + 64 + 32
+            QuantType::IQ1_S   => 54,   // approximate
+            QuantType::IQ4_NL  => 18,   // 2 + 16
             QuantType::IQ3_S   => {
                 // 2 + 64 + 32 + 8 + 4 = 110
                 2 + 256/4 + 256/8 + 256/32 + 4
             }
-            QuantType::IQ4_NL  => 18,   // 2 + 16
+            QuantType::IQ2_S   => 82,   // approximate
             QuantType::IQ4_XS  => {
                 // sizeof(ggml_half) + sizeof(uint16_t) + 256/64 + 256/2
                 // = 2 + 2 + 4 + 128 = 136
                 2 + 2 + 4 + 128
-            }
-            QuantType::IQ4_K   => {
-                // Similar to IQ4_XS but with K-scale
-                2 + 2 + 128 + 4
             }
             QuantType::IQ5_0   => {
                 // 2 + 160 = 162 (approx)
@@ -234,6 +243,10 @@ impl QuantType {
             QuantType::IQ5_K   => {
                 // 2 + 2 + 160 + 12 = 176
                 2 + 2 + 160 + 12
+            }
+            QuantType::IQ4_K   => {
+                // Similar to IQ4_XS but with K-scale
+                2 + 2 + 128 + 4
             }
         }
     }
@@ -250,7 +263,7 @@ impl QuantType {
             QuantType::Q6_K |
             QuantType::Q8_K |
             QuantType::IQ4_NL |
-            QuantType::IQ5_0
+            QuantType::IQ4_XS
         )
     }
 

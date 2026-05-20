@@ -1,7 +1,14 @@
 # Leafcutter-RS Test Results
 
-**Date:** 2026-05-15  
+**Date:** 2026-05-19  
 **Project:** Full Rust Rewrite of LeafcutterLLM (Option C)  
+**Target:** x86_64 (AVX2/FMA)  
+**Model:** Qwen3.5-9B-IQ4_NL / Qwen3.5-2B-Q4_K_M GGUF
+
+---
+
+## Previous Results (2026-05-15)
+
 **Target:** Raspberry Pi 5 (ARM64)  
 **Model:** Qwen2.5-3B Q4_K_M GGUF (1.8 GB)
 
@@ -150,6 +157,49 @@ cargo test
 
 ---
 
+## 2026-05-19: Autoregressive Generation Bug Hunt
+
+### Fixes Applied
+
+| Commit | Fix | File(s) |
+|--------|-----|---------|
+| `567cb44` | SSM state persistence + conv1d cache + RoPE position offset | `ssm.rs`, `engine.rs`, `attention.rs`, `ssm_state.rs` |
+| `fc3ec67` | Attention layer detection for Qwen3.5 tensor names | `engine.rs`, `attention.rs` |
+
+**Test verification:** `cargo test --lib` → **104 passed, 0 failed, 3 ignored**.
+
+### Generation Test Results
+
+**Test binary:** `cargo run --release --bin test_generation`
+
+| Model | Prompt | Top Prefill Token | Generated Tokens | Coherent? |
+|-------|--------|-------------------|------------------|-----------|
+| 2B-Q4_K_M (raw) | "Hello" | `asso` (logit 12.39) | `熱çado所提供史یین史史症` | ❌ No |
+| 2B-Q4_K_M (chat) | "Hello" | `fest` (logit 10.46) | `休闲νήgosgosgosstickatelyROT` | ❌ No |
+| 9B-IQ4_NL (chat) | "Hello" | `98564` (logit 10.19) | `isNew clan_rsa_rsa.Creator�` | ❌ No |
+
+### Root Cause Discovery
+
+After fixing the obvious bugs (SSM state reset, conv1d losing context, RoPE position 0 for all tokens, attention layers being skipped due to fused-QKV naming), the output remained garbled. Investigation of llama.cpp's `qwen35.cpp` reference implementation revealed that **Qwen3.5 does NOT use standard Mamba selective scan**. Instead, it uses a **Gated Delta Net** architecture with the following differences from our `ssm_forward`:
+
+| Feature | Our Implementation | Qwen3.5 (llama.cpp) |
+|---------|-------------------|---------------------|
+| Core mechanism | Mamba selective_scan | Delta Net (`build_delta_net`) |
+| Input projection | Single `attn_qkv.weight` | Dual: `wqkv` + `wqkv_gate` (z gate) |
+| Q/K after conv | None | L2 normalization |
+| Decay (`ssm_a`) | `exp(dt * a_i)` | `softplus(alpha + bias) * exp(-A_log)` |
+| Output gating | None | `norm(output) * silu(z)` |
+| Attention layers | Standard RoPE | MRoPE (multi-section), Q/K norm |
+| Attention interval | `layer_idx % 4 == 0` | `layer_idx % 4 == 3` |
+
+### Conclusion
+
+The native Rust forward pass for Qwen3.5 models **loads correctly and produces finite logits**, but the architecture implementation is incomplete. Full coherence requires implementing the Delta Net linear attention mechanism, which is a major feature beyond the current Mamba-style selective scan.
+
+**Recommendation:** For Qwen3.5 models, use the llama.cpp bridge backend (already available in `HybridEngine`) until native Delta Net support is implemented.
+
+---
+
 ## 🎯 Next Steps
 
 1. **ARM64 NEON kernels** — Replace naive Rust matmul with `std::arch::aarch64` SIMD
@@ -157,6 +207,7 @@ cargo test
 3. **HTTP API parity** — Port `/generate`, `/health`, `/load_layer` from Go
 4. **Robot integration** — Swap `leafcutter.service` to run Rust binary
 5. **Benchmark suite** — Compare token/sec vs Go implementation on Pi 5
+6. **Delta Net implementation** — Native Rust support for Qwen3.5 gated linear attention
 
 ---
 

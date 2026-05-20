@@ -34,7 +34,7 @@ pub struct Engine {
     pub ssm_cache: SSMStateCache,
     /// Current sequence position offset for RoPE. Tracks total tokens processed
     /// across forward calls within a generation session.
-    seq_offset: usize,
+    pub seq_offset: usize,
 }
 
 impl Engine {
@@ -283,7 +283,7 @@ impl Engine {
         }).collect()
     }
 
-    fn ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {
+    pub fn ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {
         let gate = weights.get("mlp.gate_proj.weight").expect("Missing gate");
         let up = weights.get("mlp.up_proj.weight").expect("Missing up");
         let down = weights.get("mlp.down_proj.weight").expect("Missing down");

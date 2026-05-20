@@ -174,7 +174,7 @@ impl GGUFile {
             QuantType::Q6_K => crate::kernels::dequantize_q6_k(raw, &mut out),
             QuantType::Q8_K => crate::kernels::dequantize_q8_k(raw, &mut out),
             QuantType::IQ4_NL => crate::kernels::dequantize_iq4_nl(raw, &mut out),
-            QuantType::IQ5_0 => crate::kernels::dequantize_iq5_0(raw, &mut out),
+            QuantType::IQ4_XS => crate::kernels::dequantize_iq4_xs(raw, &mut out),
             _ => {
                 #[cfg(debug_assertions)]
                 panic!("get_tensor_row_f32: unsupported quant type {:?} for tensor {}", qtype, name);

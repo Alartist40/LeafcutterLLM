@@ -35,8 +35,28 @@ name = "check_shapes"
 path = "src/bin/check_shapes.rs"
 
 [[bin]]
+name = "ref_full"
+path = "src/bin/ref_full.rs"
+
+[[bin]]
+name = "test_llama_ffi"
+path = "src/bin/test_llama_ffi.rs"
+
+[[bin]]
 name = "test_generation"
 path = "src/bin/test_generation.rs"
+
+[[bin]]
+name = "test_llama"
+path = "src/bin/test_llama.rs"
+
+[[bin]]
+name = "scan_corruption"
+path = "src/bin/scan_corruption.rs"
+
+[[bin]]
+name = "ref_layers"
+path = "src/bin/ref_layers.rs"
 
 [dependencies]
 axum = "0.7"
