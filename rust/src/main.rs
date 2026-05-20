@@ -12,13 +12,13 @@
 use clap::{Parser, Subcommand};
 use std::io::{self, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // ─── FFI imports for generate/chat ───────────────────────────────────────────
 use leafcutter::llama_ffi::{backend_init, backend_free, LlamaModel, LlamaContext};
 
 // ─── Server imports ──────────────────────────────────────────────────────────
-use leafcutter::bridge::HybridEngine;
+use leafcutter::ffi_server::FfiEngine;
 
 #[derive(Parser)]
 #[command(name = "leafcutter")]
@@ -38,7 +38,7 @@ enum Commands {
     /// Start the HTTP API server (OpenAI-compatible)
     Server {
         /// Path to GGUF model file
-        #[arg(short, long, default_value = "/home/pi/the-pathfinder-eye_ai/models/qwen2.5-3b-q4.gguf")]
+        #[arg(short, long, default_value = "/home/xander/Documents/portfolio/AI Models/Qwen3.5-9B-IQ4_NL.gguf")]
         model: String,
         /// HTTP port to listen on
         #[arg(short, long, default_value_t = 8081)]
@@ -147,7 +147,7 @@ async fn main() {
         None => {
             // Default to server mode for backward compatibility
             run_server(
-                "/home/pi/the-pathfinder-eye_ai/models/qwen2.5-3b-q4.gguf",
+                "/home/xander/Documents/portfolio/AI Models/Qwen3.5-9B-IQ4_NL.gguf",
                 8081,
                 false,
             ).await;
@@ -158,14 +158,13 @@ async fn main() {
 // ─── Server Mode ─────────────────────────────────────────────────────────────
 
 async fn run_server(model_path: &str, port: u16, benchmark: bool) {
-    println!("🌿 LeafcutterLLM v0.9.0 (Server Mode)");
+    println!("🌿 LeafcutterLLM v0.9.0 (FFI Server Mode)");
     println!("   Model: {}", model_path);
 
-    let engine = match HybridEngine::load(model_path) {
+    let engine = match FfiEngine::load(model_path) {
         Ok(e) => {
-            let backend = if e.native.is_some() { "native" } else { "bridge" };
-            println!("✅ Model loaded via {} backend", backend);
-            Arc::new(Mutex::new(e))
+            println!("✅ Model loaded via direct llama.cpp FFI");
+            Arc::new(e)
         }
         Err(e) => {
             eprintln!("❌ Failed to load model: {}", e);
@@ -174,27 +173,25 @@ async fn run_server(model_path: &str, port: u16, benchmark: bool) {
     };
 
     if benchmark {
-        run_benchmark(engine);
+        run_ffi_benchmark(&engine);
         return;
     }
 
     leafcutter::api::run_server(engine, port).await;
 }
 
-fn run_benchmark(engine: Arc<Mutex<HybridEngine>>) {
+fn run_ffi_benchmark(engine: &Arc<FfiEngine>) {
     use std::time::Instant;
 
     println!("\n🏁 Running benchmark...");
-    let mut eng = engine.lock().unwrap();
-
     let prompt = "Hello";
     let start = Instant::now();
-    let generated_text = eng.generate(prompt, 10, 0.7, 0.9);
+    let result = engine.generate(prompt, 10, 0.7).unwrap();
     let elapsed = start.elapsed();
 
-    let tok_per_sec = generated_text.len() as f64 / elapsed.as_secs_f64();
-    println!("Generated '{}' in {:?}", generated_text.trim(), elapsed);
-    println!("Throughput: {:.2} chars/sec", tok_per_sec);
+    let tok_per_sec = result.tokens.len() as f64 / elapsed.as_secs_f64();
+    println!("Generated '{}' in {:?}", result.text.trim(), elapsed);
+    println!("Throughput: {:.2} tok/sec", tok_per_sec);
 }
 
 // ─── Generate Mode (FFI) ─────────────────────────────────────────────────────

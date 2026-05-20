@@ -195,3 +195,30 @@ Attention layers also differ: Qwen3.5 uses **MRoPE** (multi-section RoPE) and ou
 2. **ARM dotprod (`vdotq_s32`) optimization** — Pi 5 Cortex-A76 has dot-product instructions; potential 2-3× INT8 GEMM boost
 3. **Pi 5 field testing** — Deploy and benchmark on actual hardware
 4. **GPU element-wise ops** — vec_add, silu, softmax on WGPU for full GPU offload
+
+---
+
+## Milestone M9 — llama.cpp FFI Bridge (2026-05-19)
+
+**Status:** ✅ COMPLETE
+
+### Deliverables
+- [x] Hand-written `#[repr(C)]` bindings verified against C header with size/offset checker
+- [x] Safe Rust wrappers: `LlamaModel`, `LlamaContext`, `LlamaBatch` with Drop guards
+- [x] Autoregressive generation: prefill + greedy/temperature sampling loop
+- [x] `llama_tokenize` negative-return bug fixed
+- [x] `llama_progress_callback` bool return type fixed
+- [x] Unified CLI: `leafcutter {server,generate,chat,list-models}`
+- [x] Single-line installer (`install.sh`)
+- [x] Cynapse integration docs and connector script
+
+### Test Results
+- ✅ Llama-3.2-3B-Instruct Q4_K_XL: coherent generation verified
+- ✅ Llama-3.2-3B-Instruct IQ4_NL: coherent generation verified  
+- ✅ Qwen3.5-9B-Instruct IQ4_NL: coherent generation + reasoning verified
+- ❌ Qwen3.5-9B-UD-Q8_K_XL (13GB): OOM on 8GB system (expected)
+
+### Performance
+- 3B Q4_K_XL on CPU: ~2-3 tok/sec
+- 9B IQ4_NL on CPU: ~1 tok/sec
+- Startup: instant (no subprocess spawn)

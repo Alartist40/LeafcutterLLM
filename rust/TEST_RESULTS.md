@@ -217,3 +217,32 @@ The native Rust forward pass for Qwen3.5 models **loads correctly and produces f
 > The K-quant GGUF parser loads the real Qwen2.5-3B model.  
 > All 11 tests pass. The binary is 6× smaller than Go.  
 > Ready for NEON optimization and robot deployment.
+
+---
+
+## 2026-05-19 Evening — llama.cpp FFI Bridge: Coherent Generation Achieved
+
+### Breakthrough
+After structural verification of C FFI bindings (exact struct sizes: `llama_model_params`=72B, `llama_context_params`=144B), the llama.cpp FFI wrapper produces **coherent, factually correct text**.
+
+### Verified Models
+
+| Model | Quant | Size | Prompt | Output | Status |
+|-------|-------|------|--------|--------|--------|
+| Llama-3.2-3B-Instruct | Q4_K_XL | 1.9GB | "Capital of France?" | "Paris." | ✅ Correct |
+| Llama-3.2-3B-Instruct | IQ4_NL | 1.8GB | "Color of sky?" | "Blue because of Rayleigh scattering" | ✅ Correct |
+| Qwen3.5-9B-Instruct | IQ4_NL | 5.1GB | "60km in 30min = ?" | "120 km/h" | ✅ Correct |
+
+### CLI Commands Verified
+- `leafcutter generate --model model.gguf --prompt "..."`
+- `leafcutter chat --model model.gguf` (interactive)
+- `leafcutter server --model model.gguf --port 8081` (HTTP API)
+
+### API Format
+The server returns **OpenAI-compatible** `/v1/chat/completions` and a custom `/generate` endpoint. Response format:
+```json
+{"id":"req-1","text":"generated text here","tokens":[...],"took_ms":1234}
+```
+
+### Key Fix
+`llama_tokenize` returns **negative** token count when buffer is NULL (indicating required size). Previous code treated `<= 0` as error. Fixed by taking `.abs()`.

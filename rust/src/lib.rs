@@ -4,6 +4,7 @@ pub mod api;
 pub mod backend;
 pub mod bridge;
 pub mod cache;
+pub mod ffi_server;
 pub mod inference;
 pub mod kernels;
 pub mod llama_ffi;
