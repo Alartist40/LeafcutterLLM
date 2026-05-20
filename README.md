@@ -35,7 +35,10 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 | Qwen3.5-2B-IQ4_XS | 1.2 GB | ✅ Native forward | 17.4s | 1.15 |
 | Qwen3.5-2B-Q4_K_M | 1.3 GB | ✅ Native forward | 11.4s | 1.76 |
 | Qwen3.5-9B-IQ4_NL | 5.1 GB | ✅ Native forward | 82.7s | 0.24 |
+| Llama-3.2-3B-Instruct | 1.9 GB | ✅ **FFI generation** | Coherent text | ~2–3 |
 | Llama / Qwen2 / Mistral | Various | ✅ Standard transformer | — | Layer streaming + K-quant |
+
+**NEW: llama.cpp FFI Bridge** — Any GGUF model loads and generates coherent text via direct C API. Verified on Llama-3.2-3B-Instruct: "The capital of France is Paris."
 
 ### The 3-Pillar Architecture
 
@@ -44,6 +47,55 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 | **Layer-by-Layer Loading** | Loads only one transformer layer into RAM at a time, unloads it after use | **Run 13B on 8GB RAM today**; 70B on 4GB with quantized embed WIP |
 | **SIMD Kernels + Quantized GEMM** | ARM NEON / x86_64 AVX2 matmul; direct quantized-weight GEMM without full f32 materialization | **Up to 13× faster** than naive loops |
 | **Continuous Batching Scheduler** | Queues multiple requests and batches them for concurrent processing | **2,200+ requests/sec** throughput on Pi 5 |
+
+---
+
+## 🚀 Quick Start (Single-Line Install)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Alartist40/LeafcutterLLM/main/install.sh | bash
+```
+
+Then run:
+```bash
+# Reload shell
+source ~/.bashrc  # or ~/.zshrc
+
+# List your models
+leafcutter list-models --dir ~/models
+
+# Generate text
+leafcutter generate --model ~/models/model.gguf --prompt "Hello world"
+
+# Interactive chat
+leafcutter chat --model ~/models/model.gguf
+
+# Start API server
+leafcutter server --model ~/models/model.gguf --port 8081
+```
+
+**Requirements:** Linux/macOS, 2GB+ RAM, any 64-bit CPU. No GPU needed.
+
+---
+
+## 🔗 Cynapse Integration
+
+Leafcutter is designed to work as the inference backend for **[Cynapse](https://github.com/Alartist40/cynapse)**:
+
+```bash
+# 1. Cynapse downloads the model
+cynapse model download meta-llama/Llama-3.2-3B-Instruct-GGUF Llama-3.2-3B-Instruct-Q4_K_M.gguf
+
+# 2. Leafcutter runs it (faster than llama-server subprocess)
+leafcutter chat --model ~/.cynapse/workspace/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf
+```
+
+**Why this combo wins:**
+- **Cynapse** handles the UX: model discovery, download management, conversation memory, TUI
+- **Leafcutter** handles inference: direct FFI to llama.cpp = zero startup latency, zero memory overhead
+- Together: Download any model from HuggingFace → chat instantly → fully offline
+
+See [`CYNAPSE_INTEGRATION.md`](CYNAPSE_INTEGRATION.md) for full details.
 
 ---
 
