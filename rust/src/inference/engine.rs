@@ -173,14 +173,12 @@ impl Engine {
         // Embedding lookup via mmap (avoids loading full embed matrix into RAM)
         let mut hidden = self.embed_lookup_mmap(tokens);
 
-        // Transformer / hybrid layers
+        // Transformer / hybrid layers — stream one layer at a time
         for layer_idx in 0..self.config.num_hidden_layers {
-            // Check layer cache first; load from disk only on miss
-            if !self.layer_cache.contains_key(&layer_idx) {
-                let weights = self.model.load_layer(layer_idx)
-                    .expect("Failed to load layer");
-                self.layer_cache.insert(layer_idx, weights);
-            }
+            // Load current layer
+            let weights = self.model.load_layer(layer_idx)
+                .expect("Failed to load layer");
+            self.layer_cache.insert(layer_idx, weights);
             let layer_weights = self.layer_cache.get(&layer_idx).unwrap();
 
             // Detect layer type from actual tensor contents (most robust)
@@ -213,6 +211,9 @@ impl Engine {
             let normed = hidden.rms_norm(post_norm_weight, 1e-5);
             let ffn_out = Self::ffn_forward(&normed, layer_weights);
             hidden = hidden.add(&ffn_out);
+
+            // Evict layer from cache — only one layer resident at a time
+            self.layer_cache.remove(&layer_idx);
         }
 
         // Final norm
