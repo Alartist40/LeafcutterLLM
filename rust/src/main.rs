@@ -18,7 +18,7 @@ use std::sync::Arc;
 use leafcutter::llama_ffi::{backend_init, backend_free, LlamaModel, LlamaContext};
 
 // ─── Server imports ──────────────────────────────────────────────────────────
-use leafcutter::ffi_server::FfiEngine;
+use leafcutter::api::FfiEngine;
 
 #[derive(Parser)]
 #[command(name = "leafcutter")]
@@ -186,11 +186,11 @@ fn run_ffi_benchmark(engine: &Arc<FfiEngine>) {
     println!("\n🏁 Running benchmark...");
     let prompt = "Hello";
     let start = Instant::now();
-    let result = engine.generate(prompt, 10, 0.7).unwrap();
+    let (text, tokens) = engine.generate(prompt, 10, 0.7).unwrap();
     let elapsed = start.elapsed();
 
-    let tok_per_sec = result.tokens.len() as f64 / elapsed.as_secs_f64();
-    println!("Generated '{}' in {:?}", result.text.trim(), elapsed);
+    let tok_per_sec = tokens.len() as f64 / elapsed.as_secs_f64();
+    println!("Generated '{}' in {:?}", text.trim(), elapsed);
     println!("Throughput: {:.2} tok/sec", tok_per_sec);
 }
 

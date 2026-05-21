@@ -1,8 +1,11 @@
 //! HTTP API server using Axum — Direct llama.cpp FFI backend
 //!
+//! Uses the existing `llama_ffi` module (already built and tested).
+//! The server returns decoded text so clients don't need their own tokenizer.
+//!
 //! Endpoints:
-//!   GET  /health                — health check (Leafcutter-compatible)
-//!   POST /generate              — Leafcutter native text generation
+//!   GET  /health                — health check
+//!   POST /generate              — text generation (returns text + tokens for compat)
 //!   POST /v1/chat/completions   — OpenAI-compatible chat API
 
 use axum::{
@@ -15,10 +18,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::ffi_server::FfiEngine;
+use crate::llama_ffi::{backend_init, backend_free, LlamaModel, LlamaContext};
 
 // ---------------------------------------------------------------------------
-// /generate endpoint — matches old LeafcutterLLM API
+// /generate endpoint — matches old LeafcutterLLM API but NOW returns text
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -38,10 +41,14 @@ fn default_max_tokens() -> usize { 256 }
 fn default_temperature() -> f32 { 0.7 }
 fn default_top_p() -> f32 { 0.9 }
 
-/// Response format matching what the Pathfinder Eye robot expects.
+/// Response format — NOW includes `text` so clients don't need a tokenizer.
+/// `tokens` kept for backward compatibility but `text` is the primary field.
 #[derive(Serialize, Deserialize)]
 pub struct GenerateResponse {
     pub id: String,
+    #[serde(skip_serializing_if = "String::is_empty", default)]
+    pub text: String,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tokens: Vec<usize>,
     pub took_ms: i64,
     #[serde(skip_serializing_if = "String::is_empty", default)]
@@ -99,10 +106,53 @@ pub struct Choice {
 }
 
 // ---------------------------------------------------------------------------
-// Router
+// Engine wrapper — thin state around LlamaModel (context created per request)
 // ---------------------------------------------------------------------------
 
+pub struct FfiEngine {
+    model: LlamaModel,
+    ctx_size: u32,
+    threads: i32,
+}
+
+impl FfiEngine {
+    pub fn load(path: &str) -> Result<Self, String> {
+        backend_init();
+        let model = LlamaModel::load(std::path::Path::new(path), 0)?;
+        Ok(Self {
+            model,
+            ctx_size: 4096,
+            threads: 4,
+        })
+    }
+
+    pub fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<(String, Vec<usize>), String> {
+        // Fresh context per request — avoids KV cache contamination
+        let mut ctx = LlamaContext::new(&self.model, self.ctx_size, self.threads)
+            .map_err(|e| format!("Failed to create context: {}", e))?;
+
+        let prompt_tokens = ctx.tokenize(prompt, true, true);
+        if prompt_tokens.is_empty() {
+            return Err("Empty prompt after tokenization".to_string());
+        }
+
+        let eos = self.model.eos_token();
+        let generated = ctx.generate(&prompt_tokens, max_tokens, temperature, eos);
+
+        let text: String = generated.iter()
+            .map(|&t| ctx.token_to_piece(t))
+            .collect();
+
+        let tokens: Vec<usize> = generated.iter().map(|&t| t as usize).collect();
+        Ok((text, tokens))
+    }
+}
+
 pub type SharedEngine = Arc<FfiEngine>;
+
+// ---------------------------------------------------------------------------
+// Handlers
+// ---------------------------------------------------------------------------
 
 pub async fn generate_handler(
     State(engine): State<SharedEngine>,
@@ -111,7 +161,7 @@ pub async fn generate_handler(
     let start = Instant::now();
     let id = format!("req-{}", start.elapsed().as_nanos());
 
-    let result = tokio::task::spawn_blocking(move || {
+    let (text, tokens) = tokio::task::spawn_blocking(move || {
         engine.generate(&req.prompt, req.max_tokens, req.temperature)
     })
     .await
@@ -120,7 +170,8 @@ pub async fn generate_handler(
 
     Ok(Json(GenerateResponse {
         id,
-        tokens: result.tokens,
+        text,
+        tokens,
         took_ms: start.elapsed().as_millis() as i64,
         error: String::new(),
     }))
@@ -142,13 +193,12 @@ pub async fn chat_completions_handler(
         .collect::<Vec<_>>()
         .join("\n");
 
-    let text = tokio::task::spawn_blocking(move || {
+    let (text, _tokens) = tokio::task::spawn_blocking(move || {
         engine.generate(&prompt, req.max_tokens, req.temperature)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task panic: {}", e)))?
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?
-    .text;
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
     let resp = ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
