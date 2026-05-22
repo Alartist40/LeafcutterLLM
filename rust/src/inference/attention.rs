@@ -11,6 +11,7 @@
 
 use crate::model::tensor::Tensor;
 use crate::cache::KVCache;
+use rayon::prelude::*;
 
 pub struct AttentionParams {
     pub num_heads: usize,
@@ -220,47 +221,62 @@ pub fn attention_forward(
     let num_kv_groups = params.num_heads.max(1) / params.num_kv_heads.max(1);
 
     // -------------------------------------------------------------------------
-    // Attention scores
+    // Attention scores — parallel across heads
     // -------------------------------------------------------------------------
-    let mut attn_output = vec![0.0f32; seq_len * params.num_heads * params.head_dim];
+    let head_outputs: Vec<Vec<f32>> = (0..params.num_heads)
+        .into_par_iter()
+        .map(|h| {
+            let kv_h = h / num_kv_groups;
+            let mut head_out = vec![0.0f32; seq_len * params.head_dim];
 
-    for h in 0..params.num_heads {
-        let kv_h = h / num_kv_groups;
-        for s in 0..seq_len {
-            let mut scores = vec![0.0f32; total_seq_len];
-            let cache_len = if total_seq_len > seq_len {
-                total_seq_len - seq_len
-            } else {
-                0
-            };
-
-            for t in 0..total_seq_len {
-                if t > cache_len + s {
-                    scores[t] = f32::NEG_INFINITY;
+            for s in 0..seq_len {
+                let mut scores = vec![0.0f32; total_seq_len];
+                let cache_len = if total_seq_len > seq_len {
+                    total_seq_len - seq_len
                 } else {
-                    let mut dot = 0.0f32;
-                    for d in 0..params.kv_head_dim {
-                        let q_val = q.data[s * params.num_heads * params.head_dim + h * params.head_dim + d];
-                        let k_val = k_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d];
-                        dot += q_val * k_val;
-                    }
-                    scores[t] = dot / (params.head_dim as f32).sqrt();
-                }
-            }
+                    0
+                };
 
-            let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let exp_sum: f32 = scores.iter().map(|&s| (s - max_score).exp()).sum();
-            for t in 0..total_seq_len {
-                scores[t] = (scores[t] - max_score).exp() / exp_sum;
-            }
-
-            for d in 0..params.head_dim {
-                let mut sum = 0.0f32;
                 for t in 0..total_seq_len {
-                    let v_val = v_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d.min(params.kv_head_dim - 1)];
-                    sum += scores[t] * v_val;
+                    if t > cache_len + s {
+                        scores[t] = f32::NEG_INFINITY;
+                    } else {
+                        let mut dot = 0.0f32;
+                        for d in 0..params.kv_head_dim {
+                            let q_val = q.data[s * params.num_heads * params.head_dim + h * params.head_dim + d];
+                            let k_val = k_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d];
+                            dot += q_val * k_val;
+                        }
+                        scores[t] = dot / (params.head_dim as f32).sqrt();
+                    }
                 }
-                attn_output[s * params.num_heads * params.head_dim + h * params.head_dim + d] = sum;
+
+                let max_score = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let exp_sum: f32 = scores.iter().map(|&s| (s - max_score).exp()).sum();
+                for t in 0..total_seq_len {
+                    scores[t] = (scores[t] - max_score).exp() / exp_sum;
+                }
+
+                for d in 0..params.head_dim {
+                    let mut sum = 0.0f32;
+                    for t in 0..total_seq_len {
+                        let v_val = v_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d.min(params.kv_head_dim - 1)];
+                        sum += scores[t] * v_val;
+                    }
+                    head_out[s * params.head_dim + d] = sum;
+                }
+            }
+            head_out
+        })
+        .collect();
+
+    // Reassemble heads into contiguous output
+    let mut attn_output = vec![0.0f32; seq_len * params.num_heads * params.head_dim];
+    for h in 0..params.num_heads {
+        for s in 0..seq_len {
+            for d in 0..params.head_dim {
+                attn_output[s * params.num_heads * params.head_dim + h * params.head_dim + d] =
+                    head_outputs[h][s * params.head_dim + d];
             }
         }
     }

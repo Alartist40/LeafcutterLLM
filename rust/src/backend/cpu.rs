@@ -12,10 +12,22 @@ pub struct CpuBackend;
 impl Backend for CpuBackend {
     fn matmul(&self, a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
         let mut result = vec![0.0f32; m * n];
-        // Use parallel matmul for large matrices to utilize all CPU cores.
-        // Threshold: 4096 output elements (~64×64) is where threading pays off.
-        if m * n >= 4096 {
-            simd::simd_matmul_parallel(a, b, &mut result, m, k, n);
+        // Use gemm crate for near-BLAS performance with cache-blocking,
+        // packing, and architecture-specific micro-kernels.
+        // Falls back to simd_matmul for very small matrices where
+        // gemm's overhead isn't worth it.
+        if m * n >= 256 {
+            unsafe {
+                gemm::gemm(
+                    m, n, k,
+                    result.as_mut_ptr(), 1, n as isize, false,
+                    a.as_ptr(), 1, k as isize,
+                    b.as_ptr(), 1, n as isize,
+                    1.0, 0.0,
+                    false, false, false,
+                    gemm::Parallelism::Rayon(0),
+                );
+            }
         } else {
             simd::simd_matmul(a, b, &mut result, m, k, n);
         }
