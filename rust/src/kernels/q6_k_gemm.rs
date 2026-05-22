@@ -163,18 +163,43 @@ pub fn q6_k_matmul_transposed_b(a: &[f32], b: &Q6KMatrix, c: &mut [f32], m: usiz
     assert_eq!(b.rows, n, "B rows must match n in transposed mode");
     let bpr = b.blocks_per_row();
     for v in c.iter_mut() { *v = 0.0; }
-    for j in 0..n {
-        let row_base = j * bpr;
-        let mut temp = vec![0.0f32; k];
-        for block_idx in 0..bpr {
-            let block = &b.blocks[row_base + block_idx];
-            let base = block_idx * 256;
-            block.dequantize(&mut temp[base..base + 256]);
+
+    if n >= 4096 {
+        use rayon::prelude::*;
+        let col_results: Vec<Vec<f32>> = (0..n)
+            .into_par_iter()
+            .map(|j| {
+                let row_base = j * bpr;
+                let mut temp = vec![0.0f32; k];
+                for block_idx in 0..bpr {
+                    let block = &b.blocks[row_base + block_idx];
+                    let base = block_idx * 256;
+                    block.dequantize(&mut temp[base..base + 256]);
+                }
+                let mut col = vec![0.0f32; m];
+                for i in 0..m {
+                    col[i] = crate::kernels::simd::simd_dot_product(&a[i * k..(i + 1) * k], &temp);
+                }
+                col
+            })
+            .collect();
+        for j in 0..n {
+            for i in 0..m {
+                c[i * n + j] = col_results[j][i];
+            }
         }
-        for i in 0..m {
-            let mut acc = 0.0f32;
-            for l in 0..k { acc += a[i * k + l] * temp[l]; }
-            c[i * n + j] = acc;
+    } else {
+        let mut temp = vec![0.0f32; k];
+        for j in 0..n {
+            let row_base = j * bpr;
+            for block_idx in 0..bpr {
+                let block = &b.blocks[row_base + block_idx];
+                let base = block_idx * 256;
+                block.dequantize(&mut temp[base..base + 256]);
+            }
+            for i in 0..m {
+                c[i * n + j] = crate::kernels::simd::simd_dot_product(&a[i * k..(i + 1) * k], &temp);
+            }
         }
     }
 }

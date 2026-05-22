@@ -407,6 +407,56 @@ pub fn simd_sum_sq(data: &[f32]) -> f32 {
     simd_sum
 }
 
+/// SIMD-accelerated dot product (f32). Falls back to scalar on non-x86_64.
+#[inline]
+pub fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len());
+    let len = a.len();
+
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::*;
+        let mut sum0 = _mm256_setzero_ps();
+        let mut sum1 = _mm256_setzero_ps();
+        let mut i = 0;
+        // Process 16 floats at a time (2 AVX2 registers)
+        while i + 16 <= len {
+            let a0 = _mm256_loadu_ps(a.as_ptr().add(i));
+            let b0 = _mm256_loadu_ps(b.as_ptr().add(i));
+            sum0 = _mm256_fmadd_ps(a0, b0, sum0);
+            let a1 = _mm256_loadu_ps(a.as_ptr().add(i + 8));
+            let b1 = _mm256_loadu_ps(b.as_ptr().add(i + 8));
+            sum1 = _mm256_fmadd_ps(a1, b1, sum1);
+            i += 16;
+        }
+        // Tail: 8 floats
+        if i + 8 <= len {
+            let a0 = _mm256_loadu_ps(a.as_ptr().add(i));
+            let b0 = _mm256_loadu_ps(b.as_ptr().add(i));
+            sum0 = _mm256_fmadd_ps(a0, b0, sum0);
+            i += 8;
+        }
+        // Reduce 8-lane sums to scalar
+        let sum = _mm256_add_ps(sum0, sum1);
+        let lo = _mm256_castps256_ps128(sum);
+        let hi = _mm256_extractf128_ps(sum, 1);
+        let sum128 = _mm_add_ps(lo, hi);
+        let sum64 = _mm_add_ps(sum128, _mm_movehl_ps(sum128, sum128));
+        let sum32 = _mm_add_ss(sum64, _mm_shuffle_ps(sum64, sum64, 0x55));
+        let mut acc = _mm_cvtss_f32(sum32);
+        // Scalar tail
+        for j in i..len {
+            acc += a[j] * b[j];
+        }
+        acc
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
