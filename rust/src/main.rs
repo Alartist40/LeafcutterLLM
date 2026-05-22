@@ -1,7 +1,7 @@
 //! LeafcutterLLM v0.9.0 — Unified CLI
 //!
 //! Subcommands:
-//!   leafcutter server   --model PATH [--port 8081]     # HTTP API server
+//!   leafcutter server   --model PATH [--port 8081]     # HTTP API server (requires llama-ffi)
 //!   leafcutter generate --model PATH --prompt "..."      # One-shot text generation
 //!   leafcutter chat     --model PATH                     # Interactive chat
 //!   leafcutter list-models [--dir ~/models]              # List downloaded GGUF models
@@ -14,10 +14,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-// ─── FFI imports for generate/chat ───────────────────────────────────────────
+#[cfg(feature = "llama-ffi")]
 use leafcutter::llama_ffi::{backend_init, backend_free, LlamaModel, LlamaContext};
 
-// ─── Server imports ──────────────────────────────────────────────────────────
+#[cfg(feature = "llama-ffi")]
 use leafcutter::api::FfiEngine;
 
 #[derive(Parser)]
@@ -133,30 +133,56 @@ async fn main() {
 
     match cli.command {
         Some(Commands::Server { model, port, benchmark }) => {
+            #[cfg(feature = "llama-ffi")]
             run_server(&model, port, benchmark).await;
+            #[cfg(not(feature = "llama-ffi"))]
+            {
+                eprintln!("❌ Server mode requires llama.cpp FFI. Build with: cargo build --features llama-ffi");
+                std::process::exit(1);
+            }
         }
         Some(Commands::Generate { model, prompt, max_tokens, temperature, threads, ctx_size, gpu_layers }) => {
+            #[cfg(feature = "llama-ffi")]
             cmd_generate(&model, &prompt, max_tokens, temperature, threads, ctx_size, gpu_layers);
+            #[cfg(not(feature = "llama-ffi"))]
+            cmd_generate_native(&model, &prompt, max_tokens, temperature);
         }
         Some(Commands::Chat { model, system, max_tokens, temperature, threads, ctx_size, gpu_layers }) => {
+            #[cfg(feature = "llama-ffi")]
             cmd_chat(&model, &system, max_tokens, temperature, threads, ctx_size, gpu_layers);
+            #[cfg(not(feature = "llama-ffi"))]
+            {
+                eprintln!("❌ Chat mode requires llama.cpp FFI. Build with: cargo build --features llama-ffi");
+                eprintln!("   (Native engine generate is available via: leafcutter generate --model PATH --prompt \"...\")");
+                std::process::exit(1);
+            }
         }
         Some(Commands::ListModels { dir }) => {
             cmd_list_models(&dir);
         }
         None => {
-            // Default to server mode for backward compatibility
+            #[cfg(feature = "llama-ffi")]
             run_server(
                 "/home/xander/Documents/portfolio/AI Models/Qwen3.5-9B-IQ4_NL.gguf",
                 8081,
                 false,
             ).await;
+            #[cfg(not(feature = "llama-ffi"))]
+            {
+                eprintln!("Usage: leafcutter <COMMAND>");
+                eprintln!("Commands: generate, list-models");
+                eprintln!("Server/chat require: cargo build --features llama-ffi");
+                std::process::exit(1);
+            }
         }
     }
 }
 
-// ─── Server Mode ─────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// llama-ffi enabled paths
+// ═════════════════════════════════════════════════════════════════════════════
 
+#[cfg(feature = "llama-ffi")]
 async fn run_server(model_path: &str, port: u16, benchmark: bool) {
     println!("🌿 LeafcutterLLM v0.9.0 (FFI Server Mode)");
     println!("   Model: {}", model_path);
@@ -180,6 +206,7 @@ async fn run_server(model_path: &str, port: u16, benchmark: bool) {
     leafcutter::api::run_server(engine, port).await;
 }
 
+#[cfg(feature = "llama-ffi")]
 fn run_ffi_benchmark(engine: &Arc<FfiEngine>) {
     use std::time::Instant;
 
@@ -194,8 +221,7 @@ fn run_ffi_benchmark(engine: &Arc<FfiEngine>) {
     println!("Throughput: {:.2} tok/sec", tok_per_sec);
 }
 
-// ─── Generate Mode (FFI) ─────────────────────────────────────────────────────
-
+#[cfg(feature = "llama-ffi")]
 fn cmd_generate(
     model_path: &PathBuf,
     prompt: &str,
@@ -240,8 +266,7 @@ fn cmd_generate(
     backend_free();
 }
 
-// ─── Chat Mode (FFI) ─────────────────────────────────────────────────────────
-
+#[cfg(feature = "llama-ffi")]
 fn cmd_chat(
     model_path: &PathBuf,
     system: &str,
@@ -338,7 +363,55 @@ fn cmd_chat(
     backend_free();
 }
 
-// ─── List Models ─────────────────────────────────────────────────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// Native engine fallback (no llama-ffi)
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[cfg(not(feature = "llama-ffi"))]
+fn cmd_generate_native(
+    model_path: &PathBuf,
+    prompt: &str,
+    max_tokens: usize,
+    temperature: f32,
+) {
+    use leafcutter::tokenizer::Tokenizer;
+    use leafcutter::inference::engine::Engine;
+
+    eprintln!("🌿 LeafcutterLLM Native Engine (no llama.cpp FFI)");
+    eprintln!("   Model: {}", model_path.display());
+
+    let mut engine = match Engine::load(model_path.to_str().unwrap()) {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("❌ Failed to load model: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let tok = Tokenizer::from_file("tests/tokenizer_llama.json")
+        .unwrap_or_else(|_| {
+            eprintln!("⚠️  tokenizer_llama.json not found, using byte fallback");
+            Tokenizer::from_file("tests/tokenizer.json").unwrap_or_else(|_| {
+                eprintln!("❌ No tokenizer found. Place tests/tokenizer_llama.json or tests/tokenizer.json");
+                std::process::exit(1);
+            })
+        });
+
+    let prompt_text = tok.apply_chat_template(prompt);
+    let tokens = tok.encode(&prompt_text);
+    eprintln!("📝 Prompt tokens: {}", tokens.len());
+
+    let info = engine.info();
+    eprintln!("   Arch: {}  Layers: {}  Hidden: {}", info.architecture, info.total_layers, info.hidden_size);
+
+    let generated = engine.generate(&tokens, max_tokens, temperature, 0.9);
+    let text = tok.decode(&generated, false);
+    println!("{}", text);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Shared helpers
+// ═════════════════════════════════════════════════════════════════════════════
 
 fn cmd_list_models(dir: &PathBuf) {
     let dir_str = dir.to_string_lossy().to_string();

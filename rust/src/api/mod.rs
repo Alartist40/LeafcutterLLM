@@ -1,5 +1,9 @@
 //! HTTP API server using Axum — Direct llama.cpp FFI backend
 //!
+//! Only compiled when the `llama-ffi` feature is enabled.
+
+#![cfg(feature = "llama-ffi")]
+//!
 //! Uses the existing `llama_ffi` module (already built and tested).
 //! The server returns decoded text so clients don't need their own tokenizer.
 //!

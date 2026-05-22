@@ -87,6 +87,7 @@ hex = "0.4.3"
 [features]
 default = []
 openblas = []
+llama-ffi = []
 
 [dev-dependencies]
 tokio-test = "0.4"
