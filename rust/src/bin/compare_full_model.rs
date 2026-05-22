@@ -33,7 +33,7 @@ fn print_stats(name: &str, data: &[f32]) {
     let max = finite.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mean = if !finite.is_empty() { finite.iter().sum::<f32>() / finite.len() as f32 } else { f32::NAN };
     let zeros = data.iter().filter(|&&v| v == 0.0).count();
-    eprintln!("  {:30s} min={:12.6} max={:12.6} mean={:12.6} zeros={:6}/{} all_nan={}",
+    eprintln!("  {:30} min={:12.6} max={:12.6} mean={:12.6} zeros={:6}/{} all_nan={}",
         name, min, max, mean, zeros, data.len(), all_nan);
 }
 
@@ -41,7 +41,7 @@ fn print_stats(name: &str, data: &[f32]) {
 /// Falls back to byte-level if vocab not available.
 fn tokenize_prompt(prompt: &str, gguf_file: &leafcutter::model::gguf::GGUFile) -> Vec<usize> {
     let vocab_tokens: Vec<String> = gguf_file.metadata.iter()
-        .find(|(k, _)| k == "tokenizer.ggml.tokens")
+        .find(|(k, _)| *k == "tokenizer.ggml.tokens")
         .and_then(|(_, v)| {
             if let leafcutter::model::gguf::GGUFValue::Array(arr) = v {
                 Some(arr.iter().filter_map(|item| {
@@ -214,7 +214,7 @@ fn main() {
             x = leafcutter::inference::engine::Engine::ffn_forward(&x, &weights);
         }
 
-        let name = format!("layer_{:02d}_output", layer_idx);
+        let name = format!("layer_{:02}_output", layer_idx);
         print_stats(&name, &x.data);
         dump_tensor(&format!("{}.bin", name), &x.data, &output_dir);
     }
