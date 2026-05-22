@@ -1,5 +1,5 @@
-# Binaries
-bin/
+# Binaries (root only — don't ignore rust/src/bin/ which contains source)
+/bin/
 leafcutter-server
 atta
 benchmark
