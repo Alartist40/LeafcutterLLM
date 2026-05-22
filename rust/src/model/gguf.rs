@@ -138,6 +138,9 @@ impl GGUFile {
     pub fn get_tensor_row_f32(&self, name: &str, row_idx: usize) -> Option<Vec<f32>> {
         let info = self.get_tensor_info(name)?;
         let qtype = QuantType::from_u32(info.typ)?;
+        // GGUF stores 2D weight matrices as [inner_dim, outer_dim].
+        // Each "row" we read is a contiguous chunk of inner_dim elements,
+        // and there are outer_dim such rows.
         let cols = info.dimensions[0] as usize;
         let rows = info.dimensions.get(1).copied().unwrap_or(1) as usize;
         if row_idx >= rows {

@@ -12,8 +12,8 @@ use half::f16;
 /// Non-linear lookup table for IQ4_NL.
 /// Source: llama.cpp ggml-common.h
 const IQ4NL_TABLE: [f32; 16] = [
-    -1.0, -0.6962, -0.5251, -0.3952, -0.2893, -0.1957, -0.1107, -0.0322,
-     0.0322,  0.1107,  0.1957,  0.2893,  0.3952,  0.5251,  0.6962,  1.0,
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+       1.0,   13.0,  25.0,  38.0,  53.0,  69.0,  89.0, 113.0,
 ];
 
 /// One IQ4_NL quantization block.
@@ -109,9 +109,9 @@ mod tests {
         let mut out = [0.0f32; 32];
         block.dequantize(&mut out);
 
-        // nibble0 (low) = 15 → table[15] = 1.0, value = 0.5 * 1.0 = 0.5
-        assert!((out[0] - 0.5).abs() < 1e-3, "out[0] = {}", out[0]);
-        // nibble1 (high) = 0 → table[0] = -1.0, value = 0.5 * -1.0 = -0.5
-        assert!((out[1] - (-0.5)).abs() < 1e-3, "out[1] = {}", out[1]);
+        // nibble0 (low) = 15 → table[15] = 113.0, value = 0.5 * 113.0 = 56.5
+        assert!((out[0] - 56.5).abs() < 1e-3, "out[0] = {}", out[0]);
+        // nibble1 (high) = 0 → table[0] = -127.0, value = 0.5 * -127.0 = -63.5
+        assert!((out[1] - (-63.5)).abs() < 1e-3, "out[1] = {}", out[1]);
     }
 }

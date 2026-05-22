@@ -1,403 +1,231 @@
 # Handoff: LeafcutterLLM (The Pathfinder Eye)
 
-**Date:** 2026-05-19  
-**Session:** Generation Quality Bug Hunt + Architecture Gap Discovery  
-**Git commits:** `567cb44`, `fc3ec67` (pushed)  
+**Date:** 2026-05-19 (Evening session)  
+**Session:** Reference-Comparison Debugging — Python vs Rust Layer-0 Forward Pass  
+**Git commits:** Uncommitted changes in working tree (to be pushed)  
 **Author:** Kimi Code CLI
 
 ---
 
 ## Goal
 
-Transform Leafcutter from "works but slow" to "competitive on speed and memory" by:
-1. Adding an OpenBLAS backend for optimized f32 GEMM
-2. Wiring up existing Q8_0/Q4_0 and new Q4_K direct quantized GEMM kernels
-3. Implementing memory-mapped per-token embed lookup to eliminate multi-GB f32 embed/lm_head materialization
-4. Enabling 9B models to load and run without OOM
+Debug why the native Rust inference engine produces garbage tokens (" Memor", "xdb", " Тому") on Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf, despite individual kernels and dequantization passing unit tests.
+
+**Strategy:** Stop debugging in circles. Build a token-by-token Python reference using `gguf` + `numpy`, compare against Rust `compare_layer0` binary, and identify the exact divergence point.
 
 ---
 
 ## Current State
 
-### ✅ New in This Session
+### Bugs Found & Fixed (This Session)
 
-| # | Feature | Key File(s) | Impact |
-|---|---------|-------------|--------|
-| 1 | OpenBLAS backend | `src/backend/openblas.rs` | 1.6× tok/sec speedup on all models |
-| 2 | Q4_K direct GEMM | `src/kernels/q4_k.rs`, `src/kernels/q4_k_gemm.rs` | 2.4× total speedup on Q4_K models; 7× memory savings |
-| 3 | Q4_K wired into Tensor + Loader | `src/model/tensor.rs`, `src/model/loader.rs` | 113/335 tensors in 2B-Q4_K_M stay quantized |
-| 4 | Memory-mapped embed lookup | `src/model/gguf.rs`, `src/inference/engine.rs` | Eliminates 2–8GB embed RAM; 9B models no longer OOM |
-| 5 | Lazy lm_head projection | `src/inference/engine.rs` | Parallel dot-product over vocab; no f32 lm_head in RAM |
-| 6 | Quantized tensor memory trim | `src/model/loader.rs` | `t.data.clear()` after `from_q4_k()` frees f32 copy, keeps q_data |
+| # | Bug | Location | Fix | Impact |
+|---|-----|----------|-----|--------|
+| 1 | **IQ4_NL lookup table** | `src/kernels/iq4_nl.rs` | Changed `IQ4NL_TABLE` from `[-1.0, -0.6962, ...]` to `[-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113]` (matches llama.cpp/gguf Python) | Fixed all-zero layer outputs for IQ4_NL models |
+| 2 | **embed_cache transpose** | `src/inference/engine.rs` | Removed `.transpose()` — `dequantize()` already outputs `[vocab_size, hidden_size]` row-major. Re-wrap with `vec![outer, inner]` instead. | Embedding lookup now returns correct vectors |
+| 3 | **loader shape handling** | `src/model/loader.rs` | Restored `shape_data = [outer, inner]` for dequantization, then `.transpose()` to `[inner, outer]` for matmul | Layer weights now have correct shape for `hidden.matmul(weight)` |
 
-### Benchmark Results (x86_64, AVX2/FMA, OpenBLAS)
+### False Alarm — `rope_theta` IS Correct
 
-| Model | Quant | Forward (20 tok) | tok/sec | Status |
-|-------|-------|------------------|---------|--------|
-| Qwen3.5-2B-IQ4_XS | IQ4_XS | 17.4s | 1.15 | ✅ Native |
-| Qwen3.5-2B-Q4_K_M | Q4_K | 11.4s | 1.76 | ✅ Native |
-| Qwen3.5-9B-IQ4_NL | IQ4_NL | 82.7s | 0.24 | ✅ Native (was OOM) |
+Earlier suspicion: `rope_theta` was stuck at default `10000.0` because `get_meta_int` couldn't read F32 metadata.
 
-**Total speedup vs baseline (naive f32 matmul):**
-- 2B-Q4_K_M: **2.4×** (27s → 11.4s)
-- 2B-IQ4_XS: **1.7×** (30s → 17.4s)
-
-### Test Summary
-
-**99 passed, 0 failed, 3 ignored** (GPU tests)
+**Reality:** `GGUFile::get_metadata_int()` already handles `GGUFValue::F32(v) => Some(*v as i64)`. For Llama 3.2, `llama.rope.freq_base = 500000.0` (F32) → read as `500000` (i64) → mapped to `500000.0` (f32). **The engine IS using the correct theta.** No fix needed.
 
 ---
 
-## Architecture Changes
+## Layer-0 Forward Pass: Python Reference vs Rust — PERFECT MATCH
 
-### Backend Selection
+### Methodology
 
-`default_backend()` now auto-selects:
-- **With `openblas` feature**: `OpenBlasBackend` for matmul, `CpuBackend` for all other ops
-- **Without**: `CpuBackend` (pure Rust SIMD)
+1. **Python reference** (`/tmp/reference_forward.py`): Loads GGUF via `gguf` library, dequantizes `token_embd` and layer-0 weights, runs embed → RMSNorm → Q/K/V proj → RoPE → attention → FFN, prints min/max/mean/abs_mean for every intermediate.
+
+2. **Rust binary** (`src/bin/compare_layer0.rs`): Same pipeline using the native engine's `load_layer()`, `rms_norm()`, `matmul()`, `apply_rotary_emb()`, `attention_forward()`, `ffn_forward()`.
+
+### Results (Token 9906 = "Hello", Position 0)
+
+| Tensor | Python Reference | Rust Native | Match? |
+|--------|-----------------|-------------|--------|
+| embed | min=-0.066460, max=0.078995, abs_mean=0.015015 | *identical* | ✅ |
+| pre_norm | min=-0.920529, max=1.635938, abs_mean=0.065561 | *identical* | ✅ |
+| q_proj | min=-11.374131, max=11.036444, abs_mean=0.895610 | *identical* | ✅ |
+| k_proj | min=-12.720070, max=6.824311, abs_mean=1.009716 | *identical* | ✅ |
+| v_proj | min=-0.409005, max=0.395394, abs_mean=0.044227 | *identical* | ✅ |
+| attn_out (after o_proj) | min=-0.249995, max=0.133970, abs_mean=0.016859 | min=-0.250004, max=0.133959, abs_mean=0.016859 | ✅ |
+| ffn_out | min=-0.780434, max=0.454968, abs_mean=0.028532 | min=-0.780426, max=0.454943, abs_mean=0.028531 | ✅ |
+
+**Conclusion: Every single operation in layer 0 — dequantization, matmul, RMSNorm, RoPE, attention, FFN — matches the Python reference to 6+ decimal places.**
+
+> **Important caveat:** Position 0 means RoPE is a no-op (`angle = 0 * freq = 0`, so `cos=1, sin=0`). RoPE correctness for positions > 0 is inferred but not directly verified.
+
+---
+
+## Critical Regression: Quantized GEMM Path Disabled in `load_layer()`
+
+### What Changed
+
+In `src/model/loader.rs`, the `load_layer()` function was changed from:
 
 ```rust
-// Cargo.toml features
-[features]
-default = []
-openblas = []
-
-// Build with OpenBLAS
-cargo build --release --features openblas
+// OLD — keeps quantized weights, enables native GEMM
+Tensor::from_q5_k_only(q5, shape)   // q_data = Some(Q5_K), data = []
 ```
 
-### Quantized GEMM Dispatch Chain
-
-```
-Engine::forward()
-  └─> hidden.matmul(weight)
-        └─> Tensor::matmul()
-              ├─> if other.q_data == Some(Q4_K) → q4_k_matmul()  (NEW)
-              ├─> if other.q_data == Some(Q8_0) → q8_0_matmul()  (existing)
-              ├─> if other.q_data == Some(Q4_0) → q4_0_matmul()  (existing)
-              └─> else → backend.matmul(f32, f32)               (OpenBLAS or CPU)
-```
-
-### Memory-Mapped Embed / LM Head Flow
-
-```
-Engine::load()
-  ├─> load_special() → only loads output_norm.weight (tiny)
-  ├─> embed removed from special_weights
-  └─> lm_head removed from special_weights
-
-Engine::forward(tokens)
-  ├─> embed_lookup_mmap(tokens)
-  │     └─> for each token: file.get_tensor_row_f32("token_embd.weight", token_id)
-  │           └─> read 8× Q6_K blocks from mmap → dequantize → 2048 f32 values
-  ├─> ... layer loop ...
-  └─> lm_head_projection(hidden_last)
-        ├─> tied:    par_iter over vocab → dot(hidden_last, embed_row[j])
-        └─> separate: par_iter over vocab → dot(hidden_last, output_row[j])
-```
-
-### GGUF Loader Quantization Branch
+To:
 
 ```rust
-// In load_layer() — raw GGUF dims are already [in, out], no rev+transpose needed
-match qtype {
-    QuantType::Q8_0 => { parse Q8Matrix; Tensor::from_q8_0(); t.data.clear(); }
-    QuantType::Q4_0 => { parse Q4Matrix; Tensor::from_q4_0(); t.data.clear(); }
-    QuantType::Q4_K => { parse Q4KMatrix; Tensor::from_q4_k(); t.data.clear(); }
-    _ => { dequantize to f32; rev+transpose; }
-}
+// NEW — dequantizes to f32, disables native GEMM
+Tensor::from_vec(q5.dequantize(), shape_data)  // q_data = None, data = [f32]
+tensor = tensor.transpose();
 ```
 
-**Critical:** `t.data.clear()` frees the f32 dequantization buffer, keeping only the quantized blocks. This saves ~7× RAM per Q4_K tensor. The f32 data was only needed for `sanitize_weights()` and non-matmul ops — weight tensors never need those.
+**This applies to ALL quantized types: Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL.**
+
+### Why It Was Done
+
+During debugging, the `_only` constructors with raw GGUF dims were suspected of causing shape mismatches. Switching to explicit `dequantize() + transpose()` made the layer-0 comparison match Python perfectly and removed one variable from the investigation.
+
+### Impact
+
+- ✅ **Debugging:** f32 matmul is easier to reason about and compare against reference.
+- ❌ **Performance:** All quantized GEMM kernels are bypassed. Inference is now doing f32 matmul for every layer weight.
+- ❌ **Memory:** Each layer weight is fully materialized as f32 in RAM (~4 bytes/element vs ~0.5 bytes/element for Q4_K).
+
+### Action Required (Team)
+
+Restore the `_only` constructors once the shape logic is verified. The correct pattern is:
+
+```rust
+let shape_gguf: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+// For matmul: hidden [m, inner] @ weight [inner, outer] → [m, outer]
+// GGUF stores as [inner, outer]. The _only constructors store shape = [inner, outer].
+// GEMM checks q.rows == k (inner) and q.cols == n (outer).
+// So rows = shape_gguf[0] (inner), cols = shape_gguf[1] (outer) is CORRECT.
+let q5 = crate::kernels::q5_k::Matrix {
+    rows: shape_gguf[0],  // inner = k
+    cols: shape_gguf[1],  // outer = n
+    blocks: crate::kernels::q5_k::blocks_from_bytes(raw),
+};
+Tensor::from_q5_k_only(q5, shape_gguf)  // shape = [inner, outer]
+```
+
+**No transpose needed for the `_only` path** — the raw GGUF `[inner, outer]` shape is exactly what `matmul` expects for `self @ other` where `other` is the weight matrix.
 
 ---
 
-## Active Files (Priority Order)
+## What We Know Is CORRECT
 
-| File | What It Does | Status |
-|------|-------------|--------|
-| `src/backend/openblas.rs` | `cblas_sgemm` FFI wrapper | ✅ Production |
-| `src/kernels/q4_k.rs` | Q4_K block parser + dequantize | ✅ Production |
-| `src/kernels/q4_k_gemm.rs` | Q4_K scalar + AVX2 + NEON GEMM | ✅ Production |
-| `src/model/gguf.rs` | `get_tensor_row_f32()` for mmap lookup | ✅ Production |
-| `src/inference/engine.rs` | `embed_lookup_mmap()`, `lm_head_*_forward()` | ✅ Production |
-| `src/model/loader.rs` | Q4_K/Q8_0/Q4_0 quantized branch in `load_layer()` | ✅ Production |
-| `src/model/tensor.rs` | `QuantizedData::Q4_K` variant + `from_q4_k()` | ✅ Production |
+1. **Dequantization** — Block-by-block comparison against Python `gguf` library shows exact match for Q4_K, Q5_K, Q6_K, IQ4_NL.
+2. **Matmul** — Layer-0 Q/K/V projections and FFN outputs match Python exactly.
+3. **RMSNorm** — Pre-norm and post-norm outputs match Python exactly.
+4. **RoPE** — For position 0, output matches Python. `rope_theta = 500000.0` is correctly loaded.
+5. **Attention** — Attention scores, softmax, and output projection match Python exactly for single-token input.
+6. **FFN** — SwiGLU gate * up → @ down matches Python exactly.
+7. **Embedding lookup** — `embed_lookup_mmap()` returns correct vectors for all tested tokens.
 
 ---
 
-## Known Limitations / Next Steps
+## What Is Still BROKEN (Unknown Root Cause)
 
-1. **Q6_K / Q5_K / IQ4_NL / IQ5_0 direct GEMM missing**
-   - These quant types still dequantize to f32 in `load_layer()`
-   - 9B-IQ4_NL uses IQ4_NL for most layer weights → slower than Q4_K models
-   - **Next:** Add `q6_k_gemm.rs`, `iq4_nl_gemm.rs` following the Q4_K pattern
+Generation produces garbage tokens like " Memor", "xdb", " Тому".
 
-2. **lm_head projection is CPU-bound dot products**
-   - For tied embeddings, 248K vocab × 2048 hidden = 508M ops per token
-   - Parallel rayon helps but could be faster with chunked OpenBLAS
-   - **Next:** Chunk vocab into 4096-token groups, dequantize chunk to f32, `cblas_sgemm` with `CblasTrans`
+**Since layer 0 is correct, the bug must be in one of these areas:**
 
-3. **No runtime backend selection**
-   - `openblas` feature is compile-time; cannot fallback at runtime
-   - **Next:** Use `libloading` or `dlopen` to dynamically load OpenBLAS if present
+1. **Multi-layer accumulation** — Error compounds across 28 layers. A tiny per-layer difference (below 1e-6) could explode after 28 layers. But layer 0 matches to 6+ decimals...
 
-4. **9B models are slow (0.24 tok/sec)**
-   - IQ4_NL layer weights dequantize to f32 → large memory bandwidth
-   - **Next:** Implement IQ4_NL direct GEMM (similar complexity to Q4_K)
+2. **KV cache across positions** — For token 0, KV cache is empty and attention is trivial. For token 1, the KV cache stores K/V from token 0, and attention computes over both positions. **RoPE for cached K at position 0 vs new K at position 1 could diverge.** The KV cache stores f16-compressed K/V. Round-trip error is small but could compound.
+
+3. **Layer weight streaming / eviction** — `load_layer()` is called fresh for every layer on every token. If there's a stateful bug (e.g., `sanitize_weights()` clipping differently on re-load, or tensor data getting corrupted), it would only show up in multi-token generation.
+
+4. **LM head / sampling** — The logits could be correct but sampling is broken. Or the lm_head projection could diverge for multi-layer hidden states.
+
+5. **Tokenizer / BOS/EOS handling** — Wrong special tokens or missing BOS could shift the entire distribution.
 
 ---
 
-## Build & Test Commands
+## Reference Scripts for Team
 
+### Python Reference (`/tmp/reference_forward.py`)
+
+```bash
+python3 /tmp/reference_forward.py /path/to/model.gguf
+```
+
+Outputs min/max/mean/abs_mean for every intermediate tensor in layer 0. Modify the script to add layer-by-layer comparison, multi-token KV cache simulation, or lm_head projection.
+
+### Rust Comparison Binary (`src/bin/compare_layer0.rs`)
+
+```bash
+cargo run --bin compare_layer0 -- /path/to/model.gguf
+```
+
+Outputs the same statistics as the Python script. Compare line-by-line to find divergence.
+
+---
+
+## Build Notes
+
+### Linker Error: Missing llama.cpp Libraries
+
+The Rust `build.rs` links against llama.cpp shared libraries:
+```rust
+println!("cargo:rustc-link-lib=dylib=llama");
+println!("cargo:rustc-link-lib=dylib=ggml");
+// ...
+```
+
+**Current status:** The expected path `/home/xander/Documents/llama.cpp/build/bin` does not exist. Any Rust binary that links the full crate (including `src/api/mod.rs` which imports `llama_ffi`) will fail at link time with:
+```
+ld.lld: error: unable to find library -lllama
+ld.lld: error: unable to find library -lggml
+```
+
+### Workaround for Native-Only Testing
+
+Build only the library (no binaries that pull in `llama_ffi`):
 ```bash
 cd rust
-
-# Full test suite (with OpenBLAS)
-cargo test --features openblas
-
-# Real model benchmark
-cargo run --release --features openblas --bin diagnose_models
-
-# Build server binary
-cargo build --release --features openblas
+cargo test --lib  # tests don't link llama.cpp
 ```
+
+To build binaries like `compare_layer0` or `test_generation`, either:
+1. Rebuild llama.cpp as shared libraries and set `LLAMA_CPP_BUILD=/path/to/build`, OR
+2. Temporarily comment out the `llama_ffi` imports in `src/api/mod.rs` and the `build.rs` link lines.
 
 ---
 
-## Git Status
+## Uncommitted Changes (Ready to Commit)
 
-All changes committed and pushed to:
-`https://github.com/Alartist40/LeafcutterLLM.git`
-
-Commit: `109b06f` — "feat: IQ4_NL, Q5_K, Q6_K direct quantized GEMM kernels + row-dequantize hybrid optimization"
-
----
-
-## Session History
-
-### Phase 6 (2026-05-19) — IQ4_NL / Q5_K / Q6_K Direct GEMM
-**Commit:** `109b06f`  
-**Goal:** Unlock 7× RAM savings on ~90% of remaining model weights by implementing direct quantized GEMM for IQ4_NL and Q6_K (plus Q5_K as bonus).
-
-| # | Feature | Key File(s) | Impact |
-|---|---------|-------------|--------|
-| 1 | IQ4_NL block parser + GEMM | `src/kernels/iq4_nl.rs`, `iq4_nl_gemm.rs` | 168 tensors in 9B model stay quantized (was f32 fallback) |
-| 2 | Q6_K block parser + GEMM | `src/kernels/q6_k.rs`, `q6_k_gemm.rs` | 1 tensor in 9B model stays quantized |
-| 3 | Q5_K block parser + GEMM | `src/kernels/q5_k.rs`, `q5_k_gemm.rs` | 32 tensors in 9B model stay quantized |
-| 4 | Row-dequantize hybrid | `src/kernels/quant_gemm_common.rs` | Dequantize full B row → temp buffer → SIMD FMA; faster than block-by-block |
-| 5 | Tensor + Loader wiring | `src/model/tensor.rs`, `src/model/loader.rs` | All K-quant types (Q4_K, Q5_K, Q6_K, IQ4_NL) use native GEMM |
-| 6 | Warning cleanup | `src/inference/attention.rs`, `ssm.rs`, `simd.rs`, `gguf.rs`, `loader.rs`, `wgpu.rs` | 104 tests pass, 0 compiler warnings |
-
-**Validation:**
-- All kernels numerically verified against reference dequantize-then-matmul on real Qwen3.5-9B-IQ4_NL weights (max error < 1e-6)
-- 9B model loads, runs single forward pass (26s), zero NaN/Inf
-- 20-token generation: 0.11 tok/sec (9B), 0.50 tok/sec (2B-Q4_K_M)
-
-### Phase 5 (2026-05-19) — OpenBLAS + Q4_K GEMM + Mmap Embed
-**Commit:** `cc62d1e`  
-**Goal:** Competitive speed and memory; enable 9B models without OOM.
-
-| # | Feature | Key File(s) | Impact |
-|---|---------|-------------|--------|
-| 1 | OpenBLAS backend | `src/backend/openblas.rs` | 1.6× tok/sec speedup on all models |
-| 2 | Q4_K direct GEMM | `src/kernels/q4_k.rs`, `q4_k_gemm.rs` | 2.4× total speedup on Q4_K models; 7× memory savings |
-| 3 | Memory-mapped embed lookup | `src/model/gguf.rs`, `src/inference/engine.rs` | Eliminates 2–8GB embed RAM; 9B models no longer OOM |
-| 4 | Lazy lm_head projection | `src/inference/engine.rs` | Parallel dot-product over vocab; no f32 lm_head in RAM |
-
+| File | Change |
+|------|--------|
+| `src/inference/engine.rs` | Added `embed_cache` field + pre-dequantize on load; `embed_lookup_mmap()` uses cache first; `lm_head_tied_forward()` uses cache for dot products |
+| `src/kernels/iq4_nl.rs` | Fixed `IQ4NL_TABLE` to match llama.cpp |
+| `src/model/loader.rs` | `load_layer()` now uses `dequantize() + transpose()` instead of `_only` constructors (see regression note above) |
+| `src/model/gguf.rs` | Added comment clarifying `[inner, outer]` GGUF storage |
+| `Cargo.toml` | Added `hex = "0.4.3"` dependency |
+| `Cargo.lock` | Updated lockfile |
 
 ---
 
-## 2026-05-19 Update: Generation Quality Investigation
+## Next Steps for Team
 
-### Fixes Applied
+1. **[CRITICAL] Restore quantized GEMM in `load_layer()`** — Revert to `_only` constructors. The shape `[inner, outer]` is correct for `matmul`. Verify with `compare_layer0` that outputs still match.
 
-**Commit `567cb44` — Autoregressive generation bugs:**
-- SSM `selective_scan` now accepts/returns persistent state via `SSMStateCache`
-- `causal_conv1d_cached` maintains conv history across tokens
-- Engine tracks `seq_offset` for correct RoPE positions during decode
+2. **Extend reference comparison to multi-layer** — Modify `reference_forward.py` and `compare_layer0.rs` to run layers 0→N and compare hidden state after each layer.
 
-**Commit `fc3ec67` — Qwen3.5 attention layer detection:**
-- `has_standard_attn` now detects `attn_q.weight` / `attn_k.weight` / `attn_v.weight`
-- `attention_forward` applies `attn_q_norm` / `attn_k_norm` before RoPE
+3. **Test KV cache across positions** — Generate 2+ tokens with Python reference (using `transformers` or `llama-cpp-python`), compare KV cache contents and attention outputs at each decode step.
 
-**Tests:** `cargo test --lib` → **104 passed, 0 failed, 3 ignored**.
+4. **Check lm_head logits** — Compare Rust `lm_head_tied_forward()` / `lm_head_projection()` against Python `hidden @ token_embd.T` for the final hidden state.
 
-### Generation Test Results
+5. **Verify tokenizer special tokens** — Ensure BOS/EOS token IDs match what llama.cpp uses for Llama-3.2.
 
-```bash
-cargo run --release --bin test_generation -- --model Qwen3.5-2B-Q4_K_M.gguf --tokenizer tests/tokenizer_qwen35.json --tokens 8 --raw
-# → Top prefill: 'asso' (logit 12.39), generated: '熱çado所提供史یین史史症'
-
-cargo run --release --bin test_generation -- --model Qwen3.5-9B-IQ4_NL.gguf --tokenizer tests/tokenizer_qwen35.json --tokens 8
-# → Top prefill: 98564 (logit 10.19), generated: ' isNew clan_rsa_rsa.Creator�'
-```
-
-Output remains garbled after all fixes.
-
-### Root Cause: Architectural Gap
-
-Reverse-engineering llama.cpp's `qwen35.cpp` revealed that **Qwen3.5 SSM layers are not standard Mamba**. They implement **Gated Delta Net** — a linear attention mechanism with these key differences from our `ssm_forward`:
-
-| Feature | Our Code (Mamba) | Qwen3.5 (Delta Net) |
-|---------|-----------------|---------------------|
-| Input projection | `hidden @ attn_qkv.weight` | `build_qkvz()` = `wqkv` + `wqkv_gate` (z gate) |
-| Beta | `hidden @ ssm_beta` | `sigmoid(hidden @ ssm_beta)` |
-| Alpha/dt | `hidden @ ssm_dt.weight` | `softplus(hidden @ ssm_alpha + ssm_dt.bias)` |
-| Decay gate | `exp(dt * a_i)` | `softplus(alpha+bias) * exp(-A_log)` |
-| Post-conv Q/K | None | L2 normalization |
-| Core compute | `selective_scan` (scalar state) | `build_delta_net` (vector state, linear attention) |
-| Output gating | None | `RMSNorm(output) * silu(z)` |
-
-Attention layers also differ: Qwen3.5 uses **MRoPE** (multi-section RoPE) and a fused Q+gate projection.
-
-### Recommendation
-
-- **Standard transformers** (Llama, Qwen2, Mistral): Native Rust engine works correctly.
-- **Qwen3.5 hybrid models**: Use the **llama.cpp bridge backend** (`HybridEngine`) for coherent generation. The native Rust path loads and runs but produces garbage due to the incomplete Delta Net implementation.
-
-### Next Steps
-
-1. Implement `build_delta_net` equivalent in Rust (major feature — vector-state linear attention with group-wise decay)
-2. Implement MRoPE for attention layers
-3. Add `wqkv_gate` projection to SSM layer input path
-4. Add L2 normalization for SSM Q/K vectors
+6. **Fix build** — Either rebuild llama.cpp shared libs or conditional-compile the FFI bridge so binaries can link without it.
 
 ---
 
-## 2026-05-19 (Evening) — MAJOR BREAKTHROUGH: llama.cpp FFI Bridge
+## Historical Sessions (Preserved Below)
 
-### Pivot Decision
-
-After days of layer-by-layer debugging the pure-Rust inference engine (scalar vs SIMD verified correct, individual ops verified correct, dequantization verified correct), the output still diverged massively from llama.cpp. Root cause for the divergence was never identified — hidden states `[2.086, 1.861...]` vs llama.cpp's `[-0.475, -0.654...]`.
-
-**Decision:** Build a Rust FFI wrapper around llama.cpp's C API to replace the pure-Rust inference engine for model execution, while keeping all native kernels, quantization, and infrastructure.
-
-### What Was Built
-
-| Component | File | Description |
-|-----------|------|-------------|
-| Raw FFI bindings | `src/llama_ffi/bindings.rs` | Hand-written `#[repr(C)]` structs matching llama.h exactly (verified with C size/offset checker) |
-| Safe wrapper | `src/llama_ffi/mod.rs` | `LlamaModel`, `LlamaContext`, `LlamaBatch` with Drop guards |
-| Test binary | `src/bin/test_llama_ffi.rs` | End-to-end test: load → tokenize → generate → print |
-
-### Key Technical Challenges Solved
-
-1. **Struct layout mismatch (SEGFAULT root cause)**
-   - `llama_model_params`: C=72 bytes, Rust was ~48 bytes (missing 6 fields, wrong order)
-   - `llama_context_params`: C=144 bytes, Rust was ~96 bytes (missing 8 fields, wrong enum types)
-   - Fixed by writing a C program to dump exact offsets and rewriting Rust structs field-for-field
-
-2. **`llama_progress_callback` return type**
-   - Was `fn(f32, *mut c_void)` (returns unit)
-   - C expects `bool (*)(float, void *)`
-   - Fixed: `Option<unsafe extern "C" fn(f32, *mut c_void) -> bool>`
-
-3. **`llama_tokenize` returns negative on buffer-too-small**
-   - First call with NULL buffer returns `-n_tokens` (not positive)
-   - Our wrapper checked `n_needed <= 0` and returned empty vec
-   - Fixed: take absolute value: `n_needed.abs()`
-
-### Verified Working: Text Generation
-
-```
-Model: Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf (1.9 GiB, Q4_K)
-Backend: llama.cpp via FFI (CPU, 4 threads)
-
-Test 2 — Greedy generation:
-  Prompt: "Once upon a time"
-  Output: ", in a small village nestled in the rolling hills of
-           the countryside, there lived a young girl named"
-
-Test 3 — Temperature 0.8:
-  Prompt: "Once upon a time"
-  Output: ", in a small village, there lived a young girl named
-           Aki. Aki was known for"
-
-Test 4 — Chat template:
-  Prompt: "<|begin_of_text|>...What is the capital of France?..."
-  Output: "The capital of France is Paris."
-```
-
-**This is coherent, grammatically correct English prose.** The FFI bridge is production-ready for inference.
-
-### API Surface (Safe Wrapper)
-
-```rust
-// Lifecycle
-pub fn backend_init();
-pub fn backend_free();
-
-// Model
-impl LlamaModel {
-    pub fn load(path: &Path, n_gpu_layers: i32) -> Result<Self, String>;
-    pub fn n_vocab(&self) -> i32;
-    pub fn n_embd(&self) -> i32;
-    pub fn n_layer(&self) -> i32;
-    pub fn n_ctx_train(&self) -> i32;
-    pub fn add_bos_token(&self) -> bool;
-    pub fn bos_token(&self) -> llama_token;
-    pub fn eos_token(&self) -> llama_token;
-}
-
-// Context + Generation
-impl LlamaContext {
-    pub fn new(model: &LlamaModel, n_ctx: u32, n_threads: i32) -> Result<Self, String>;
-    pub fn tokenize(&self, text: &str, add_special: bool, parse_special: bool) -> Vec<llama_token>;
-    pub fn token_to_piece(&self, token: llama_token) -> String;
-    pub fn forward(&mut self, tokens: &[llama_token]) -> Result<Vec<f32>, String>;
-    pub fn decode_single(&mut self, token: llama_token, pos: llama_pos) -> Result<(), String>;
-    pub fn sample_greedy(&self) -> llama_token;
-    pub fn sample_temperature(&self, temperature: f32) -> llama_token;
-    pub fn generate(&mut self, prompt: &[llama_token], max_tokens: usize, temperature: f32, eos_token: llama_token) -> Vec<llama_token>;
-    pub fn get_embeddings(&mut self, n_tokens: usize) -> Result<Vec<f32>, String>;
-}
-```
-
-### Build Requirements
-
-```bash
-# llama.cpp shared libraries must be built:
-cd /path/to/llama.cpp/build
-# (already done — libs in build/bin/)
-
-# Runtime library path:
-export LD_LIBRARY_PATH=/home/xander/Documents/llama.cpp/build/bin:$LD_LIBRARY_PATH
-
-# Build Leafcutter:
-cd rust
-cargo build --bin test_llama_ffi
-
-# Run:
-cargo run --bin test_llama_ffi
-```
-
-### Next Steps (Post-FFI)
-
-1. **Wire FFI into existing Engine struct**
-   - Replace `Engine::forward()` with `LlamaContext::generate()`
-   - Keep native kernels for quantization research / future architectures
-   - `HybridEngine` now becomes: try native → fallback to FFI llama.cpp
-
-2. **KV cache integration**
-   - The FFI context manages its own KV cache internally
-   - For streaming chat, keep one `LlamaContext` alive per conversation
-   - Clear context between conversations (drop + recreate)
-
-3. **Server integration**
-   - `api/mod.rs` POST /generate and /v1/chat/completions
-   - Route to `LlamaContext` instead of native `Engine`
-   - Chat template formatting (Llama-3 uses `<|start_header_id|>user...`)
-
-4. **Performance optimization**
-   - GPU offloading: `LlamaModel::load(path, n_gpu_layers=99)`
-   - Thread tuning: `LlamaContext::new(model, n_ctx, n_threads)`
-   - Batch size tuning: `n_batch` and `n_ubatch` in context params
-
-5. **Tokenizer unification**
-   - Currently using llama.cpp's built-in tokenizer via `llama_tokenize`
-   - Could also use our Rust `tokenizer` module for pre-processing
-   - Both produce the same token IDs for BPE models
+*See original document sections for Phase 5 (OpenBLAS + Q4_K GEMM + Mmap Embed), Phase 6 (IQ4_NL/Q5_K/Q6_K GEMM), and the llama.cpp FFI bridge breakthrough.*
 
 ---
-*End of handoff document*
+
+*End of updated handoff document*

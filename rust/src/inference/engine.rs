@@ -35,6 +35,10 @@ pub struct Engine {
     /// Current sequence position offset for RoPE. Tracks total tokens processed
     /// across forward calls within a generation session.
     pub seq_offset: usize,
+    /// Cached dequantized embedding matrix [vocab_size, hidden_size].
+    /// GGUF token_embd.weight has shape [hidden_size, vocab_size] in row-major.
+    /// We transpose to [vocab_size, hidden_size] so token lookup is a simple row read.
+    pub embed_cache: Option<Tensor>,
 }
 
 impl Engine {
@@ -121,6 +125,30 @@ impl Engine {
         special_weights.remove("lm_head.weight");
         let lm_head_tied = !model.file.get_tensor_info("output.weight").is_some();
 
+        // Pre-dequantize embedding matrix for fast lookup.
+        // GGUF stores 2D tensors as [inner, outer]; the dequantized flat data is in
+        // [outer, inner] order (outer chunks of inner elements).  We just need to
+        // fix the Tensor shape metadata — no transpose needed.
+        let embed_cache = if let (Some(raw), Some(info)) = (
+            model.file.get_tensor_raw("token_embd.weight"),
+            model.file.get_tensor_info("token_embd.weight")
+        ) {
+            let shape_gguf: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+            match crate::model::loader::GGUFModel::dequantize(raw, info.typ, shape_gguf.clone()) {
+                Ok(t) => {
+                    let outer = shape_gguf[1];
+                    let inner = shape_gguf[0];
+                    Some(Tensor::from_vec(t.data, vec![outer, inner]))
+                }
+                Err(e) => {
+                    eprintln!("⚠️ Failed to dequantize token_embd.weight: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Ok(Self {
             model,
             config,
@@ -133,6 +161,7 @@ impl Engine {
             layer_cache: HashMap::new(),
             ssm_cache: SSMStateCache::new(),
             seq_offset: 0,
+            embed_cache,
         })
     }
 
@@ -242,8 +271,11 @@ impl Engine {
         Tensor::from_vec(data, vec![tokens.len(), hidden_size])
     }
 
-    /// Lookup embeddings via memory-mapped file (per-token, no full matrix in RAM).
+    /// Lookup embeddings via cached dequantized matrix or mmap fallback.
     pub fn embed_lookup_mmap(&self, tokens: &[usize]) -> Tensor {
+        if let Some(ref embed) = self.embed_cache {
+            return self.embed_lookup(tokens, embed);
+        }
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
         let mut data = vec![0.0f32; tokens.len() * hidden_size];
@@ -259,8 +291,17 @@ impl Engine {
     /// Compute logits when lm_head is tied to embeddings.
     /// Parallelized over the vocabulary using rayon.
     fn lm_head_tied_forward(&self, hidden: &Tensor, seq_len: usize) -> Vec<f32> {
-        self.lm_head_projection(&hidden.data[(seq_len - 1) * self.config.hidden_size..seq_len * self.config.hidden_size],
-            "token_embd.weight", self.config.hidden_size, self.config.vocab_size)
+        let hidden_size = self.config.hidden_size;
+        let vocab_size = self.config.vocab_size;
+        let hidden_last = &hidden.data[(seq_len - 1) * hidden_size..seq_len * hidden_size];
+        if let Some(ref embed) = self.embed_cache {
+            return (0..vocab_size).into_par_iter().map(|token_id| {
+                let row_start = token_id * hidden_size;
+                let row = &embed.data[row_start..row_start + hidden_size];
+                hidden_last.iter().zip(row.iter()).map(|(a, b)| a * b).sum::<f32>()
+            }).collect();
+        }
+        self.lm_head_projection(hidden_last, "token_embd.weight", hidden_size, vocab_size)
     }
 
     /// Compute logits when lm_head is a separate tensor (output.weight).

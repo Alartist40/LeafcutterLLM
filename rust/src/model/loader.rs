@@ -209,71 +209,73 @@ impl GGUFModel {
                     let qtype = QuantType::from_u32(info.typ)
                         .ok_or(GGUError::InvalidTensorType(info.typ))?;
 
+                    let shape_gguf: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                    let is_2d = shape_gguf.len() == 2;
+                    // GGUF stores 2D tensors as [inner, outer]; the raw bytes are laid out
+                    // as outer chunks of inner elements.  To dequantize correctly we must
+                    // tell the Matrix that rows = outer and cols = inner, then reshape.
+                    let shape_data: Vec<usize> = if is_2d {
+                        vec![shape_gguf[1], shape_gguf[0]] // [outer, inner]
+                    } else {
+                        shape_gguf.clone()
+                    };
+
                     let mut tensor = match qtype {
-                        // Quantized weight matrices: raw GGUF dims are already [in, out]
-                        // which is the correct layout for matmul. Skip rev+transpose.
                         QuantType::Q8_0 => {
-                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
                             let q8 = crate::kernels::q8_0::Matrix {
-                                rows: shape[0],
-                                cols: shape[1],
+                                rows: shape_data[0],
+                                cols: shape_data[1],
                                 blocks: crate::kernels::q8_0::blocks_from_bytes(raw),
                             };
-                            Tensor::from_q8_0_only(q8, shape)
+                            Tensor::from_vec(q8.dequantize(), shape_data.clone())
                         }
                         QuantType::Q4_0 => {
-                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
                             let q4 = crate::kernels::q4_0::Matrix {
-                                rows: shape[0],
-                                cols: shape[1],
+                                rows: shape_data[0],
+                                cols: shape_data[1],
                                 blocks: crate::kernels::q4_0::blocks_from_bytes(raw),
                             };
-                            Tensor::from_q4_0_only(q4, shape)
+                            Tensor::from_vec(q4.dequantize(), shape_data.clone())
                         }
                         QuantType::Q4_K => {
-                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
                             let q4 = crate::kernels::q4_k::Matrix {
-                                rows: shape[0],
-                                cols: shape[1],
+                                rows: shape_data[0],
+                                cols: shape_data[1],
                                 blocks: crate::kernels::q4_k::blocks_from_bytes(raw),
                             };
-                            Tensor::from_q4_k_only(q4, shape)
+                            Tensor::from_vec(q4.dequantize(), shape_data.clone())
                         }
                         QuantType::IQ4_NL => {
-                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
                             let q4 = crate::kernels::iq4_nl::Matrix {
-                                rows: shape[0],
-                                cols: shape[1],
+                                rows: shape_data[0],
+                                cols: shape_data[1],
                                 blocks: crate::kernels::iq4_nl::blocks_from_bytes(raw),
                             };
-                            Tensor::from_iq4_nl_only(q4, shape)
+                            Tensor::from_vec(q4.dequantize(), shape_data.clone())
                         }
                         QuantType::Q5_K => {
-                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
                             let q5 = crate::kernels::q5_k::Matrix {
-                                rows: shape[0],
-                                cols: shape[1],
+                                rows: shape_data[0],
+                                cols: shape_data[1],
                                 blocks: crate::kernels::q5_k::blocks_from_bytes(raw),
                             };
-                            Tensor::from_q5_k_only(q5, shape)
+                            Tensor::from_vec(q5.dequantize(), shape_data.clone())
                         }
                         QuantType::Q6_K => {
-                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
                             let q6 = crate::kernels::q6_k::Matrix {
-                                rows: shape[0],
-                                cols: shape[1],
+                                rows: shape_data[0],
+                                cols: shape_data[1],
                                 blocks: crate::kernels::q6_k::blocks_from_bytes(raw),
                             };
-                            Tensor::from_q6_k_only(q6, shape)
+                            Tensor::from_vec(q6.dequantize(), shape_data.clone())
                         }
-                        // Non-quantized types: dequantize directly with GGUF dimensions.
-                        // GGUF stores dimensions as [in, out] for weight matrices, which is
-                        // the correct layout for matmul — no rev or transpose needed.
                         _ => {
-                            let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
-                            Self::dequantize(raw, info.typ, shape)?
+                            Self::dequantize(raw, info.typ, shape_data.clone())?
                         }
                     };
+                    if is_2d {
+                        tensor = tensor.transpose();
+                    }
                     sanitize_weights(&mut tensor);
                     weights.insert(engine_name.to_string(), tensor);
                 }

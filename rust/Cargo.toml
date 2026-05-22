@@ -82,6 +82,7 @@ ureq = { version = "2", features = ["json"] }
 which = "7.0"
 libc = "0.2"
 shellexpand = "3.1"
+hex = "0.4.3"
 
 [features]
 default = []
