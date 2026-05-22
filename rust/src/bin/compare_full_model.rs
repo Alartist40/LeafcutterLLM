@@ -98,6 +98,7 @@ fn main() {
     let mut model_path = None;
     let mut prompt = "The capital of France is";
     let mut output_dir = "/tmp/layer_dumps".to_string();
+    let mut raw_tokens: Option<Vec<usize>> = None;
 
     let mut i = 1;
     while i < args.len() {
@@ -105,6 +106,12 @@ fn main() {
             "--model" => { i += 1; model_path = args.get(i).cloned(); }
             "--prompt" => { i += 1; prompt = args.get(i).map(|s| s.as_str()).unwrap_or(prompt); }
             "--output-dir" => { i += 1; output_dir = args.get(i).unwrap_or(&output_dir).to_string(); }
+            "--tokens" => {
+                i += 1;
+                if let Some(s) = args.get(i) {
+                    raw_tokens = Some(s.split(',').filter_map(|t| t.parse().ok()).collect());
+                }
+            }
             _ => {}
         }
         i += 1;
@@ -113,7 +120,7 @@ fn main() {
     let model_path = match model_path {
         Some(p) => p,
         None => {
-            eprintln!("Usage: compare_full_model --model <path> [--prompt \"text\"] [--output-dir /tmp/dumps]");
+            eprintln!("Usage: compare_full_model --model <path> [--prompt \"text\"] [--tokens 9906] [--output-dir /tmp/dumps]");
             std::process::exit(1);
         }
     };
@@ -144,7 +151,7 @@ fn main() {
         }
     };
 
-    let token_ids = tokenize_prompt(prompt, &engine.model.file);
+    let token_ids = raw_tokens.unwrap_or_else(|| tokenize_prompt(prompt, &engine.model.file));
     eprintln!("\n[2] Prompt: '{}'", prompt);
     eprintln!("    Token IDs: {:?}", token_ids);
     eprintln!("    Token count: {}", token_ids.len());
@@ -179,39 +186,52 @@ fn main() {
         let has_ssm = weights.contains_key("ssm_out.weight")
             || weights.contains_key("ssm_alpha.weight");
 
+        // Pre-LN: save original, norm, compute, add residual to ORIGINAL
+        let residual_attn = x.clone();
+
         // Input RMSNorm
-        if let Some(ln_w) = weights.get("input_layernorm.weight")
+        let x_normed = if let Some(ln_w) = weights.get("input_layernorm.weight")
             .or_else(|| weights.get("attn_norm.weight"))
         {
-            x = x.rms_norm(ln_w, 1e-5);
-        }
+            x.rms_norm(ln_w, 1e-5)
+        } else {
+            x.clone()
+        };
 
         // Attention or SSM
-        if has_ssm {
-            x = leafcutter::inference::ssm::ssm_forward(
-                &x, &weights, &engine.ssm_config, &mut engine.ssm_cache, layer_idx
-            );
+        let attn_out = if has_ssm {
+            leafcutter::inference::ssm::ssm_forward(
+                &x_normed, &weights, &engine.ssm_config, &mut engine.ssm_cache, layer_idx
+            )
         } else if has_standard_attn || has_fused_qkv {
-            x = leafcutter::inference::attention::attention_forward(
-                &x, &weights, &engine.attn_params, &mut engine.kv_cache, layer_idx, 0
-            );
+            leafcutter::inference::attention::attention_forward(
+                &x_normed, &weights, &engine.attn_params, &mut engine.kv_cache, layer_idx, 0
+            )
         } else {
             eprintln!("    Layer {}: WARNING — unknown type", layer_idx);
             eprintln!("    Available: {:?}", weights.keys().collect::<Vec<_>>());
-        }
+            Tensor::from_vec(vec![0.0f32; x_normed.size()], x_normed.shape.clone())
+        };
+        x = residual_attn.add(&attn_out);
+
+        // Pre-LN FFN: save original, norm, compute, add residual to ORIGINAL
+        let residual_ffn = x.clone();
 
         // Post-attention RMSNorm
-        if let Some(ln_w) = weights.get("post_attention_layernorm.weight")
+        let x_normed = if let Some(ln_w) = weights.get("post_attention_layernorm.weight")
             .or_else(|| weights.get("ffn_norm.weight"))
         {
-            x = x.rms_norm(ln_w, 1e-5);
-        }
+            x.rms_norm(ln_w, 1e-5)
+        } else {
+            x.clone()
+        };
 
         // FFN
         let has_ffn = weights.contains_key("mlp.gate_proj.weight")
             || weights.contains_key("ffn_gate.weight");
         if has_ffn {
-            x = leafcutter::inference::engine::Engine::ffn_forward(&x, &weights);
+            let ffn_out = leafcutter::inference::engine::Engine::ffn_forward(&x_normed, &weights);
+            x = residual_ffn.add(&ffn_out);
         }
 
         let name = format!("layer_{:02}_output", layer_idx);
@@ -278,7 +298,7 @@ fn main() {
 
     eprintln!("  Prefill top: {}", next_token);
 
-    for step in 0..10 {
+    for step in 0..2 {
         let dec_logits = engine.forward(&[next_token]);
         engine.seq_offset += 1;
         next_token = dec_logits.iter().enumerate()

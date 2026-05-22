@@ -188,6 +188,78 @@ impl GGUFile {
         Some(out)
     }
 
+    /// Read a single row from a 2D tensor into a pre-allocated buffer.
+    /// Avoids allocating a new Vec on every call — use with a thread-local buffer
+    /// in hot loops like lm_head projection.
+    pub fn get_tensor_row_f32_into(&self, name: &str, row_idx: usize, out: &mut [f32]) -> Option<()> {
+        let info = self.get_tensor_info(name)?;
+        let qtype = QuantType::from_u32(info.typ)?;
+        let cols = info.dimensions[0] as usize;
+        let rows = info.dimensions.get(1).copied().unwrap_or(1) as usize;
+        if row_idx >= rows || out.len() < cols {
+            return None;
+        }
+
+        let block_size = qtype.block_size();
+        let block_bytes = qtype.block_bytes();
+        let blocks_per_row = (cols + block_size - 1) / block_size;
+        let row_bytes = blocks_per_row * block_bytes;
+
+        let tensor_start = (self.data_offset + info.offset) as usize;
+        let row_start = tensor_start + row_idx * row_bytes;
+        let raw = &self.mmap[row_start..row_start + row_bytes];
+
+        match qtype {
+            QuantType::F32 => {
+                for i in 0..cols {
+                    let b = [raw[i*4], raw[i*4+1], raw[i*4+2], raw[i*4+3]];
+                    out[i] = f32::from_le_bytes(b);
+                }
+            }
+            QuantType::F16 => {
+                for i in 0..cols {
+                    let b = [raw[i*2], raw[i*2+1]];
+                    out[i] = half::f16::from_le_bytes(b).to_f32();
+                }
+            }
+            QuantType::Q8_0 => crate::kernels::dequantize_q8_0(raw, &mut out[..cols]),
+            QuantType::Q4_0 => crate::kernels::dequantize_q4_0(raw, &mut out[..cols]),
+            QuantType::Q4_K => crate::kernels::dequantize_q4_k(raw, &mut out[..cols]),
+            QuantType::Q5_K => crate::kernels::dequantize_q5_k(raw, &mut out[..cols]),
+            QuantType::Q6_K => crate::kernels::dequantize_q6_k(raw, &mut out[..cols]),
+            QuantType::Q8_K => crate::kernels::dequantize_q8_k(raw, &mut out[..cols]),
+            QuantType::IQ4_NL => crate::kernels::dequantize_iq4_nl(raw, &mut out[..cols]),
+            QuantType::IQ4_XS => crate::kernels::dequantize_iq4_xs(raw, &mut out[..cols]),
+            _ => {
+                #[cfg(debug_assertions)]
+                panic!("get_tensor_row_f32_into: unsupported quant type {:?} for tensor {}", qtype, name);
+                #[cfg(not(debug_assertions))]
+                return None;
+            }
+        }
+        Some(())
+    }
+
+    /// Drop all mmap pages from the OS page cache.
+    /// Call after processing a layer to prevent RSS from growing
+    /// as the entire file gets paged in.
+    #[cfg(target_os = "linux")]
+    pub fn drop_pages_from_cache(&self) {
+        let ptr = self.mmap.as_ptr();
+        let len = self.mmap.len();
+        unsafe {
+            // MADV_DONTNEED: Linux will free these pages on next access
+            // they will be re-faulted from disk. Clean pages only — safe
+            // because we never write to the mmap.
+            libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTNEED);
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn drop_pages_from_cache(&self) {
+        // No-op on non-Linux platforms
+    }
+
     pub fn get_metadata_int(&self, key: &str) -> Option<i64> {
         match self.metadata.get(key)? {
             GGUFValue::U8(v) => Some(*v as i64),

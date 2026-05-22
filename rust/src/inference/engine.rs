@@ -14,6 +14,7 @@ use crate::inference::attention::{attention_forward, AttentionParams};
 use crate::inference::sampler::sample_top_p;
 use crate::inference::ssm::{ssm_forward, SSMConfig};
 use crate::inference::speculative::SpeculativeHead;
+use crate::tokenizer::GgufTokenizer;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
@@ -27,29 +28,18 @@ pub struct Engine {
     pub speculative_head: Option<SpeculativeHead>,
     /// Whether lm_head is tied to token embeddings (no separate output.weight tensor).
     lm_head_tied: bool,
-    /// Layer weight cache: layer_idx -> weights HashMap.
-    /// Avoids reloading layers from disk on every forward pass.
-    pub layer_cache: HashMap<usize, HashMap<String, Tensor>>,
+    /// GGUF vocab tokenizer (lazy-initialized from model metadata).
     /// SSM state cache: persistent hidden state for Mamba-style layers.
     pub ssm_cache: SSMStateCache,
     /// Current sequence position offset for RoPE. Tracks total tokens processed
     /// across forward calls within a generation session.
     pub seq_offset: usize,
-    /// Cached dequantized embedding matrix [vocab_size, hidden_size].
-    /// GGUF token_embd.weight has shape [hidden_size, vocab_size] in row-major.
-    /// We transpose to [vocab_size, hidden_size] so token lookup is a simple row read.
-    pub embed_cache: Option<Tensor>,
+    // Embedding lookup is on-demand via mmap — see embed_lookup_mmap()
 }
 
 impl Engine {
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let model = GGUFModel::load(path)?;
-
-        // Run corruption scan
-        let corruption = crate::model::loader::scan_for_corruption(&model.file);
-        if !corruption.is_clean() {
-            eprintln!("\n{}", corruption.print());
-        }
 
         // Run pre-flight capability report
         let report = model.capability_report();
@@ -125,29 +115,8 @@ impl Engine {
         special_weights.remove("lm_head.weight");
         let lm_head_tied = !model.file.get_tensor_info("output.weight").is_some();
 
-        // Pre-dequantize embedding matrix for fast lookup.
-        // GGUF stores 2D tensors as [inner, outer]; the dequantized flat data is in
-        // [outer, inner] order (outer chunks of inner elements).  We just need to
-        // fix the Tensor shape metadata — no transpose needed.
-        let embed_cache = if let (Some(raw), Some(info)) = (
-            model.file.get_tensor_raw("token_embd.weight"),
-            model.file.get_tensor_info("token_embd.weight")
-        ) {
-            let shape_gguf: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
-            match crate::model::loader::GGUFModel::dequantize(raw, info.typ, shape_gguf.clone()) {
-                Ok(t) => {
-                    let outer = shape_gguf[1];
-                    let inner = shape_gguf[0];
-                    Some(Tensor::from_vec(t.data, vec![outer, inner]))
-                }
-                Err(e) => {
-                    eprintln!("⚠️ Failed to dequantize token_embd.weight: {}", e);
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        // Embedding lookup is done on-demand via mmap per-row dequantization.
+        // Never pre-dequantize the full embedding table — it would use 1-4 GB of RAM.
 
         Ok(Self {
             model,
@@ -158,10 +127,9 @@ impl Engine {
             ssm_config,
             speculative_head,
             lm_head_tied,
-            layer_cache: HashMap::new(),
+
             ssm_cache: SSMStateCache::new(),
             seq_offset: 0,
-            embed_cache,
         })
     }
 
@@ -204,14 +172,11 @@ impl Engine {
 
         // Transformer / hybrid layers — stream one layer at a time
         for layer_idx in 0..self.config.num_hidden_layers {
-            // Load current layer
-            let weights = self.model.load_layer(layer_idx)
+            // Load current layer (dequantizes on demand, drops after use)
+            let layer_weights = self.model.load_layer(layer_idx)
                 .expect("Failed to load layer");
-            self.layer_cache.insert(layer_idx, weights);
-            let layer_weights = self.layer_cache.get(&layer_idx).unwrap();
 
             // Detect layer type from actual tensor contents (most robust)
-            // Qwen3.5 uses attn_q.weight (unfused) or self_attn.q_proj.weight (Llama-style)
             let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight")
                 || layer_weights.contains_key("attn_q.weight");
             let has_ssm = layer_weights.contains_key("ssm_out.weight")
@@ -224,12 +189,10 @@ impl Engine {
             let normed = hidden.rms_norm(pre_norm_weight, 1e-5);
 
             if has_standard_attn {
-                // Standard attention layer
-                let attn_out = attention_forward(&normed, layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
+                let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
                 hidden = hidden.add(&attn_out);
             } else if has_ssm {
-                // SSM layer (Mamba-style)
-                let ssm_out = ssm_forward(&normed, layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
+                let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
                 hidden = hidden.add(&ssm_out);
             }
 
@@ -238,11 +201,12 @@ impl Engine {
                 .or_else(|| layer_weights.get("ffn_norm.weight"))
                 .expect("Missing post-norm");
             let normed = hidden.rms_norm(post_norm_weight, 1e-5);
-            let ffn_out = Self::ffn_forward(&normed, layer_weights);
+            let ffn_out = Self::ffn_forward(&normed, &layer_weights);
             hidden = hidden.add(&ffn_out);
 
-            // Evict layer from cache — only one layer resident at a time
-            self.layer_cache.remove(&layer_idx);
+            // layer_weights goes out of scope here — memory freed immediately
+            // Drop mmap pages from OS cache so RSS stays bounded to ~1 layer
+            self.model.file.drop_pages_from_cache();
         }
 
         // Final norm
@@ -258,6 +222,78 @@ impl Engine {
         }
     }
 
+    /// Forward pass with per-layer RSS debugging.
+    pub fn forward_debug(&mut self, tokens: &[usize]) -> Vec<f32> {
+        fn read_rss_kb() -> usize {
+            if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
+                for line in status.lines() {
+                    if line.starts_with("VmRSS:") {
+                        let parts: Vec<&str> = line.split_whitespace().collect();
+                        if let Some(Ok(v)) = parts.get(1).map(|s| s.parse::<usize>()) {
+                            return v;
+                        }
+                    }
+                }
+            }
+            0
+        }
+
+        let seq_len = tokens.len();
+        let mut hidden = self.embed_lookup_mmap(tokens);
+        println!("   [embed] RSS: {} MB", read_rss_kb() / 1024);
+
+        for layer_idx in 0..self.config.num_hidden_layers {
+            let layer_weights = self.model.load_layer(layer_idx)
+                .expect("Failed to load layer");
+            let rss_after_load = read_rss_kb();
+
+            let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight")
+                || layer_weights.contains_key("attn_q.weight");
+            let has_ssm = layer_weights.contains_key("ssm_out.weight")
+                || layer_weights.contains_key("ssm_alpha.weight");
+
+            let pre_norm_weight = layer_weights.get("input_layernorm.weight")
+                .or_else(|| layer_weights.get("attn_norm.weight"))
+                .expect("Missing pre-norm");
+            let normed = hidden.rms_norm(pre_norm_weight, 1e-5);
+
+            if has_standard_attn {
+                let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
+                hidden = hidden.add(&attn_out);
+            } else if has_ssm {
+                let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
+                hidden = hidden.add(&ssm_out);
+            }
+
+            let post_norm_weight = layer_weights.get("post_attention_layernorm.weight")
+                .or_else(|| layer_weights.get("ffn_norm.weight"))
+                .expect("Missing post-norm");
+            let normed = hidden.rms_norm(post_norm_weight, 1e-5);
+            let ffn_out = Self::ffn_forward(&normed, &layer_weights);
+            hidden = hidden.add(&ffn_out);
+
+            let rss_after_layer = read_rss_kb();
+            if layer_idx < 3 || layer_idx == self.config.num_hidden_layers - 1 {
+                println!("   [layer {:>2}] after load: {:>5} MB | after compute: {:>5} MB | delta: {:>4} MB",
+                    layer_idx, rss_after_load / 1024, rss_after_layer / 1024,
+                    (rss_after_layer as i64 - rss_after_load as i64) / 1024);
+            }
+        }
+
+        let final_norm = self.special_weights.get("model.norm.weight")
+            .expect("Missing final norm");
+        hidden = hidden.rms_norm(final_norm, 1e-5);
+        println!("   [final norm] RSS: {} MB", read_rss_kb() / 1024);
+
+        let logits = if self.lm_head_tied {
+            self.lm_head_tied_forward(&hidden, seq_len)
+        } else {
+            self.lm_head_separate_forward(&hidden, seq_len)
+        };
+        println!("   [lm_head] RSS: {} MB", read_rss_kb() / 1024);
+        logits
+    }
+
     /// Legacy embed lookup from a fully-materialized tensor (for tests / compatibility).
     pub fn embed_lookup(&self, tokens: &[usize], embed: &Tensor) -> Tensor {
         let hidden_size = embed.shape[1];
@@ -271,11 +307,10 @@ impl Engine {
         Tensor::from_vec(data, vec![tokens.len(), hidden_size])
     }
 
-    /// Lookup embeddings via cached dequantized matrix or mmap fallback.
+    /// Lookup embeddings via on-demand mmap per-row dequantization.
+    /// Each token reads exactly one row from the quantized embedding table —
+    /// ~3 KB for Q4_K instead of 1.5 GB for the full f32 matrix.
     pub fn embed_lookup_mmap(&self, tokens: &[usize]) -> Tensor {
-        if let Some(ref embed) = self.embed_cache {
-            return self.embed_lookup(tokens, embed);
-        }
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
         let mut data = vec![0.0f32; tokens.len() * hidden_size];
@@ -294,13 +329,6 @@ impl Engine {
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
         let hidden_last = &hidden.data[(seq_len - 1) * hidden_size..seq_len * hidden_size];
-        if let Some(ref embed) = self.embed_cache {
-            return (0..vocab_size).into_par_iter().map(|token_id| {
-                let row_start = token_id * hidden_size;
-                let row = &embed.data[row_start..row_start + hidden_size];
-                hidden_last.iter().zip(row.iter()).map(|(a, b)| a * b).sum::<f32>()
-            }).collect();
-        }
         self.lm_head_projection(hidden_last, "token_embd.weight", hidden_size, vocab_size)
     }
 
@@ -316,13 +344,86 @@ impl Engine {
     }
 
     /// Generic lm_head projection: dot(hidden_last, embed_row) for each token.
-    fn lm_head_projection(&self, hidden_last: &[f32], tensor_name: &str, _hidden_size: usize, vocab_size: usize) -> Vec<f32> {
+    /// Uses thread-local reusable buffers to avoid 128k Vec allocations per token.
+    fn lm_head_projection(&self, hidden_last: &[f32], tensor_name: &str, hidden_size: usize, vocab_size: usize) -> Vec<f32> {
+        use rayon::prelude::*;
         let file = &self.model.file;
         (0..vocab_size).into_par_iter().map(|token_id| {
-            let row = file.get_tensor_row_f32(tensor_name, token_id)
-                .expect("lm_head row");
-            hidden_last.iter().zip(row.iter()).map(|(a, b)| a * b).sum::<f32>()
+            thread_local! {
+                static BUF: std::cell::RefCell<Vec<f32>> = std::cell::RefCell::new(Vec::new());
+            }
+            BUF.with(|buf| {
+                let mut buf = buf.borrow_mut();
+                buf.resize(hidden_size, 0.0);
+                file.get_tensor_row_f32_into(tensor_name, token_id, &mut buf)
+                    .expect("lm_head row");
+                hidden_last.iter().zip(buf.iter()).map(|(a, b)| a * b).sum::<f32>()
+            })
         }).collect()
+    }
+
+    /// Format a chat prompt based on the model's special tokens.
+    /// Auto-detects Llama-3, Qwen2.5, or plain text.
+    pub fn format_chat_prompt(&self, system: &str, user: &str) -> String {
+        let tok = self.tokenizer_from_model();
+        let has_llama3 = tok.as_ref()
+            .map(|t| t.token_to_id.contains_key("<|start_header_id|>"))
+            .unwrap_or(false);
+        let has_qwen = tok.as_ref()
+            .map(|t| t.token_to_id.contains_key("<|im_start|>"))
+            .unwrap_or(false);
+
+        if has_llama3 {
+            format!(
+                "<|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>\
+                 <|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|>\
+                 <|start_header_id|>assistant<|end_header_id|>\n\n",
+                system, user
+            )
+        } else if has_qwen {
+            format!(
+                "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                system, user
+            )
+        } else {
+            // Plain text fallback
+            user.to_string()
+        }
+    }
+
+    /// Build a GgufTokenizer from the model's embedded vocab metadata.
+    pub fn tokenizer_from_model(&self) -> Option<GgufTokenizer> {
+        let file = &self.model.file;
+        let tokens = file.metadata.get("tokenizer.ggml.tokens")?;
+        if let crate::model::gguf::GGUFValue::Array(arr) = tokens {
+            let vocab: Vec<String> = arr.iter().filter_map(|v| {
+                if let crate::model::gguf::GGUFValue::String(s) = v {
+                    Some(s.clone())
+                } else {
+                    None
+                }
+            }).collect();
+            if !vocab.is_empty() {
+                return Some(GgufTokenizer::from_vocab(vocab));
+            }
+        }
+        None
+    }
+
+    /// Generate text from a string prompt using the embedded GGUF tokenizer.
+    pub fn generate_text(&mut self, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32) -> Option<String> {
+        let tok = self.tokenizer_from_model()?;
+        let token_ids = tok.encode(prompt, true);
+        let generated_ids = self.generate(&token_ids, max_tokens, temperature, top_p);
+
+        // Skip BOS and stop at EOS
+        let clean_ids: Vec<usize> = generated_ids.iter()
+            .skip_while(|&&id| Some(id) == tok.bos_id())
+            .take_while(|&&id| Some(id) != tok.eos_id())
+            .copied()
+            .collect();
+
+        Some(tok.decode(&clean_ids))
     }
 
     pub fn ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {

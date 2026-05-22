@@ -160,6 +160,39 @@ pub unsafe fn q4_k_matmul_neon(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usize
 }
 
 // ============================================================================
+// Transposed-B matmul (B stored as [n, k] instead of [k, n])
+// ============================================================================
+
+/// Q4_K matmul where B is stored in native GGUF layout [n, k].
+/// Computes C = A @ B^T where B^T is [k, n].
+pub fn q4_k_matmul_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    assert_eq!(b.cols, k, "B cols ({}) must match k ({}) in transposed mode", b.cols, k);
+    assert_eq!(b.rows, n, "B rows ({}) must match n ({}) in transposed mode", b.rows, n);
+    let bpr = b.blocks_per_row(); // = k / 256
+
+    for v in c.iter_mut() { *v = 0.0; }
+
+    for j in 0..n {
+        let row_base = j * bpr;
+        // Dequantize full row j of B (length k) into temp
+        let mut temp = vec![0.0f32; k];
+        for block_idx in 0..bpr {
+            let block = &b.blocks[row_base + block_idx];
+            let base = block_idx * 256;
+            block.dequantize(&mut temp[base..base + 256]);
+        }
+        // Dot product with each row of A
+        for i in 0..m {
+            let mut acc = 0.0f32;
+            for l in 0..k {
+                acc += a[i * k + l] * temp[l];
+            }
+            c[i * n + j] = acc;
+        }
+    }
+}
+
+// ============================================================================
 // Dispatch
 // ============================================================================
 

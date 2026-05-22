@@ -69,9 +69,9 @@ impl KVCache {
         k_bytes + v_bytes
     }
 
-    /// Total sequence length cached across all layers.
+    /// Total sequence length cached (same for all layers; returns first layer's seq_len).
     pub fn total_seq_len(&self) -> usize {
-        self.shapes.values().map(|s| s.get(0).copied().unwrap_or(0)).sum()
+        self.shapes.values().next().map(|s| s.get(0).copied().unwrap_or(0)).unwrap_or(0)
     }
 }
 

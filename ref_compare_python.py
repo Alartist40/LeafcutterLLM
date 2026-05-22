@@ -123,7 +123,8 @@ def attention_forward(
 def ffn_forward(x, gw, uw, dw):
     gate = x @ gw.T
     up = x @ uw.T
-    activated = gate * (up / (1 + np.exp(-up)))
+    # SwiGLU: silu(gate) * up, where silu(t) = t / (1 + exp(-t))
+    activated = (gate / (1 + np.exp(-gate))) * up
     return activated @ dw.T
 
 
@@ -227,6 +228,7 @@ def main():
     p = argparse.ArgumentParser(description="Python reference for layer comparison (v3)")
     p.add_argument("--model", required=True, help="Path to .gguf file")
     p.add_argument("--prompt", default="The capital of France is")
+    p.add_argument("--tokens", help="Raw token IDs (comma-separated). Overrides --prompt.")
     p.add_argument("--output-dir", default="/tmp/python_ref")
     p.add_argument("--test-dequant", action="store_true",
                    help="Verify dequantization works before running full model")
@@ -314,7 +316,10 @@ def main():
                 print(f"    -> ERROR: {e}")
         print("---")
 
-    tokens = tokenize_gguf(args.prompt, reader)
+    if args.tokens:
+        tokens = [int(t.strip()) for t in args.tokens.split(',')]
+    else:
+        tokens = tokenize_gguf(args.prompt, reader)
     seq = len(tokens)
     hd = hs // nh
     # In standard GQA (Llama, Mistral), head_dim is the same for Q and K/V.

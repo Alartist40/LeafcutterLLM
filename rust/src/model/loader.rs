@@ -220,63 +220,62 @@ impl GGUFModel {
                         shape_gguf.clone()
                     };
 
-                    let mut tensor = match qtype {
+                    // For supported quantized types, keep weights as quantized blocks.
+                    // The Q*Matrix uses native GGUF layout (shape_data = [n, k]),
+                    // but the Tensor shape is the logical transposed layout (shape_gguf = [k, n])
+                    // so matmul computes A @ B^T correctly.
+                    let (mut tensor, needs_transpose) = match qtype {
                         QuantType::Q8_0 => {
                             let q8 = crate::kernels::q8_0::Matrix {
-                                rows: shape_data[0],
-                                cols: shape_data[1],
+                                rows: shape_data[0], cols: shape_data[1],
                                 blocks: crate::kernels::q8_0::blocks_from_bytes(raw),
                             };
-                            Tensor::from_vec(q8.dequantize(), shape_data.clone())
+                            (Tensor::from_q8_0_only(q8, shape_gguf.clone()), false)
                         }
                         QuantType::Q4_0 => {
                             let q4 = crate::kernels::q4_0::Matrix {
-                                rows: shape_data[0],
-                                cols: shape_data[1],
+                                rows: shape_data[0], cols: shape_data[1],
                                 blocks: crate::kernels::q4_0::blocks_from_bytes(raw),
                             };
-                            Tensor::from_vec(q4.dequantize(), shape_data.clone())
+                            (Tensor::from_q4_0_only(q4, shape_gguf.clone()), false)
                         }
                         QuantType::Q4_K => {
                             let q4 = crate::kernels::q4_k::Matrix {
-                                rows: shape_data[0],
-                                cols: shape_data[1],
+                                rows: shape_data[0], cols: shape_data[1],
                                 blocks: crate::kernels::q4_k::blocks_from_bytes(raw),
                             };
-                            Tensor::from_vec(q4.dequantize(), shape_data.clone())
+                            (Tensor::from_q4_k_only(q4, shape_gguf.clone()), false)
                         }
                         QuantType::IQ4_NL => {
                             let q4 = crate::kernels::iq4_nl::Matrix {
-                                rows: shape_data[0],
-                                cols: shape_data[1],
+                                rows: shape_data[0], cols: shape_data[1],
                                 blocks: crate::kernels::iq4_nl::blocks_from_bytes(raw),
                             };
-                            Tensor::from_vec(q4.dequantize(), shape_data.clone())
+                            (Tensor::from_iq4_nl_only(q4, shape_gguf.clone()), false)
                         }
                         QuantType::Q5_K => {
                             let q5 = crate::kernels::q5_k::Matrix {
-                                rows: shape_data[0],
-                                cols: shape_data[1],
+                                rows: shape_data[0], cols: shape_data[1],
                                 blocks: crate::kernels::q5_k::blocks_from_bytes(raw),
                             };
-                            Tensor::from_vec(q5.dequantize(), shape_data.clone())
+                            (Tensor::from_q5_k_only(q5, shape_gguf.clone()), false)
                         }
                         QuantType::Q6_K => {
                             let q6 = crate::kernels::q6_k::Matrix {
-                                rows: shape_data[0],
-                                cols: shape_data[1],
+                                rows: shape_data[0], cols: shape_data[1],
                                 blocks: crate::kernels::q6_k::blocks_from_bytes(raw),
                             };
-                            Tensor::from_vec(q6.dequantize(), shape_data.clone())
+                            (Tensor::from_q6_k_only(q6, shape_gguf.clone()), false)
                         }
                         _ => {
-                            Self::dequantize(raw, info.typ, shape_data.clone())?
+                            // Fallback: dequantize to f32, still needs transpose
+                            (Self::dequantize(raw, info.typ, shape_data.clone())?, true)
                         }
                     };
-                    if is_2d {
+                    if is_2d && needs_transpose {
                         tensor = tensor.transpose();
+                        sanitize_weights(&mut tensor);
                     }
-                    sanitize_weights(&mut tensor);
                     weights.insert(engine_name.to_string(), tensor);
                 }
             }

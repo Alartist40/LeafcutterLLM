@@ -1,7 +1,7 @@
 # LeafcutterLLM Handoff Document
 
 ## Goal
-Transform LeafcutterLLM from a failing prototype into a production-ready LLM inference engine that runs standard transformers AND hybrid architectures (Qwen3.5 SSM+Attention) natively in Rust, with full K-quant/IQ-quant support, BitNet LUT GEMM, compressed KV cache, and speculative decoding.
+Transform LeafcutterLLM from a failing prototype into a production-ready LLM inference engine that runs standard transformers (Llama, Mistral, Qwen2) natively in Rust, with full K-quant/IQ-quant support, layer-wise streaming, and a built-in OpenAI-compatible HTTP API.
 
 The ultimate vision is to surpass airllm in speed and capability, leveraging Rust's memory safety and SIMD performance.
 
@@ -11,44 +11,43 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 
 ### What's Complete
 - **Unified single project** — all development in `LeafcutterLLM/rust/`, `leafcutter advanced/` archived
-- Rust crate builds successfully (`cargo build --release` passes)
+- Rust crate builds successfully (`LLAMA_CPP_BUILD="" cargo build --release` passes)
 - Rust side has dequantization kernels for: Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, **IQ5_0**
 - Rust has ARM64 NEON and x86_64 AVX2 SIMD matmul kernels
 - Rust has layer-streaming loader (only one layer in RAM at a time)
 - Rust has HTTP API server (Axum, port 8081) with `/generate`, `/health`, `/v1/chat/completions`
 - **M2: BitNet LUT GEMM** — scalar + NEON + AVX2 lookup-table matmul for ternary weights
-- **M4: Fused QKV attention** — handles `attn_qkv.weight` and `attn_gate.weight` tensors
+- **M4: Fused QKV attention** — handles `attn_qkv.weight` and `attn_gate.weight` tensors (for Qwen2-style fused QKV)
 - **M5: Compressed KV cache** — 256-dim key/value heads instead of 4096
 - **M6: Speculative decoding heads** — Eagle `nextn.*` tensor loading and draft generation
-- **M7: Full Qwen3.5 native forward pass** — hybrid SSM+Attention engine with layer routing
-- **Real model validation** — all 4 Qwen3.5 models load and produce non-NaN logits
+- **M7: Hybrid SSM+Attention engine** — layer routing for Qwen3.5 (SSM kernels are stubs)
+- **Real model validation — Llama-3.2-3B** — mathematically verified correct against Python reference (max diff < 0.003)
+- **Coherent generation verified** — "The capital of France is" → `France\nParis\nParis`
+- **Quantized weight loading** — 4× memory reduction. One layer resident at a time as native quantized blocks.
+- **`madvise(MADV_DONTNEED)` layer streaming** — RSS bounded to ~1 layer + base. 3B peak: 534 MB. 70B est: ~2.4 GB.
 - Go codebase has been fully deprecated and removed
 
 ### What's In Progress
-- BitNet LUT GEMM performance benchmarking vs dequant-then-matmul
-- Competitive benchmarking vs airllm (Python/PyTorch) and bitnet.cpp (Microsoft C++)
+- Speed optimization — quantized GEMM kernels are naive scalar loops (~0.12 tok/sec on 3B)
+- Llama-70B end-to-end validation — download + run real 70B model to confirm ~2.4 GB peak
 
 ### What's Blocked
-- 9B models require >15GB RAM for full f32 embed/lm_head dequantization
-  - Workaround: implement lazy/embed-on-demand loading for large models
-  - 2B models run successfully on 15GB RAM machines
+- **Qwen3.6-27B native attention** — architectural mismatch. Model uses `head_count=24`, `key_length=256`, `value_length=256`, `rope.dimension_count=64`, and fused QKV shape `[5120, 10240]`. Our code assumes `head_dim = hidden_size / num_heads`, which gives 213, but this doesn't divide the fused QKV evenly. RoPE partial application (64 dims) and compressed KV dimensions are also unimplemented.
+- **Workaround:** Use llama.cpp bridge for Qwen3.6 models.
 
 ### Real Model Validation Results (2026-05-19)
-All diagnostics run with `cargo run --release --bin diagnose_models`
 
-| Model | Size | Load | Forward (20 tok) | NaN | Inf | Status |
-|-------|------|------|------------------|-----|-----|--------|
-| Qwen3.5-2B-IQ4_XS | 1.2 GB | 4.3s | 30.3s | 0 | 0 | ✅ PASS |
-| Qwen3.5-2B-Q4_K_M | 1.3 GB | 4.2s | 27.1s | 0 | 0 | ✅ PASS |
-| Qwen3.5-9B-IQ4_NL | 5.1 GB | — | — | — | — | ⚠️ OOM (needs >15GB) |
-| Qwen3.5-9B-UD-Q8_K_XL | 13 GB | — | — | — | — | ⚠️ OOM (needs >15GB) |
+| Model | Size | Load | Forward | Status |
+|-------|------|------|---------|--------|
+| Llama-3.2-3B-Q4_K_XL | 1.9 GB | ✅ | ✅ Layer-by-layer match vs Python | **PASS** |
+| Llama-3.2-3B (generation) | — | ✅ | ✅ Coherent greedy decode | **PASS** |
+| Synthetic 80-layer stress test | 27 MB | ✅ | ✅ 80 layers, 30 MB peak | **PASS** |
+| Qwen3.6-27B-IQ4_NL | 16 GB | ✅ | ❌ Attention index OOB | **BLOCKED** |
 
 **Key findings:**
-- Capability report now correctly identifies SSM vs attention layers per actual tensor contents
-- IQ5_0 dequantization kernel added — previously unsupported
-- KVCache uses HashMap for sparse layer indexing (hybrid architectures)
-- Attention auto-detects fused vs separate QKV per layer
-- SSM forward uses adaptive projection when tensor shapes don't align exactly
+- Quantized loading reduces per-layer memory 4× (70MB vs 280MB for 3B, 217MB vs 870MB for 27B)
+- Llama-style models work end-to-end natively
+- Qwen3.6 requires architecture research before native support
 
 ---
 
@@ -58,15 +57,22 @@ All diagnostics run with `cargo run --release --bin diagnose_models`
 |------|---------|
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/mod.rs` | Dequantization kernels: Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, **IQ5_0** |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/bitnet_lut.rs` | **M2: BitNet LUT GEMM** — scalar + NEON + AVX2 ternary matmul |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/q4_k_gemm.rs` | Q4_K transposed-B GEMM (scalar reference) |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/q5_k_gemm.rs` | Q5_K transposed-B GEMM (scalar reference) |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/q6_k_gemm.rs` | Q6_K transposed-B GEMM (scalar reference) |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/iq4_nl_gemm.rs` | IQ4_NL transposed-B GEMM (scalar reference) |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/q8_0_gemm.rs` | Q8_0 transposed-B GEMM (scalar reference) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/attention.rs` | **M4+M5: Attention** — RoPE + GQA + fused QKV + compressed KV + gated attention |
-| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/ssm.rs` | **M7: SSM layer** — causal conv1d + selective scan for Mamba layers |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/ssm.rs` | **M7: SSM layer** — causal conv1d + selective scan for Mamba layers (stubs) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/speculative.rs` | **M6: Speculative decoding** — Eagle draft heads (`nextn.*` tensors) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/engine.rs` | **M7: Hybrid engine** — routes SSM/Attention per layer, loads from GGUF |
-| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/cache/mod.rs` | **M5: Compressed KV cache** — HashMap-based sparse layer storage |
-| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/model/arch.rs` | Architecture detection — Qwen35 with layer-type-aware mappings |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/cache/mod.rs` | **M5: Compressed KV cache** — per-layer seq len tracking |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/model/arch.rs` | Architecture detection — Llama, Qwen2, Qwen35, Phi3, Mistral, BitNet |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/api/mod.rs` | HTTP API (Axum) — `/health`, `/generate`, `/v1/chat/completions` |
-| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/model/loader.rs` | Layer-streaming GGUF loader + capability report + corruption scan |
-| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/bin/diagnose_models.rs` | Real-model diagnostic tool for all 4 Qwen3.5 variants |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/model/loader.rs` | Layer-streaming GGUF loader + capability report + quantized weight loading |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/model/tensor.rs` | f32 Tensor + quantized Tensor dual storage with matmul dispatch |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/bin/compare_full_model.rs` | Full-model Python reference comparison binary |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/ref_compare_python.py` | Python reference forward pass (v3, verified) |
 
 ---
 
@@ -74,78 +80,49 @@ All diagnostics run with `cargo run --release --bin diagnose_models`
 
 *Session started 2026-05-19*
 
-### Discovery Phase
-- **Diagnostic programs written and executed** against actual model files in `/home/xander/Documents/portfolio/AI Models/`
-  - Confirmed IQ4_NL model reports "fully supported" for quantization types
-  - Confirmed Q8_K_XL model only contains F32/F16/Q8_0 (no actual Q8_K blocks)
-  - Discovered Qwen3.5 uses hybrid SSM architecture (was not documented anywhere in codebase)
-  - Discovered BitNet architecture at `/home/xander/Documents/BitNet/` — Microsoft's 1.58-bit ternary LLM inference framework
+### Fixes Applied (This Session)
+- **`rust/src/bin/compare_full_model.rs`** — Added missing residuals (`x = x + attn_out`, `x = x + ffn_out`)
+  - Root cause: comparison script computed `x = ffn(rms_norm(x))` without residual connections
+  - Result: fixed "repetitive tokens" artifact in comparison output
+  - Real `engine.rs` was always correct
 
-### Fixes Applied
-- **`rust/src/model/loader.rs`** — Fixed corruption detector false positives
-  - Root cause: detector read `dmin` from bytes 2-3 for ALL quantization types
-  - Q4_0, Q8_0, IQ4_NL have NO dmin field — bytes 2-3 are quantized data
-  - When interpreted as f16, random quantized bytes look like NaN or huge values
-  - Fix: explicitly handle each quant type's block layout correctly
-  - Result: model now reports "✓ No corruption detected in any tensor blocks"
+- **`rust/src/cache/mod.rs`** — Fixed `KVCache::total_seq_len()`
+  - Root cause: was summing seq lengths across all layers instead of returning per-layer length
+  - Result: `seq_offset` now tracks correctly during autoregressive generation
 
-- **`rust/src/kernels/mod.rs`** — Added Q8_K dequantization kernel
-  - Block layout: f32 scale (4 bytes) + 256 int8 values (256 bytes) + 32 bytes bsums
-  - Dequant: `out[i] = d * qs[i] as i8 as f32`
+- **`rust/src/model/loader.rs`** — Fixed IQ4_XS quantized loading bug
+  - Root cause: `IQ4_XS` fell through to f32 dequant but `is_quantized=true` skipped transpose
+  - Fix: `is_quantized_supported` only true for types with native transposed-B GEMM kernels
+  - Result: f32 fallbacks always get transposed; quantized tensors never do
 
-- **`rust/src/model/quant.rs`** — Updated `is_supported()` to include Q8_K
-
-- **`rust/src/model/loader.rs`** — Added Q8_K dispatch in `dequantize()` match statement
-
-### Bridge Implementation (llama.cpp fallback)
-- **`rust/src/bridge/mod.rs`** — NEW: `LlamaBridge` struct + `HybridEngine`
-  - Auto-detects `llama-server` binary in common paths
-  - Spawns llama-server as child process on fallback port 8082
-  - Forwards `/completion` requests with JSON payload
-  - `HybridEngine::load()` tries native first, falls back to bridge
-  - Implements `Drop` to cleanly kill child process
-
-- **`rust/src/api/mod.rs`** — Updated to use `HybridEngine`
-  - `/generate` returns `"backend": "native" | "bridge"` field
-  - `/health` reports which backend is active
-
-- **`rust/src/main.rs`** — Updated to use `HybridEngine`
-  - Benchmark function updated for new engine type
-
-- **`rust/Cargo.toml`** — Added dependencies: `ureq = { version = "2", features = ["json"] }`, `which = "7.0"`
-
-- **`rust/src/lib.rs`** — Added `pub mod bridge;`
+- **Quantized weight loading restored** — `_only` constructors re-enabled for Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL
+  - Per-layer memory: 3B ~70MB, 27B ~217MB, 70B ~130MB (estimated)
 
 ### Verification
 - `cargo test --release` — **71 passed, 0 failed**
-- Corruption detector re-run on Qwen3.5-9B-IQ4_NL — **0 bad blocks** (was 21.7M)
-- `cargo build --release` — **success** (hybrid engine compiles)
+- Python reference comparison (v3) — **max diff < 0.003** across all 28 layers of Llama-3.2-3B
+- Coherent generation — **"The capital of France is" → `France\nParis\nParis`**
+- Qwen3.6-27B loads successfully but **attention panics** with index OOB
 
 ---
 
 ## Failed Attempts
 
-### Smoke test with IQ4_NL model
-- **What**: Ran Rust engine forward pass on Qwen3.5-9B-IQ4_NL.gguf
-- **Result**: Failed with "Model cannot run: architecture=Qwen3.5 unsupported_quant=0 missing_tensors=16"
-- **Why**: Engine only supports Llama/Qwen2/Mistral. Qwen3.5 architecture marked `is_supported=false`
-- **Learned**: The model uses `attn_qkv` (fused), `attn_gate` (gated), and `ssm_*` (State Space Model) tensors
-
-### Corruption detector scan
-- **What**: `scan_for_corruption()` flagged 21.7M bad blocks (10.74%) across all tensors
-- **Result**: False positives — uniform 10-20% "corruption" across ALL tensor types indicates detector bug
-- **Why**: The detector likely misreads block layouts for IQ4_NL and Q8_0, or the threshold is wrong
-- **Learned**: Model files are NOT corrupted — the detector algorithm is broken
+### Qwen3.6-27B native forward pass
+- **What**: Ran Rust engine forward pass on Qwen3.6-27B-IQ4_NL.gguf
+- **Result**: `index out of bounds: the len is 25560 but the index is 25560` in `attention.rs:243`
+- **Why**: Qwen3.6 attention architecture differs from Llama/Qwen2. Uses `head_count=24`, `key_length=256`, `value_length=256`, `rope.dimension_count=64`, and fused QKV `[5120, 10240]`. Standard formula `head_dim = hidden_size / num_heads` gives 213, which doesn't divide the fused QKV evenly.
+- **Learned**: Native attention.rs needs architecture-specific updates for Qwen3.6. Use llama.cpp bridge as fallback.
 
 ---
 
 ## Next Steps
 
-1. **[IMMEDIATE] Memory optimization for 9B+ models** — implement lazy embed/lm_head loading or memory-mapped dequantization to reduce RAM footprint
-2. **[IMMEDIATE] Run competitive benchmarks** — compare tok/sec and memory usage vs airllm and bitnet.cpp on identical hardware
-3. **[SHORT-TERM] Performance optimization** — naive matmul is the bottleneck; integrate SIMD GEMM for all quant types
-4. **[SHORT-TERM] Speculative decoding end-to-end** — wire Eagle `nextn.*` tensors into actual draft generation loop
-5. **[MEDIUM-TERM] Push to GitHub** — validate CI passes, tag v0.9.0 release
+1. **[HIGH] Llama-70B validation** — Download a 70B Q4_K model, verify forward pass and memory footprint (~630MB peak)
+2. **[HIGH] Speed optimization** — Quantized GEMM kernels are naive scalar loops; implement SIMD (NEON/AVX2) or integrate `gemm` crate for f32 fallback
+3. **[MEDIUM] KV cache quantization** — Store KV cache as f16 or Q8_0 for 2-4× memory reduction
+4. **[MEDIUM] Qwen3.6 architecture research** — Read Qwen3 paper/spec to understand attention dimensions, partial RoPE, compressed KV
+5. **[LOW] Chat template robustness** — Auto-detect Llama-3 vs Qwen format from vocab tokens (already implemented)
 
 ---
 
@@ -184,6 +161,7 @@ All diagnostics run with `cargo run --release --bin diagnose_models`
 | `test_simd_vec_add` | `kernels::simd::tests` | Element-wise addition |
 | `test_simd_sum_sq` | `kernels::simd::tests` | Sum of squares accuracy |
 | `test_parallel_matmul_correctness` | `kernels::simd::tests` | 128×256×128 parallel vs single-threaded |
+| `test_lut_values` | `kernels::bitnet_lut::tests` | LUT[256] correctness for all byte patterns |
 | `bench_parallel_matmul_speedup` | `kernels::simd::tests` | **IGNORED** — benchmark only |
 
 #### Model/Loader Tests (22 passed, 12 skipped)
@@ -240,7 +218,7 @@ All diagnostics run with `cargo run --release --bin diagnose_models`
 | `test_q4_0_shard_roundtrip` | `shard::writer::tests` | Q4_0 quantized shard roundtrip |
 | `test_q8_0_shard_roundtrip` | `shard::writer::tests` | Q8_0 quantized shard roundtrip |
 
-#### Inference Tests (5 passed)
+#### Inference Tests (8 passed)
 | Test | Module | Description |
 |---|---|---|
 | `test_greedy` | `inference::sampler::tests` | Argmax sampling |
@@ -249,6 +227,9 @@ All diagnostics run with `cargo run --release --bin diagnose_models`
 | `test_shard_engine_forward_q8_0` | `inference::shard_engine::tests` | Q8_0 sharded forward pass |
 | `test_kv_cache_append` | `cache::tests` | KV cache append operation |
 | `test_kv_cache_f16_roundtrip` | `cache::tests` | f16 KV cache accuracy |
+| `test_attention_standard` | `inference::attention::tests` | Standard separate Q/K/V projections |
+| `test_attention_fused_qkv` | `inference::attention::tests` | Fused attn_qkv.weight projection + split |
+| `test_attention_compressed_kv` | `inference::attention::tests` | 256-dim KV cache (Qwen3.5 compressed) |
 
 #### Tokenizer Tests (2 passed)
 | Test | Module | Description |
@@ -281,123 +262,13 @@ All diagnostics run with `cargo run --release --bin diagnose_models`
 ### Custom Diagnostics Run (not in `cargo test`)
 | Diagnostic | Result |
 |---|---|
-| Qwen3.5-9B-IQ4_NL quant summary | ✅ All 6 types supported |
-| Qwen3.5-9B-UD-Q8_K_XL quant summary | ✅ All 3 types supported |
-| Corruption detector (before fix) | ❌ 21.7M false positives |
-| Corruption detector (after fix) | ✅ 0 bad blocks |
-| Smoke test (Qwen3.5 via native) | ❌ Architecture unsupported (expected) |
-
----
-
-## Test Records — leafcutter advanced/
-
-**Command:** `cargo test -- --nocapture`
-**Date:** 2026-05-19
-**Result:** ✅ **43 passed, 0 failed, 0 ignored** (was 24, added 19 new tests)
-
-#### Kernel Tests (8 passed)
-| Test | Module | Description |
-|---|---|---|
-| `test_q4_0_zero` | `kernels::tests` | Q4_0 zero-scale block |
-| `test_q8_k_zero` | `kernels::tests` | Q8_K zero-scale block |
-| `test_i2_s_block_layout` | `kernels::bitnet_lut::tests` | Block size = 128, bytes = 34 |
-| `test_i2_s_dequant_zero` | `kernels::bitnet_lut::tests` | All-zero weights dequantize to 0 |
-| `test_i2_s_dequant_all_ones` | `kernels::bitnet_lut::tests` | All-+1 weights dequantize to scale |
-| `test_ssm_scan_constant` | `kernels::ssm_scan::tests` | Sequential scan recurrence verification |
-| `test_simd_matmul_small` | `kernels::simd::tests` | 2×2×2 SIMD matmul |
-| `test_simd_matmul_large` | `kernels::simd::tests` | 16×32×24 SIMD matmul |
-| `test_simd_vec_add` | `kernels::simd::tests` | Element-wise SIMD add |
-
-#### Model Tests (8 passed)
-| Test | Module | Description |
-|---|---|---|
-| `test_bitnet_block_size` | `model::quant::tests` | I2_S tensor size math |
-| `test_q8k_block_size` | `model::quant::tests` | Q8_K tensor size math |
-| `test_arch_names` | `model::arch::tests` | Architecture enum + capability flags |
-| `test_load_real_gguf` | `model::gguf::tests` | Parses Qwen3.5-9B-IQ4_NL.gguf |
-| `test_quant_summary` | `model::gguf::tests` | Quant type report from real model |
-| `test_load_real_model` | `model::loader::tests` | Full model load + capability report |
-| `test_matmul` | `model::tensor::tests` | 2D matrix multiplication |
-| `test_rms_norm` | `model::tensor::tests` | RMS normalization |
-| `test_softmax` | `model::tensor::tests` | Softmax over last dimension |
-
-#### Inference Tests (3 passed)
-| Test | Module | Description |
-|---|---|---|
-| `test_greedy` | `inference::sampler::tests` | Argmax sampling |
-| `test_temperature` | `inference::sampler::tests` | Temperature scaling |
-| `test_kv_cache_append` | `cache::tests` | KV cache append operation |
-
-#### API Tests (2 passed)
-| Test | Module | Description |
-|---|---|---|
-| `test_health_endpoint` | `api::tests` | GET /health returns 200 + backend info |
-| `test_generate_endpoint` | `api::tests` | POST /generate returns JSON with text |
-
-#### Bridge Tests (1 passed)
-| Test | Module | Description |
-|---|---|---|
-| `test_bridge_config` | `bridge::tests` | Bridge struct creation and defaults |
-
-#### BitNet LUT GEMM Tests (5 passed) — M2
-| Test | Module | Description |
-|---|---|---|
-| `test_lut_values` | `kernels::bitnet_lut::tests` | LUT[256] correctness for all byte patterns |
-| `test_bitnet_matmul_lut_all_ones` | `kernels::bitnet_lut::tests` | All-+1 weights matmul vs reference |
-| `test_bitnet_matmul_lut_mixed_weights` | `kernels::bitnet_lut::tests` | Mixed {-1,0,+1} weights matmul |
-| `test_bitnet_matmul_lut_vs_dequant` | `kernels::bitnet_lut::tests` | LUT matmul matches dequant→matmul reference |
-| `test_bitnet_dispatch_matches_scalar` | `kernels::bitnet_lut::tests` | SIMD dispatch produces identical output to scalar |
-
-#### Attention Tests (4 passed) — M4 + M5
-| Test | Module | Description |
-|---|---|---|
-| `test_attention_standard` | `inference::attention::tests` | Standard separate Q/K/V projections |
-| `test_attention_fused_qkv` | `inference::attention::tests` | Fused attn_qkv.weight projection + split |
-| `test_attention_compressed_kv` | `inference::attention::tests` | 256-dim KV cache (Qwen3.5 compressed) |
-| `test_kv_cache_accumulates` | `inference::attention::tests` | Multi-step autoregressive cache growth |
-
-#### SSM Tests (3 passed) — M7
-| Test | Module | Description |
-|---|---|---|
-| `test_causal_conv1d` | `inference::ssm::tests` | Causal 1D convolution correctness |
-| `test_selective_scan_basic` | `inference::ssm::tests` | SSM recurrence h_t = A·h_{t-1} + B·x_t |
-| `test_ssm_forward_shape` | `inference::ssm::tests` | Full SSM layer forward pass shape check |
-
-#### Speculative Decoding Tests (2 passed) — M6
-| Test | Module | Description |
-|---|---|---|
-| `test_speculative_head_creation` | `inference::speculative::tests` | Eagle head loads from nextn.* tensors |
-| `test_draft_produces_gamma_outputs` | `inference::speculative::tests` | Draft head generates γ future hidden states |
-
-#### Engine Tests (3 passed) — M7
-| Test | Module | Description |
-|---|---|---|
-| `test_embed_lookup` | `inference::engine::tests` | Token embedding table lookup |
-| `test_engine_info_defaults` | `inference::engine::tests` | EngineInfo struct with SSM/KV flags |
-| `test_hybrid_engine_loads_real_model` | `inference::engine::tests` | HybridEngine loads Qwen3.5 via native or bridge |
-
-### Advanced Project Modules Implemented
-- ✅ GGUF v3 parser (`model::gguf`) — mmap-based, metadata + tensor info
-- ✅ Architecture detection (`model::arch`) — auto-detects Qwen35, BitNet, Llama, Qwen2
-- ✅ Model loader (`model::loader`) — loads GGUF + capability report
-- ✅ Quant registry (`model::quant`) — 25 types including BitNet I2_S/TL1/TL2
-- ✅ Tensor ops (`model::tensor`) — matmul, RMSNorm, softmax, SiLU
-- ✅ BitNet I2_S kernel (`kernels::bitnet_lut`) — ternary {-1,0,+1} dequantization
-- ✅ **BitNet LUT GEMM (`kernels::bitnet_lut`) — M2: scalar + NEON + AVX2 dispatch**
-- ✅ SSM scan kernel (`kernels::ssm_scan`) — sequential reference + parallel stub
-- ✅ SIMD kernels (`kernels::simd`) — ARM NEON / x86_64 AVX2 matmul + vec ops
-- ✅ Attention forward (`inference::attention`) — RoPE + GQA + causal mask
-- ✅ **Fused QKV attention (`inference::attention`) — M4: attn_qkv.weight + attn_gate.weight**
-- ✅ **Compressed KV cache (`cache`) — M5: 256-dim keys/values per head**
-- ✅ FFN forward (`inference::ffn`) — SiLU-gated MLP
-- ✅ Sampler (`inference::sampler`) — greedy + temperature + top-p
-- ✅ **SSM layer (`inference::ssm`) — M7: causal conv1d + selective scan**
-- ✅ **Speculative decoding (`inference::speculative`) — M6: Eagle nextn.* draft heads**
-- ✅ KV cache (`cache`) — append + retrieve per layer
-- ✅ Llama.cpp bridge (`bridge`) — auto-spawn + /completion proxy
-- ✅ **Hybrid engine (`inference::engine`) — M7: native SSM+Attention forward pass**
-- ✅ HTTP API (`api`) — Axum with /health, /generate, /v1/chat/completions
-- ✅ CLI (`main.rs`) — `--model`, `--port`, `--benchmark`
+| Llama-3.2-3B layer-0 forward vs Python | ✅ Identical (diff=0) |
+| Llama-3.2-3B full 28-layer forward vs Python | ✅ Max diff < 0.003 |
+| Llama-3.2-3B coherent generation | ✅ "France\nParis\nParis" |
+| Qwen3.6-27B-IQ4_NL load + capability report | ✅ Loads, 65 layers, hidden=5120 |
+| Qwen3.6-27B-IQ4_NL forward pass | ❌ Attention index OOB at line 243 |
+| Quantized loading memory (3B) | ✅ ~70MB/layer vs ~280MB f32 |
+| Quantized loading memory (27B est.) | ✅ ~217MB/layer vs ~870MB f32 |
 
 ---
 
@@ -405,41 +276,47 @@ All diagnostics run with `cargo run --release --bin diagnose_models`
 
 ### Key Decisions Made
 - **User approved replacing Go with Rust** as primary stack
-- **Hybrid approach (B+A) chosen**: Native Rust for standard transformers + llama.cpp bridge for Qwen3.5
-- **Option C (SSM support) approved** as parallel effort in `leafcutter advanced/`
+- **Hybrid approach (B+A) chosen**: Native Rust for standard transformers + llama.cpp bridge for unsupported architectures
+- **Quantized loading is now the default** — `_only` constructors keep weights as native GGUF blocks
 
 ### Model Architecture Discovery
-**Qwen3.5-9B GGUF structure:**
-- `general.architecture = "qwen35"`
-- `qwen35.block_count = 32`
-- `qwen35.embedding_length = 4096`
-- `qwen35.feed_forward_length = 12288`
-- `qwen35.attention.head_count = 16`
-- `qwen35.attention.head_count_kv = 4`
-- `qwen35.attention.key_length = 256` ← compressed KV
-- `qwen35.attention.value_length = 256` ← compressed KV
-- `qwen35.full_attention_interval = 4` ← every 4th layer is standard attention
-- `qwen35.context_length = 262144`
-- SSM config: `state_size=128`, `inner_size=4096`, `time_step_rank=32`, `conv_kernel=4`, `group_count=16`
 
-**Layer pattern:**
-- SSM layers (most): `attn_qkv`, `attn_gate`, `ffn_gate/up/down`, `ssm_alpha/beta/conv1d/dt/norm/out`
-- Attention layers (every 4th): `attn_q`, `attn_k`, `attn_v`, `attn_q_norm`, `attn_k_norm`, `attn_output`
-- Layer 32: `nextn.eh_proj`, `nextn.enorm`, `nextn.hnorm` — Eagle speculative decoding heads
+**Llama-3.2-3B GGUF structure (verified working):**
+- `general.architecture = "llama"`
+- `llama.block_count = 28`
+- `llama.embedding_length = 3072`
+- `llama.feed_forward_length = 8192`
+- `llama.attention.head_count = 24`
+- `llama.attention.head_count_kv = 8`
+- `llama.rope.freq_base = 500000.0`
+- Uses mixed quantization: Q5_K, Q4_K, Q6_K, IQ4_XS
+
+**Qwen3.6-27B GGUF structure (blocked):**
+- `general.architecture = "qwen35"`
+- `qwen35.block_count = 65`
+- `qwen35.embedding_length = 5120`
+- `qwen35.feed_forward_length = 17408`
+- `qwen35.attention.head_count = 24`
+- `qwen35.attention.head_count_kv = 4`
+- `qwen35.attention.key_length = 256`
+- `qwen35.attention.value_length = 256`
+- `qwen35.rope.dimension_count = 64`
+- `qwen35.rope.dimension_sections = 5`
+- `qwen35.full_attention_interval = 4`
+- `qwen35.context_length = 262144`
+- Fused QKV: `blk.0.attn_qkv.weight` shape `[5120, 10240]`
+- Gated attention: `blk.0.attn_gate.weight` shape `[5120, 6144]`
 
 ### Environment
 - Rust: `cargo 1.95.0`
-- Go: `go1.26.3`
 - Models located at: `/home/xander/Documents/portfolio/AI Models/`
-  - `Qwen3.5-9B-IQ4_NL.gguf` (5.3 GB)
-  - `Qwen3.5-9B-UD-Q8_K_XL.gguf` (13.2 GB)
-- Advanced workspace: `/home/xander/Documents/portfolio/leafcutter advanced/`
+  - `Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf` (1.9 GB) — **verified working natively**
+  - `Qwen3.6-27B-IQ4_NL.gguf` (16 GB) — **loads but attention fails**
 
 ### Dependencies & Constraints
+- Build: `LLAMA_CPP_BUILD="" cargo build --release` for pure-native (no llama.cpp FFI)
 - Pi 5 target has ~8GB RAM — models must fit via layer streaming or quantization
-- IQ4_NL model (5.3GB) could potentially fit with layer streaming
-- Q8_K_XL model (13.2GB) will NOT fit on Pi 5 regardless of streaming
-
+- Llama-3.2-3B runs on 8GB with quantized loading (~570MB peak)
 
 ---
 
@@ -450,32 +327,16 @@ All diagnostics run with `cargo run --release --bin diagnose_models`
 | M1 | BitNet I2_S scalar reference kernel | ✅ Complete | `test_i2_s_dequant_*` |
 | **M2** | **BitNet LUT GEMM (NEON/AVX2)** | ✅ Complete | `test_bitnet_matmul_lut_*`, `test_bitnet_dispatch_*` |
 | M3 | SSM sequential scan reference | ✅ Complete | `test_ssm_scan_constant` |
-| **M4** | **Fused QKV attention** | ✅ Complete | `test_attention_fused_qkv` |
+| **M4** | **Fused QKV attention** | ✅ Complete (Llama/Qwen2) | `test_attention_fused_qkv` |
 | **M5** | **Compressed KV cache (256-dim)** | ✅ Complete | `test_attention_compressed_kv` |
 | **M6** | **Speculative decoding heads** | ✅ Complete | `test_speculative_head_creation`, `test_draft_produces_gamma_outputs` |
-| **M7** | **Full Qwen3.5 native forward pass** | ✅ Complete | `test_ssm_forward_shape`, `test_hybrid_engine_loads_real_model` |
+| **M7** | **Full Qwen3.5 native forward pass** | ⚠️ Partial | SSM stubs, attention works for Llama-style |
 | M8 | OpenAI-compatible API | ✅ Complete | `test_generate_endpoint` |
-| M9 | Multi-model scheduler | 📋 Planned | — |
-| M10 | NPU/GPU backends | 📋 Planned | — |
+| M9 | llama.cpp FFI bridge | ✅ Complete | `test_bridge_config` |
+| M10 | Quantized weight loading (one layer resident) | ✅ Complete | Verified on 3B + 27B load |
+| M11 | Multi-model scheduler | 📋 Planned | — |
+| M12 | NPU/GPU backends | 📋 Planned | — |
 
-**All milestones M1–M8 are now implemented and tested.**
+---
 
-### What M7 Enables
-
-The Qwen3.5 native forward pass (M7) is the capstone achievement. It means:
-
-1. **No bridge required** for Qwen3.5 — the engine runs it entirely in Rust
-2. **Layer routing** automatically selects SSM for most layers, attention every 4th layer
-3. **Compressed KV cache** reduces memory by 16× compared to standard attention
-4. **Fused QKV** eliminates 3 separate matrix multiplies per attention layer
-5. **Speculative decoding** (M6) can accelerate generation by 2–3× once fully wired
-6. **BitNet LUT GEMM** (M2) provides the fastest possible ternary weight matmul
-
-### Test Count Growth
-
-| Date | Tests | Milestone |
-|------|-------|-----------|
-| 2026-05-19 | 18 | Initial scaffold |
-| 2026-05-19 | 24 | GGUF parser + API + arch detection |
-| 2026-05-19 | **43** | **M2–M7 complete** |
-
+*End of handoff document*

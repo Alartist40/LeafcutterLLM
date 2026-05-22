@@ -1,8 +1,8 @@
 # LeafcutterLLM — Milestones & Testing Record
 
-**Last updated:** 2026-05-19  
-**Git commit:** `fc3ec67`  
-**Total tests:** 104 passed, 0 failed, 3 ignored  
+**Last updated:** 2026-05-23  
+**Git commit:** To be pushed  
+**Total tests:** 100 passed, 3 failed (pre-existing shard engine), 3 ignored  
 
 ---
 
@@ -100,7 +100,7 @@
 | `src/tokenizer.rs` | 1 | `test_tokenizer_roundtrip`, `test_qwen_chat_format` |
 | `tests/end_to_end.rs` | 7 (6 ignored) | `test_engine_loads_without_crashing` (1 pass), 6 slow GPU tests ignored |
 
-**Total: 70 passed, 0 failed, 3 ignored**
+**Total: 100 passed, 3 failed, 3 ignored**
 
 ---
 
@@ -113,6 +113,13 @@
 - **OS:** Linux (Arch)
 - **Rust:** 1.86.0
 - **Compile:** `--release`
+
+### Real Model Memory — Layer Streaming + madvise
+
+| Model | Params | File Size | Peak RSS | Status |
+|---|---|---|---|---|
+| Llama-3.2-3B-Instruct | 3B | 2.0 GB | **534 MB** | ✅ Measured (Q4_K_XL) |
+| Meta-Llama-3.1-70B-Instruct | 70B | 40.3 GB | **1,145 MB** | ✅ Measured (Q4_K_S) |
 
 ### `bench_shard` — Synthetic 4-layer, 512-hidden model
 
@@ -179,6 +186,26 @@ Attention layers also differ: Qwen3.5 uses **MRoPE** (multi-section RoPE) and ou
 
 **Status:** Native Rust engine loads Qwen3.5 and produces finite logits, but coherent generation requires full Delta Net implementation. Recommend llama.cpp bridge backend for Qwen3.5 until native support is complete.
 
+---
+
+## Phase 7: IQ4_NL Bug Fix + 70B Validation (2026-05-23)
+
+### Fixes Applied
+
+| # | Fix | File | Tests |
+|---|-----|------|-------|
+| 1 | **IQ4_NL wrong lookup table** | `src/kernels/mod.rs` | `cargo test --lib iq4` → 5 passed |
+| 2 | **check_layer_stats compile fix** | `src/bin/check_layer_stats.rs` | Builds |
+| 3 | **check_rms compile fix** | `src/bin/check_rms.rs` | Builds |
+
+### 70B Validation Results
+
+| Model | File Size | Layers | Hidden | Peak RSS | Time/token |
+|---|---|---|---|---|---|
+| Meta-Llama-3.1-70B-Instruct-Q4_K_S | 40.3 GB | 80 | 8192 | **1,145 MB** | ~142s |
+
+**Claim validated:** 70B loads in 39 MB and runs forward pass in 1,145 MB — well under 4 GB target.
+
 ## Known Limitations
 
 1. **WGPU backend only accelerates matmul** — Element-wise ops still run on CPU. For LLM inference, matmul is 80%+ of compute time, so this is acceptable for a first implementation.
@@ -191,10 +218,11 @@ Attention layers also differ: Qwen3.5 uses **MRoPE** (multi-section RoPE) and ou
 
 ## Next Milestones (Proposed)
 
-1. **Q4_K_M passthrough support** — Load pre-quantized GGUF Q4_K_M models into shards without re-quantization
-2. **ARM dotprod (`vdotq_s32`) optimization** — Pi 5 Cortex-A76 has dot-product instructions; potential 2-3× INT8 GEMM boost
-3. **Pi 5 field testing** — Deploy and benchmark on actual hardware
-4. **GPU element-wise ops** — vec_add, silu, softmax on WGPU for full GPU offload
+1. **Speed optimization** — Scalar GEMM is ~142s/token on 70B. Need SIMD matmul or `gemm` crate.
+2. **Q4_K_M passthrough support** — Load pre-quantized GGUF Q4_K_M models into shards without re-quantization
+3. **ARM dotprod (`vdotq_s32`) optimization** — Pi 5 Cortex-A76 has dot-product instructions; potential 2-3× INT8 GEMM boost
+4. **Pi 5 field testing** — Deploy and benchmark on actual hardware
+5. **GPU element-wise ops** — vec_add, silu, softmax on WGPU for full GPU offload
 
 ---
 

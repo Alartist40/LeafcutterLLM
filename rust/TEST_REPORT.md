@@ -254,3 +254,56 @@ The native Rust engine **loads and runs** Qwen3.5 models without numerical error
 - `src/cache/ssm_state.rs` — New SSM state cache with conv state support
 - `src/bin/test_generation.rs` — Generation quality test binary
 - `tests/tokenizer_qwen35.json` — Qwen3.5 tokenizer (vocab 248,044)
+
+
+---
+
+## Update: 2026-05-23
+
+### Bug Fix: IQ4_NL Garbled Output
+
+**Symptom:** IQ4_NL quantized models (e.g., Llama-3.2-3B-IQ4_NL, Qwen3.5-9B-IQ4_NL) produced garbled/nonsensical output, while Q4_K models on the same architecture worked correctly.
+
+**Root Cause:** Two conflicting `IQ4NL_TABLE` definitions existed:
+
+| Location | Table Values | Used By |
+|----------|-------------|---------|
+| `src/kernels/iq4_nl.rs` | `[-127, -104, -83, …]` ✅ | GEMM kernels (`iq4_nl_matmul_*`) |
+| `src/kernels/mod.rs` | `[-1.0, -0.6962, -0.5251, …]` ❌ | `get_tensor_row_f32()` for embedding/LM head lookup |
+
+The wrong table in `mod.rs` produced values **30–300× smaller** than correct. When `token_embd.weight` or `output.weight` were IQ4_NL quantized, embedding lookup and LM head projection used the wrong table, collapsing activations to near-zero.
+
+**Fix:** Replaced the wrong `IQ4NL_TABLE` in `src/kernels/mod.rs` with the correct llama.cpp `kvalues_iq4nl` values, matching `src/kernels/iq4_nl.rs`. Updated the unit test accordingly.
+
+**Verification:**
+- `cargo test --lib iq4` → **5 passed, 0 failed**
+- Cross-module consistency test (`verify_iq4_nl_fix`) confirms `get_tensor_row_f32()` and `Matrix::dequantize()` produce identical output for real model weights.
+
+---
+
+### Validation: 70B Model Memory Claims
+
+**Claim:** A 70B parameter model can be loaded and run on consumer hardware with ~4 GB RAM using layer-streaming + mmap + `madvise(MADV_DONTNEED)`.
+
+**Test Setup:**
+- Model: `Meta-Llama-3.1-70B-Instruct-Q4_K_S.gguf` (40.3 GB file)
+- Architecture: 80 layers, hidden_size=8192, 64 attention heads, 8 KV heads
+- Hardware: Standard Linux workstation
+
+**Results:**
+
+| Stage | Peak RSS (VmHWM) |
+|-------|-----------------|
+| Load only | **39 MB** |
+| 1-token forward pass | **1,145 MB** |
+
+**Conclusion:** ✅ Claim validated. The 40 GB model file stays on disk via mmap. Layer streaming ensures only one layer (~500 MB quantized) is resident at a time, plus activations and KV cache. Peak RSS during inference stays well under 1.2 GB — leaving ample headroom on a 4 GB system.
+
+**Note:** Inference speed is currently ~142s/token on 70B CPU with naive scalar GEMM kernels. Speed is not the focus of this memory validation.
+
+---
+
+### Compilation Fixes
+
+- `src/bin/check_layer_stats.rs` — Fixed `&HashMap` borrowing errors after `ffn_forward`/`attention_forward` API changes.
+

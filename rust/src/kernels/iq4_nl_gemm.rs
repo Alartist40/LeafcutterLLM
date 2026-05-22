@@ -158,6 +158,27 @@ pub unsafe fn iq4_nl_matmul_neon(a: &[f32], b: &IQ4NLMatrix, c: &mut [f32], m: u
 
 /// Dispatch to the best available IQ4_NL GEMM kernel.
 /// Uses row-dequantize hybrid: dequantize one B row to temp buffer, then SIMD FMA.
+pub fn iq4_nl_matmul_transposed_b(a: &[f32], b: &IQ4NLMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    assert_eq!(b.cols, k, "B cols must match k in transposed mode");
+    assert_eq!(b.rows, n, "B rows must match n in transposed mode");
+    let bpr = b.cols / 32;
+    for v in c.iter_mut() { *v = 0.0; }
+    for j in 0..n {
+        let row_base = j * bpr;
+        let mut temp = vec![0.0f32; k];
+        for block_idx in 0..bpr {
+            let block = &b.blocks[row_base + block_idx];
+            let base = block_idx * 32;
+            block.dequantize(&mut temp[base..base + 32]);
+        }
+        for i in 0..m {
+            let mut acc = 0.0f32;
+            for l in 0..k { acc += a[i * k + l] * temp[l]; }
+            c[i * n + j] = acc;
+        }
+    }
+}
+
 pub fn iq4_nl_matmul(a: &[f32], b: &IQ4NLMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
     assert_eq!(b.cols, n);
     assert_eq!(b.rows, k);

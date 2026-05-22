@@ -169,6 +169,27 @@ pub unsafe fn q8_0_matmul_neon(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize,
 // ============================================================================
 
 /// Dispatch to the best available INT8 GEMM kernel.
+pub fn q8_0_matmul_transposed_b(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    assert_eq!(b.cols, k, "B cols must match k in transposed mode");
+    assert_eq!(b.rows, n, "B rows must match n in transposed mode");
+    let bpr = b.cols / 32;
+    for v in c.iter_mut() { *v = 0.0; }
+    for j in 0..n {
+        let row_base = j * bpr;
+        let mut temp = vec![0.0f32; k];
+        for block_idx in 0..bpr {
+            let block = &b.blocks[row_base + block_idx];
+            let base = block_idx * 32;
+            block.dequantize(&mut temp[base..base + 32]);
+        }
+        for i in 0..m {
+            let mut acc = 0.0f32;
+            for l in 0..k { acc += a[i * k + l] * temp[l]; }
+            c[i * n + j] = acc;
+        }
+    }
+}
+
 pub fn q8_0_matmul(a: &[f32], b: &Q8Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
     #[cfg(target_arch = "x86_64")]
     {
@@ -331,6 +352,27 @@ unsafe fn q4_0_matmul_neon_inner(a: &[f32], b: &Q4Matrix, c: &mut [f32], m: usiz
 #[cfg(target_arch = "aarch64")]
 pub unsafe fn q4_0_matmul_neon(a: &[f32], b: &Q4Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
     q4_0_matmul_neon_inner(a, b, c, m, k, n);
+}
+
+pub fn q4_0_matmul_transposed_b(a: &[f32], b: &Q4Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    assert_eq!(b.cols, k, "B cols must match k in transposed mode");
+    assert_eq!(b.rows, n, "B rows must match n in transposed mode");
+    let bpr = b.cols / 32;
+    for v in c.iter_mut() { *v = 0.0; }
+    for j in 0..n {
+        let row_base = j * bpr;
+        let mut temp = vec![0.0f32; k];
+        for block_idx in 0..bpr {
+            let block = &b.blocks[row_base + block_idx];
+            let base = block_idx * 32;
+            block.dequantize(&mut temp[base..base + 32]);
+        }
+        for i in 0..m {
+            let mut acc = 0.0f32;
+            for l in 0..k { acc += a[i * k + l] * temp[l]; }
+            c[i * n + j] = acc;
+        }
+    }
 }
 
 pub fn q4_0_matmul(a: &[f32], b: &Q4Matrix, c: &mut [f32], m: usize, k: usize, n: usize) {

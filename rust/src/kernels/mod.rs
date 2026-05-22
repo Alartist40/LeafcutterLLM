@@ -208,11 +208,12 @@ pub fn dequantize_q8_k(data: &[u8], out: &mut [f32]) {
 
 /// Non-linear lookup table for IQ4_NL (improved 4-bit quantization).
 ///
-/// Source: llama.cpp ggml-common.h
-/// These 16 values are optimized for typical weight distributions.
+/// Source: llama.cpp ggml-common.h — kvalues_iq4nl
+/// These 16 values are the raw integer-ish lattice points; the block scale
+/// converts them to the final weight.
 const IQ4NL_TABLE: [f32; 16] = [
-    -1.0, -0.6962, -0.5251, -0.3952, -0.2893, -0.1957, -0.1107, -0.0322,
-     0.0322,  0.1107,  0.1957,  0.2893,  0.3952,  0.5251,  0.6962,  1.0,
+    -127.0, -104.0, -83.0, -65.0, -49.0, -35.0, -22.0, -10.0,
+       1.0,   13.0,  25.0,  38.0,  53.0,  69.0,  89.0, 113.0,
 ];
 
 /// Dequantize IQ4_NL blocks to f32.
@@ -342,11 +343,11 @@ mod tests {
         let mut data = vec![0u8; 18];
         // scale = 1.0 in f16
         data[0] = 0x00; data[1] = 0x3C;
-        // nibble0=0  (-1.0), nibble1=15 (1.0)
+        // nibble0=0 → table[0] = -127, nibble1=15 → table[15] = 113
         data[2] = 0xF0;
         let mut out = vec![0.0f32; 32];
         dequantize_iq4_nl(&data, &mut out);
-        assert!((out[0] - -1.0).abs() < 0.001);
-        assert!((out[1] - 1.0).abs() < 0.001);
+        assert!((out[0] - -127.0).abs() < 0.001, "out[0] = {}", out[0]);
+        assert!((out[1] - 113.0).abs() < 0.001, "out[1] = {}", out[1]);
     }
 }

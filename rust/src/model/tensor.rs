@@ -186,6 +186,19 @@ impl Tensor {
         self.q_data.is_some()
     }
 
+    /// Report approximate memory used by quantized data (bytes).
+    pub fn quantized_memory_bytes(&self) -> usize {
+        match &self.q_data {
+            Some(QuantizedData::Q4_K(q4)) => q4.blocks.len() * 144,
+            Some(QuantizedData::Q5_K(q5)) => q5.blocks.len() * 176,
+            Some(QuantizedData::Q6_K(q6)) => q6.blocks.len() * 210,
+            Some(QuantizedData::Q8_0(q8)) => q8.blocks.len() * 34,
+            Some(QuantizedData::Q4_0(q4)) => q4.blocks.len() * 18,
+            Some(QuantizedData::IQ4_NL(q4)) => q4.blocks.len() * 18,
+            None => 0,
+        }
+    }
+
     /// Set the global backend for all new Tensors.
     pub fn set_global_backend(backend: &'static dyn Backend) {
         set_global_backend(backend);
@@ -205,39 +218,41 @@ impl Tensor {
         let n = other.shape[1];
         assert_eq!(k, other.shape[0]);
 
-        // Fast path: if other has quantized weights, use native GEMM
+        // Fast path: if other has quantized weights, use native GEMM.
+        // Quantized matrices are stored in native GGUF layout [n, k];
+        // we compute C = A @ B^T using transposed-B kernels.
         if let Some(ref q) = other.q_data {
             let mut result = vec![0.0f32; m * n];
             match q {
                 QuantizedData::Q8_0(q8) => {
-                    assert_eq!(q8.rows, k);
-                    assert_eq!(q8.cols, n);
-                    crate::kernels::int8_gemm::q8_0_matmul(&self.data, q8, &mut result, m, k, n);
+                    assert_eq!(q8.cols, k, "Q8_0 cols mismatch");
+                    assert_eq!(q8.rows, n, "Q8_0 rows mismatch");
+                    crate::kernels::int8_gemm::q8_0_matmul_transposed_b(&self.data, q8, &mut result, m, k, n);
                 }
                 QuantizedData::Q4_0(q4) => {
-                    assert_eq!(q4.rows, k);
-                    assert_eq!(q4.cols, n);
-                    crate::kernels::int8_gemm::q4_0_matmul(&self.data, q4, &mut result, m, k, n);
+                    assert_eq!(q4.cols, k, "Q4_0 cols mismatch");
+                    assert_eq!(q4.rows, n, "Q4_0 rows mismatch");
+                    crate::kernels::int8_gemm::q4_0_matmul_transposed_b(&self.data, q4, &mut result, m, k, n);
                 }
                 QuantizedData::Q4_K(q4) => {
-                    assert_eq!(q4.rows, k);
-                    assert_eq!(q4.cols, n);
-                    crate::kernels::q4_k_gemm::q4_k_matmul(&self.data, q4, &mut result, m, k, n);
+                    assert_eq!(q4.cols, k, "Q4_K cols mismatch");
+                    assert_eq!(q4.rows, n, "Q4_K rows mismatch");
+                    crate::kernels::q4_k_gemm::q4_k_matmul_transposed_b(&self.data, q4, &mut result, m, k, n);
                 }
                 QuantizedData::IQ4_NL(q4) => {
-                    assert_eq!(q4.rows, k);
-                    assert_eq!(q4.cols, n);
-                    crate::kernels::iq4_nl_gemm::iq4_nl_matmul(&self.data, q4, &mut result, m, k, n);
+                    assert_eq!(q4.cols, k, "IQ4_NL cols mismatch");
+                    assert_eq!(q4.rows, n, "IQ4_NL rows mismatch");
+                    crate::kernels::iq4_nl_gemm::iq4_nl_matmul_transposed_b(&self.data, q4, &mut result, m, k, n);
                 }
                 QuantizedData::Q5_K(q5) => {
-                    assert_eq!(q5.rows, k);
-                    assert_eq!(q5.cols, n);
-                    crate::kernels::q5_k_gemm::q5_k_matmul(&self.data, q5, &mut result, m, k, n);
+                    assert_eq!(q5.cols, k, "Q5_K cols mismatch");
+                    assert_eq!(q5.rows, n, "Q5_K rows mismatch");
+                    crate::kernels::q5_k_gemm::q5_k_matmul_transposed_b(&self.data, q5, &mut result, m, k, n);
                 }
                 QuantizedData::Q6_K(q6) => {
-                    assert_eq!(q6.rows, k);
-                    assert_eq!(q6.cols, n);
-                    crate::kernels::q6_k_gemm::q6_k_matmul(&self.data, q6, &mut result, m, k, n);
+                    assert_eq!(q6.cols, k, "Q6_K cols mismatch");
+                    assert_eq!(q6.rows, n, "Q6_K rows mismatch");
+                    crate::kernels::q6_k_gemm::q6_k_matmul_transposed_b(&self.data, q6, &mut result, m, k, n);
                 }
             }
             return Self::from_vec_with_backend(result, vec![m, n], self.backend);

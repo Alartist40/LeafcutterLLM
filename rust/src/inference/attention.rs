@@ -228,7 +228,11 @@ pub fn attention_forward(
         let kv_h = h / num_kv_groups;
         for s in 0..seq_len {
             let mut scores = vec![0.0f32; total_seq_len];
-            let cache_len = total_seq_len - seq_len;
+            let cache_len = if total_seq_len > seq_len {
+                total_seq_len - seq_len
+            } else {
+                0
+            };
 
             for t in 0..total_seq_len {
                 if t > cache_len + s {
