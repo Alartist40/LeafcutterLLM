@@ -58,6 +58,10 @@ path = "src/bin/scan_corruption.rs"
 name = "ref_layers"
 path = "src/bin/ref_layers.rs"
 
+[[bin]]
+name = "diagnose_qwen36"
+path = "src/bin/diagnose_qwen36.rs"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }

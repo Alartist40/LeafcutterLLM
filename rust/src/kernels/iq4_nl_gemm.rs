@@ -161,21 +161,67 @@ pub unsafe fn iq4_nl_matmul_neon(a: &[f32], b: &IQ4NLMatrix, c: &mut [f32], m: u
 pub fn iq4_nl_matmul_transposed_b(a: &[f32], b: &IQ4NLMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
     assert_eq!(b.cols, k, "B cols must match k in transposed mode");
     assert_eq!(b.rows, n, "B rows must match n in transposed mode");
-    let bpr = b.cols / 32;
+    let bpr = b.blocks_per_row();
+
     for v in c.iter_mut() { *v = 0.0; }
-    for j in 0..n {
+
+    // Thread-local reusable buffers to eliminate per-task allocations.
+    use std::cell::RefCell;
+    thread_local! {
+        static TEMP_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+        static COL_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    }
+
+    let compute_col = |j: usize, temp: &mut [f32], col: &mut [f32]| {
         let row_base = j * bpr;
-        let mut temp = vec![0.0f32; k];
         for block_idx in 0..bpr {
             let block = &b.blocks[row_base + block_idx];
             let base = block_idx * 32;
             block.dequantize(&mut temp[base..base + 32]);
         }
         for i in 0..m {
-            let mut acc = 0.0f32;
-            for l in 0..k { acc += a[i * k + l] * temp[l]; }
-            c[i * n + j] = acc;
+            col[i] = crate::kernels::simd::simd_dot_product(&a[i * k..(i + 1) * k], temp);
         }
+    };
+
+    // For large matrices, parallelize over output columns.
+    if n >= 4096 {
+        use rayon::prelude::*;
+        let col_results: Vec<Vec<f32>> = (0..n)
+            .into_par_iter()
+            .map(|j| {
+                TEMP_BUF.with(|buf| {
+                    let mut temp = buf.borrow_mut();
+                    temp.resize(k, 0.0);
+                    COL_BUF.with(|cbuf| {
+                        let mut col = cbuf.borrow_mut();
+                        col.resize(m, 0.0);
+                        compute_col(j, &mut temp, &mut col);
+                        col.clone()
+                    })
+                })
+            })
+            .collect();
+        for j in 0..n {
+            for i in 0..m {
+                c[i * n + j] = col_results[j][i];
+            }
+        }
+    } else {
+        TEMP_BUF.with(|buf| {
+            let mut temp = buf.borrow_mut();
+            temp.resize(k, 0.0);
+            COL_BUF.with(|cbuf| {
+                let mut col = cbuf.borrow_mut();
+                col.resize(m, 0.0);
+                for j in 0..n {
+                    compute_col(j, &mut temp, &mut col);
+                    for i in 0..m {
+                        c[i * n + j] = col[i];
+                    }
+                }
+            })
+        });
     }
 }
 

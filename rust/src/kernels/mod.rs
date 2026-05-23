@@ -18,7 +18,7 @@ pub mod q8_0;
 pub mod quant_gemm_common;
 pub mod simd;
 
-use half::f16;
+use half::{f16, bf16};
 
 pub const QK_K: usize = 256;
 
@@ -40,6 +40,42 @@ pub fn dequantize_q4_0(data: &[u8], out: &mut [f32]) {
             out[i * block_size + j] = q0 * scale;
             out[i * block_size + j + 16] = q1 * scale;
         }
+    }
+}
+
+/// Dequantize Q4_1 blocks to f32
+/// Block layout (20 bytes for 32 values = 5.0 bpw):
+///   - bytes 0..1: scale `d` as f16
+///   - bytes 2..3: min `m` as f16
+///   - bytes 4..19: 32 nibbles packed into 16 bytes
+/// Dequant: value = d * nibble + m
+pub fn dequantize_q4_1(data: &[u8], out: &mut [f32]) {
+    let block_size = 32;
+    let group_size = 20;
+    let num_blocks = out.len() / block_size;
+
+    for i in 0..num_blocks {
+        let start = i * group_size;
+        let block = &data[start..start + group_size];
+        let scale = f16::from_le_bytes([block[0], block[1]]).to_f32();
+        let min = f16::from_le_bytes([block[2], block[3]]).to_f32();
+
+        for j in 0..16 {
+            let qs = block[4 + j];
+            let q0 = (qs & 0x0F) as f32;
+            let q1 = (qs >> 4) as f32;
+            out[i * block_size + j] = q0 * scale + min;
+            out[i * block_size + j + 16] = q1 * scale + min;
+        }
+    }
+}
+
+/// Dequantize BF16 elements to f32
+pub fn dequantize_bf16(data: &[u8], out: &mut [f32]) {
+    let count = out.len();
+    for i in 0..count {
+        let bytes = [data[i * 2], data[i * 2 + 1]];
+        out[i] = bf16::from_le_bytes(bytes).to_f32();
     }
 }
 

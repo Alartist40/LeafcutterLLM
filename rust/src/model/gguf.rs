@@ -170,8 +170,15 @@ impl GGUFile {
                     out[i] = half::f16::from_le_bytes(b).to_f32();
                 }
             }
+            QuantType::BF16 => {
+                for i in 0..cols {
+                    let b = [raw[i*2], raw[i*2+1]];
+                    out[i] = half::bf16::from_le_bytes(b).to_f32();
+                }
+            }
             QuantType::Q8_0 => crate::kernels::dequantize_q8_0(raw, &mut out),
             QuantType::Q4_0 => crate::kernels::dequantize_q4_0(raw, &mut out),
+            QuantType::Q4_1 => crate::kernels::dequantize_q4_1(raw, &mut out),
             QuantType::Q4_K => crate::kernels::dequantize_q4_k(raw, &mut out),
             QuantType::Q5_K => crate::kernels::dequantize_q5_k(raw, &mut out),
             QuantType::Q6_K => crate::kernels::dequantize_q6_k(raw, &mut out),
@@ -222,8 +229,15 @@ impl GGUFile {
                     out[i] = half::f16::from_le_bytes(b).to_f32();
                 }
             }
+            QuantType::BF16 => {
+                for i in 0..cols {
+                    let b = [raw[i*2], raw[i*2+1]];
+                    out[i] = half::bf16::from_le_bytes(b).to_f32();
+                }
+            }
             QuantType::Q8_0 => crate::kernels::dequantize_q8_0(raw, &mut out[..cols]),
             QuantType::Q4_0 => crate::kernels::dequantize_q4_0(raw, &mut out[..cols]),
+            QuantType::Q4_1 => crate::kernels::dequantize_q4_1(raw, &mut out[..cols]),
             QuantType::Q4_K => crate::kernels::dequantize_q4_k(raw, &mut out[..cols]),
             QuantType::Q5_K => crate::kernels::dequantize_q5_k(raw, &mut out[..cols]),
             QuantType::Q6_K => crate::kernels::dequantize_q6_k(raw, &mut out[..cols]),
@@ -283,6 +297,32 @@ impl GGUFile {
             }
             _ => None,
         }
+    }
+
+    pub fn get_metadata_f32(&self, key: &str) -> Option<f32> {
+        match self.metadata.get(key)? {
+            GGUFValue::F32(v) => Some(*v),
+            GGUFValue::F64(v) => Some(*v as f32),
+            GGUFValue::U8(v) => Some(*v as f32),
+            GGUFValue::I8(v) => Some(*v as f32),
+            GGUFValue::U16(v) => Some(*v as f32),
+            GGUFValue::I16(v) => Some(*v as f32),
+            GGUFValue::U32(v) => Some(*v as f32),
+            GGUFValue::I32(v) => Some(*v as f32),
+            GGUFValue::U64(v) => Some(*v as f32),
+            GGUFValue::I64(v) => Some(*v as f32),
+            _ => None,
+        }
+    }
+
+    /// Raw pointer to the mmap'd file data.
+    pub fn mmap_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
+    }
+
+    /// Total length of the mmap'd file in bytes.
+    pub fn mmap_len(&self) -> usize {
+        self.mmap.len()
     }
 }
 

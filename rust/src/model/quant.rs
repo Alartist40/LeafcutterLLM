@@ -256,7 +256,9 @@ impl QuantType {
         matches!(self,
             QuantType::F32 |
             QuantType::F16 |
+            QuantType::BF16 |
             QuantType::Q4_0 |
+            QuantType::Q4_1 |
             QuantType::Q8_0 |
             QuantType::Q4_K |
             QuantType::Q5_K |

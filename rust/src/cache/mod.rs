@@ -9,6 +9,7 @@
 //! (e.g. Qwen3.5 where only some layers use attention).
 
 pub mod ssm_state;
+pub mod deltanet_state;
 
 use crate::model::tensor::Tensor;
 use std::collections::HashMap;

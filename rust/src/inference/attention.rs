@@ -223,11 +223,16 @@ pub fn attention_forward(
     // -------------------------------------------------------------------------
     // Attention scores — parallel across heads
     // -------------------------------------------------------------------------
+    // Q may have larger head_dim than K/V (Qwen3.5/3.6: Q=512, K/V=256).
+    // The output per head is only kv_head_dim wide — the extra Q dimensions
+    // are used for scoring but don't expand the output. O_proj expects
+    // input of shape [seq_len, num_heads * kv_head_dim].
+    let output_dim_per_head = params.kv_head_dim;
     let head_outputs: Vec<Vec<f32>> = (0..params.num_heads)
         .into_par_iter()
         .map(|h| {
             let kv_h = h / num_kv_groups;
-            let mut head_out = vec![0.0f32; seq_len * params.head_dim];
+            let mut head_out = vec![0.0f32; seq_len * output_dim_per_head];
 
             for s in 0..seq_len {
                 let mut scores = vec![0.0f32; total_seq_len];
@@ -243,11 +248,13 @@ pub fn attention_forward(
                     } else {
                         let mut dot = 0.0f32;
                         for d in 0..params.kv_head_dim {
+                            // Q uses first kv_head_dim of its head_dim for scoring
                             let q_val = q.data[s * params.num_heads * params.head_dim + h * params.head_dim + d];
                             let k_val = k_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d];
                             dot += q_val * k_val;
                         }
-                        scores[t] = dot / (params.head_dim as f32).sqrt();
+                        // Scale by sqrt(kv_head_dim) — the dimension of the dot product
+                        scores[t] = dot / (params.kv_head_dim as f32).sqrt();
                     }
                 }
 
@@ -257,13 +264,13 @@ pub fn attention_forward(
                     scores[t] = (scores[t] - max_score).exp() / exp_sum;
                 }
 
-                for d in 0..params.head_dim {
+                for d in 0..output_dim_per_head {
                     let mut sum = 0.0f32;
                     for t in 0..total_seq_len {
-                        let v_val = v_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d.min(params.kv_head_dim - 1)];
+                        let v_val = v_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d];
                         sum += scores[t] * v_val;
                     }
-                    head_out[s * params.head_dim + d] = sum;
+                    head_out[s * output_dim_per_head + d] = sum;
                 }
             }
             head_out
@@ -271,17 +278,17 @@ pub fn attention_forward(
         .collect();
 
     // Reassemble heads into contiguous output
-    let mut attn_output = vec![0.0f32; seq_len * params.num_heads * params.head_dim];
+    let mut attn_output = vec![0.0f32; seq_len * params.num_heads * output_dim_per_head];
     for h in 0..params.num_heads {
         for s in 0..seq_len {
-            for d in 0..params.head_dim {
-                attn_output[s * params.num_heads * params.head_dim + h * params.head_dim + d] =
-                    head_outputs[h][s * params.head_dim + d];
+            for d in 0..output_dim_per_head {
+                attn_output[s * params.num_heads * output_dim_per_head + h * output_dim_per_head + d] =
+                    head_outputs[h][s * output_dim_per_head + d];
             }
         }
     }
 
-    let attn_tensor = Tensor::from_vec(attn_output, vec![seq_len, params.num_heads * params.head_dim]);
+    let attn_tensor = Tensor::from_vec(attn_output, vec![seq_len, params.num_heads * output_dim_per_head]);
 
     // Output projection
     let o_proj = weights.get("self_attn.o_proj.weight")
@@ -299,10 +306,11 @@ mod tests {
         let mut w = HashMap::new();
         let q_dim = heads * head_dim;
         let kv_dim = kv_heads * kv_head_dim;
+        let o_dim = heads * kv_head_dim; // attention output is num_heads * kv_head_dim
         w.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(vec![0.0; hidden * q_dim], vec![hidden, q_dim]));
         w.insert("self_attn.k_proj.weight".to_string(), Tensor::from_vec(vec![0.0; hidden * kv_dim], vec![hidden, kv_dim]));
         w.insert("self_attn.v_proj.weight".to_string(), Tensor::from_vec(vec![0.0; hidden * kv_dim], vec![hidden, kv_dim]));
-        w.insert("self_attn.o_proj.weight".to_string(), Tensor::from_vec(vec![0.0; q_dim * hidden], vec![q_dim, hidden]));
+        w.insert("self_attn.o_proj.weight".to_string(), Tensor::from_vec(vec![0.0; o_dim * hidden], vec![o_dim, hidden]));
         w
     }
 
@@ -310,9 +318,10 @@ mod tests {
         let mut w = HashMap::new();
         let q_dim = heads * head_dim;
         let kv_dim = kv_heads * kv_head_dim;
+        let o_dim = heads * kv_head_dim; // attention output is num_heads * kv_head_dim
         let fused_dim = q_dim + kv_dim + kv_dim;
         w.insert("attn_qkv.weight".to_string(), Tensor::from_vec(vec![0.0; hidden * fused_dim], vec![hidden, fused_dim]));
-        w.insert("attn_output.weight".to_string(), Tensor::from_vec(vec![0.0; q_dim * hidden], vec![q_dim, hidden]));
+        w.insert("attn_output.weight".to_string(), Tensor::from_vec(vec![0.0; o_dim * hidden], vec![o_dim, hidden]));
         w
     }
 

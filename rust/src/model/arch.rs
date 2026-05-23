@@ -13,6 +13,7 @@ pub enum ModelArchitecture {
     Llama,
     Qwen2,
     Qwen35,
+    Qwen36,
     Mistral,
     Phi,
     Gemma,
@@ -27,6 +28,7 @@ impl ModelArchitecture {
                 "llama"   => ModelArchitecture::Llama,
                 "qwen2"   => ModelArchitecture::Qwen2,
                 "qwen35"  => ModelArchitecture::Qwen35,
+                "qwen36"  => ModelArchitecture::Qwen36,
                 "mistral" => ModelArchitecture::Mistral,
                 "phi"     => ModelArchitecture::Phi,
                 "gemma"   => ModelArchitecture::Gemma,
@@ -43,6 +45,7 @@ impl ModelArchitecture {
             ModelArchitecture::Llama   => "Llama",
             ModelArchitecture::Qwen2   => "Qwen2",
             ModelArchitecture::Qwen35  => "Qwen3.5",
+            ModelArchitecture::Qwen36  => "Qwen3.6",
             ModelArchitecture::Mistral => "Mistral",
             ModelArchitecture::Phi     => "Phi",
             ModelArchitecture::Gemma   => "Gemma",
@@ -56,6 +59,7 @@ impl ModelArchitecture {
             ModelArchitecture::Llama   => "llama",
             ModelArchitecture::Qwen2   => "qwen2",
             ModelArchitecture::Qwen35  => "qwen35",
+            ModelArchitecture::Qwen36  => "qwen36",
             ModelArchitecture::Mistral => "llama", // Mistral uses llama.* keys
             ModelArchitecture::Phi     => "phi",
             ModelArchitecture::Gemma   => "gemma",
@@ -72,18 +76,19 @@ impl ModelArchitecture {
             ModelArchitecture::Llama |
             ModelArchitecture::Qwen2 |
             ModelArchitecture::Qwen35 |
+            ModelArchitecture::Qwen36 |
             ModelArchitecture::Mistral
         )
     }
 
     /// Whether this architecture uses SSM (State Space Model) layers.
     pub fn uses_ssm(self) -> bool {
-        matches!(self, ModelArchitecture::Qwen35)
+        matches!(self, ModelArchitecture::Qwen35 | ModelArchitecture::Qwen36)
     }
 
     /// Whether this architecture uses fused QKV projections.
     pub fn uses_fused_qkv(self) -> bool {
-        matches!(self, ModelArchitecture::Qwen35 | ModelArchitecture::Phi)
+        matches!(self, ModelArchitecture::Qwen35 | ModelArchitecture::Qwen36 | ModelArchitecture::Phi)
     }
 
     /// Standard transformer layer weight mappings for this architecture.
@@ -118,6 +123,39 @@ impl ModelArchitecture {
                 ("ssm_out.weight",    "ssm_out.weight"),
                 ("ssm_a",             "ssm_a"),
             ],
+            ModelArchitecture::Qwen36 => &[
+                // Gated DeltaNet (linear attention with state matrix)
+                ("attn_q.weight",          "self_attn.q_proj.weight"),
+                ("attn_k.weight",          "self_attn.k_proj.weight"),
+                ("attn_v.weight",          "self_attn.v_proj.weight"),
+                ("attn_output.weight",     "self_attn.o_proj.weight"),
+                // Fused QKV for hybrid layers
+                ("attn_qkv.weight",        "self_attn.qkv_proj.weight"),
+                ("attn_gate.weight",       "self_attn.gate_proj.weight"),
+                // MoE routing
+                ("ffn_gate_inp.weight",    "mlp.gate.weight"),
+                ("ffn_gate_exps.weight",   "mlp.expert_gate.weight"),
+                ("ffn_down_exps.weight",   "mlp.expert_down.weight"),
+                ("ffn_up_exps.weight",     "mlp.expert_up.weight"),
+                ("ffn_norm.weight",        "mlp.norm.weight"),
+                // Shared expert (Qwen-MoE style)
+                ("ffn_gate_shexp.weight",  "mlp.shared_expert_gate.weight"),
+                ("ffn_up_shexp.weight",    "mlp.shared_expert_up.weight"),
+                ("ffn_down_shexp.weight",  "mlp.shared_expert_down.weight"),
+                // Norms
+                ("attn_norm.weight",       "input_layernorm.weight"),
+                ("post_attention_norm.weight", "post_attention_layernorm.weight"),
+                // DeltaNet state / recurrent weights
+                ("ssm_alpha.weight",       "ssm_alpha.weight"),
+                ("ssm_beta.weight",        "ssm_beta.weight"),
+                ("ssm_conv1d.weight",      "ssm_conv1d.weight"),
+                ("ssm_dt.bias",            "ssm_dt.bias"),
+                ("ssm_norm.weight",        "ssm_norm.weight"),
+                ("ssm_out.weight",         "ssm_out.weight"),
+                ("ssm_a",                  "ssm_a"),
+                ("ssm_state.weight",       "ssm_state.weight"),
+                ("ssm_gate.weight",        "ssm_gate.weight"),
+            ],
             _ => &[
                 ("attn_q.weight",     "self_attn.q_proj.weight"),
                 ("attn_k.weight",     "self_attn.k_proj.weight"),
@@ -143,6 +181,18 @@ impl ModelArchitecture {
                 "nextn.enorm.weight",
                 "nextn.hnorm.weight",
                 "nextn.shared_head_norm.weight",
+            ],
+            ModelArchitecture::Qwen36 => &[
+                "attn_q_norm.weight",
+                "attn_k_norm.weight",
+                "attn_v_norm.weight",
+                "nextn.eh_proj.weight",
+                "nextn.enorm.weight",
+                "nextn.hnorm.weight",
+                "nextn.shared_head_norm.weight",
+                "moe_gate.weight",
+                "moe_norm.weight",
+                "expert_gate.weight",
             ],
             ModelArchitecture::Llama => &[
                 "attn_norm.bias",

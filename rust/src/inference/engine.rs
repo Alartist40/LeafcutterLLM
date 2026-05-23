@@ -9,8 +9,9 @@
 
 use crate::model::loader::{GGUFModel, ModelConfig};
 use crate::model::tensor::Tensor;
-use crate::cache::{KVCache, ssm_state::SSMStateCache};
+use crate::cache::{KVCache, ssm_state::SSMStateCache, deltanet_state::DeltaNetStateCache};
 use crate::inference::attention::{attention_forward, AttentionParams};
+use crate::inference::deltanet::{deltanet_forward, DeltaNetParams};
 use crate::inference::sampler::sample_top_p;
 use crate::inference::ssm::{ssm_forward, SSMConfig};
 use crate::inference::speculative::SpeculativeHead;
@@ -25,12 +26,15 @@ pub struct Engine {
     pub special_weights: HashMap<String, Tensor>,
     pub attn_params: AttentionParams,
     pub ssm_config: SSMConfig,
+    pub deltanet_params: DeltaNetParams,
     pub speculative_head: Option<SpeculativeHead>,
     /// Whether lm_head is tied to token embeddings (no separate output.weight tensor).
     lm_head_tied: bool,
     /// GGUF vocab tokenizer (lazy-initialized from model metadata).
     /// SSM state cache: persistent hidden state for Mamba-style layers.
     pub ssm_cache: SSMStateCache,
+    /// DeltaNet state cache: persistent matrix state for DeltaNet layers.
+    pub deltanet_cache: DeltaNetStateCache,
     /// Current sequence position offset for RoPE. Tracks total tokens processed
     /// across forward calls within a generation session.
     pub seq_offset: usize,
@@ -67,6 +71,13 @@ impl Engine {
             use_fused_qkv: report.uses_fused_qkv,
             use_gate: report.uses_ssm,
             ..Default::default()
+        };
+
+        // Build DeltaNet params for hybrid architectures
+        let deltanet_params = if report.uses_ssm {
+            Self::infer_deltanet_params(&model, &config)
+        } else {
+            DeltaNetParams::default()
         };
 
         // Build SSM config for hybrid architectures from model metadata
@@ -125,17 +136,81 @@ impl Engine {
             special_weights,
             attn_params,
             ssm_config,
+            deltanet_params,
             speculative_head,
             lm_head_tied,
 
             ssm_cache: SSMStateCache::new(),
+            deltanet_cache: DeltaNetStateCache::new(),
             seq_offset: 0,
         })
+    }
+
+    // -------------------------------------------------------------------------
+    // DeltaNet parameter inference from actual weight shapes
+    // -------------------------------------------------------------------------
+    fn infer_deltanet_params(model: &GGUFModel, config: &ModelConfig) -> DeltaNetParams {
+        let num_layers = config.num_hidden_layers;
+        for layer_idx in 0..num_layers.min(4) {
+            let prefix = format!("blk.{}", layer_idx);
+            let has_qkv = model.file.get_tensor_info(&format!("{}.{}", prefix, "attn_qkv.weight")).is_some();
+            if !has_qkv { continue; }
+
+            if let Some(info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "attn_qkv.weight")) {
+                let dims: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+                if dims.len() >= 2 {
+                    // GGUF stores 2-D weights as [in_dim, out_dim]
+                    let conv_dim = dims[1];
+
+                    // num_qk_heads comes from attention config, NOT ssm_alpha columns.
+                    // ssm_alpha/ssm_beta columns = num_v_heads (decay/beta is per-V-head).
+                    let num_qk_heads = config.num_attention_heads;
+
+                    let head_v_dim = if let Some(norm_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_norm.weight")) {
+                        norm_info.dimensions.iter().map(|&d| d as usize).product()
+                    } else if let Some(a_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_a")) {
+                        a_info.dimensions.iter().map(|&d| d as usize).product()
+                    } else { 128 };
+
+                    let (num_v_heads, head_k_dim) = if let Some(out_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_out.weight")) {
+                        let out_dims: Vec<usize> = out_info.dimensions.iter().map(|&d| d as usize).collect();
+                        let out_input_dim = out_dims[0]; // [in_dim, out_dim]
+                        let nvh = out_input_dim / head_v_dim.max(1);
+                        let hk = if num_qk_heads > 0 && conv_dim > nvh * head_v_dim {
+                            (conv_dim - nvh * head_v_dim) / (2 * num_qk_heads)
+                        } else { head_v_dim };
+                        (nvh, hk)
+                    } else {
+                        (num_qk_heads, head_v_dim)
+                    };
+
+                    let conv_kernel = if let Some(conv_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_conv1d.weight")) {
+                        conv_info.dimensions[0] as usize
+                    } else { 4 };
+
+                    eprintln!("  DeltaNet: qk_heads={}, v_heads={}, head_k={}, head_v={}, conv_dim={}, conv_k={}",
+                        num_qk_heads, num_v_heads, head_k_dim, head_v_dim, conv_dim, conv_kernel);
+
+                    return DeltaNetParams {
+                        num_qk_heads,
+                        num_v_heads,
+                        head_k_dim,
+                        head_v_dim,
+                        conv_dim,
+                        conv_kernel,
+                        state_size: head_v_dim,
+                    };
+                }
+            }
+        }
+        eprintln!("  Warning: Could not infer DeltaNet params, using defaults");
+        DeltaNetParams::default()
     }
 
     pub fn generate(&mut self, tokens: &[usize], max_tokens: usize, temperature: f32, top_p: f32) -> Vec<usize> {
         self.kv_cache.clear();
         self.ssm_cache.clear();
+        self.deltanet_cache.clear();
         self.seq_offset = 0;
 
         // Prefill
@@ -179,8 +254,10 @@ impl Engine {
             // Detect layer type from actual tensor contents (most robust)
             let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight")
                 || layer_weights.contains_key("attn_q.weight");
+            let has_deltanet = layer_weights.contains_key("ssm_alpha.weight")
+                || layer_weights.contains_key("self_attn.qkv_proj.weight");
             let has_ssm = layer_weights.contains_key("ssm_out.weight")
-                || layer_weights.contains_key("ssm_alpha.weight");
+                && !has_deltanet;
 
             // Pre-norm
             let pre_norm_weight = layer_weights.get("input_layernorm.weight")
@@ -191,7 +268,7 @@ impl Engine {
             if has_standard_attn {
                 let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
                 hidden = hidden.add(&attn_out);
-            } else if has_ssm {
+            } else if has_deltanet || has_ssm {
                 let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
                 hidden = hidden.add(&ssm_out);
             }
@@ -249,8 +326,10 @@ impl Engine {
 
             let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight")
                 || layer_weights.contains_key("attn_q.weight");
+            let has_deltanet = layer_weights.contains_key("ssm_alpha.weight")
+                || layer_weights.contains_key("self_attn.qkv_proj.weight");
             let has_ssm = layer_weights.contains_key("ssm_out.weight")
-                || layer_weights.contains_key("ssm_alpha.weight");
+                && !has_deltanet;
 
             let pre_norm_weight = layer_weights.get("input_layernorm.weight")
                 .or_else(|| layer_weights.get("attn_norm.weight"))
@@ -260,7 +339,7 @@ impl Engine {
             if has_standard_attn {
                 let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
                 hidden = hidden.add(&attn_out);
-            } else if has_ssm {
+            } else if has_deltanet || has_ssm {
                 let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
                 hidden = hidden.add(&ssm_out);
             }

@@ -171,7 +171,15 @@ impl GGUFModel {
             .map(|v| v as f32).unwrap_or(cfg.rope_theta);
 
         // Compute head dimensions
-        cfg.head_dim = cfg.hidden_size / cfg.num_attention_heads;
+        // For most models: head_dim = hidden_size / num_attention_heads.
+        // For Qwen3.5/3.6 the Q projection has larger outer dim (e.g. 12288 vs 5120),
+        // so we compute from actual weight tensor when available.
+        cfg.head_dim = (0..cfg.num_hidden_layers)
+            .find_map(|i| {
+                file.get_tensor_info(&format!("blk.{}.attn_q.weight", i))
+                    .map(|t| t.dimensions[1] as usize / cfg.num_attention_heads)
+            })
+            .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
 
         // Compressed KV dimensions (M5) — for Qwen3.5, key_length != embedding_length / head_count
         cfg.kv_head_dim = Self::get_meta_int(file, &[&format!("{}.attention.key_length", prefix), "llama.attention.key_length", "qwen35.attention.key_length"])
@@ -323,7 +331,14 @@ impl GGUFModel {
                     out[i] = half::f16::from_le_bytes(bytes).to_f32();
                 }
             }
+            QuantType::BF16 => {
+                for i in 0..count {
+                    let bytes = [data[i * 2], data[i * 2 + 1]];
+                    out[i] = half::bf16::from_le_bytes(bytes).to_f32();
+                }
+            }
             QuantType::Q4_0 => kernels::dequantize_q4_0(data, &mut out),
+            QuantType::Q4_1 => kernels::dequantize_q4_1(data, &mut out),
             QuantType::Q8_0 => kernels::dequantize_q8_0(data, &mut out),
             QuantType::Q4_K => kernels::dequantize_q4_k(data, &mut out),
             QuantType::Q5_K => kernels::dequantize_q5_k(data, &mut out),

@@ -44,7 +44,7 @@ pub fn ssm_forward(
     let seq_len = hidden_states.shape[0];
     let hidden_size = hidden_states.shape[1];
 
-    // 1. Input projection: attn_qkv outputs 3*hidden (or intermediate)
+    // 1. In-projection: hidden → [X, z_gate]
     let x_inner = if let Some(in_proj) = weights.get("ssm_in_proj.weight")
         .or_else(|| weights.get("self_attn.qkv_proj.weight"))
         .or_else(|| weights.get("attn_qkv.weight")) {
@@ -52,95 +52,116 @@ pub fn ssm_forward(
     } else {
         hidden_states.clone()
     };
-    let inner_size = x_inner.shape[1];
+    let inner_total = x_inner.shape[1];
 
-    // 2. Causal conv1d — only apply if shape matches
+    // 2. Causal conv1d on FULL in-proj output (conv weight has 8192 channels)
     let x_conv = if let Some(conv_w) = weights.get("ssm_conv1d.weight") {
         let conv_state = ssm_cache.get_conv(layer_idx);
-        let (out, new_state) = if conv_w.shape.len() >= 2 && conv_w.shape[1] == inner_size {
-            causal_conv1d_cached(&x_inner, conv_w, conv_w.shape[0], &conv_state)
-        } else if conv_w.shape.len() == 1 {
-            causal_conv1d_cached(&x_inner, conv_w, _config.conv_kernel.min(conv_w.data.len()), &conv_state)
-        } else {
-            (x_inner.clone(), vec![])
-        };
+        let kernel = conv_w.shape[0];
+        let (out, new_state) = causal_conv1d_cached(&x_inner, conv_w, kernel, &conv_state);
         ssm_cache.set_conv(layer_idx, new_state);
         out
     } else {
         x_inner.clone()
     };
 
-    // 3. B and C projections from hidden state (Qwen3.5 style)
+    // 3. Split conv output into X (first half) and z_gate (second half)
+    let half = hidden_size;
+    let mut x_data = vec![0.0f32; seq_len * half];
+    let mut z_data = vec![0.0f32; seq_len * half];
+    for s in 0..seq_len {
+        let base = s * inner_total;
+        x_data[s * half..(s + 1) * half].copy_from_slice(&x_conv.data[base..base + half]);
+        z_data[s * half..(s + 1) * half].copy_from_slice(&x_conv.data[base + half..base + inner_total]);
+    }
+    let mut x = Tensor::from_vec(x_data, vec![seq_len, half]);
+    let z_gate = Tensor::from_vec(z_data, vec![seq_len, half]);
+
+    // 4. SiLU on conv output (X only, not z_gate)
+    let mut x_conv = x_conv;
+    for i in 0..x_conv.data.len() {
+        let v = x_conv.data[i];
+        x_conv.data[i] = v * (1.0 / (1.0 + (-v).exp()));
+    }
+
+    // 5. B and C projections from hidden state
+    let state_size = _config.state_size;
     let b_raw = if let Some(b_w) = weights.get("ssm_beta.weight")
         .or_else(|| weights.get("ssm_B.weight")) {
         hidden_states.matmul(b_w)
     } else {
-        Tensor::zeros(vec![seq_len, _config.state_size])
+        Tensor::zeros(vec![seq_len, state_size])
     };
-
     let c_raw = if let Some(c_w) = weights.get("ssm_alpha.weight")
         .or_else(|| weights.get("ssm_C.weight")) {
         hidden_states.matmul(c_w)
     } else {
-        Tensor::zeros(vec![seq_len, _config.state_size])
+        Tensor::zeros(vec![seq_len, state_size])
     };
 
-    // 4. Delta projection
+    // 6. Delta (dt) projection + bias
     let dt_raw = if let Some(dt_w) = weights.get("ssm_dt.weight") {
-        hidden_states.matmul(dt_w)
+        let dt_proj = hidden_states.matmul(dt_w);
+        if let Some(dt_b) = weights.get("ssm_dt.bias") {
+            let mut dt = dt_proj;
+            for s in 0..seq_len {
+                for i in 0..state_size {
+                    dt.data[s * state_size + i] += dt_b.data[i % dt_b.data.len()];
+                }
+            }
+            dt
+        } else {
+            dt_proj
+        }
     } else if let Some(dt_b) = weights.get("ssm_dt.bias") {
-        let mut dt_data = vec![0.0f32; seq_len * _config.state_size];
-        for t in 0..seq_len {
-            for i in 0.._config.state_size {
-                dt_data[t * _config.state_size + i] = dt_b.data[i % dt_b.data.len()];
+        let mut dt_data = vec![0.0f32; seq_len * state_size];
+        for s in 0..seq_len {
+            for i in 0..state_size {
+                dt_data[s * state_size + i] = dt_b.data[i % dt_b.data.len()];
             }
         }
-        Tensor::from_vec(dt_data, vec![seq_len, _config.state_size])
+        Tensor::from_vec(dt_data, vec![seq_len, state_size])
     } else {
-        Tensor::zeros(vec![seq_len, _config.state_size])
+        Tensor::zeros(vec![seq_len, state_size])
     };
 
-    // 5. Broadcast B, C, delta to match conv output channels
-    // Qwen3.5 uses group-wise SSM: state_size groups, each with inner_size/group_count channels
-    let b_proj = broadcast_to_dim(b_raw, inner_size);
-    let c_proj = broadcast_to_dim(c_raw, inner_size);
-    let dt_proj = broadcast_to_dim(dt_raw, inner_size);
+    // 7. Broadcast B, C, delta to match X channels (half = hidden_size)
+    let conv_channels = x_conv.shape[1];
+    let b_proj = broadcast_to_dim(b_raw, conv_channels);
+    let c_proj = broadcast_to_dim(c_raw, conv_channels);
+    let dt_proj = broadcast_to_dim(dt_raw, conv_channels);
 
-    // 6. A matrix broadcast to inner_size
+    // 8. A_log → A discretization (Mamba convention)
     let a_vec = weights.get("ssm_a")
-        .map(|t| t.data.clone())
-        .unwrap_or_else(|| vec![-1.0f32; _config.state_size]);
+        .map(|t| t.data.iter().map(|&a_log| -a_log.exp()).collect::<Vec<f32>>())
+        .unwrap_or_else(|| vec![-1.0f32; state_size]);
 
-    // 7. Selective scan on inner_size channels
-    // Retrieve previous state from cache (or zeros if first call)
-    let initial_state = ssm_cache.get(layer_idx, inner_size);
-    let (y, final_state) = selective_scan(&x_conv, &b_proj, &c_proj, &dt_proj, &a_vec, inner_size, Some(&initial_state));
-    // Store final state back to cache for next token
+    // 9. Selective scan
+    let initial_state = ssm_cache.get(layer_idx, conv_channels);
+    let (y, final_state) = selective_scan(
+        &x_conv, &b_proj, &c_proj, &dt_proj, &a_vec,
+        conv_channels, Some(&initial_state),
+    );
     ssm_cache.set(layer_idx, final_state);
 
-    // 8. Optional gating (attn_gate.weight)
-    let y_gated = if let Some(gate_w) = weights.get("self_attn.gate_proj.weight")
-        .or_else(|| weights.get("attn_gate.weight")) {
-        let gate = hidden_states.matmul(gate_w);
-        let mut gated = vec![0.0f32; y.data.len()];
-        for i in 0..gated.len() {
-            let sigmoid = 1.0 / (1.0 + (-gate.data[i % gate.data.len()]).exp());
-            gated[i] = y.data[i] * sigmoid;
-        }
-        Tensor::from_vec(gated, y.shape.clone())
-    } else {
-        y
-    };
+    // 10. Group norm (ssm_norm.weight = [state_size/num_groups])
+    let mut y_normed = y.clone();
+    if let Some(norm_w) = weights.get("ssm_norm.weight") {
+        apply_group_norm(&mut y_normed, seq_len, conv_channels, norm_w, 1e-5);
+    }
 
-    // 9. Output projection with shape adaptation
+    // 11. Gating: y * silu(z_gate)
+    let activated = z_gate.silu();
+    let mut gated = vec![0.0f32; y_normed.data.len()];
+    for i in 0..gated.len() {
+        gated[i] = y_normed.data[i] * activated.data[i % activated.data.len()];
+    }
+    let y_gated = Tensor::from_vec(gated, y_normed.shape.clone());
+
+    // 12. Output projection
     if let Some(out_proj) = weights.get("ssm_out.weight")
         .or_else(|| weights.get("ssm_out_proj.weight")) {
-        if y_gated.shape[1] == out_proj.shape[0] {
-            y_gated.matmul(out_proj)
-        } else {
-            // Adaptive: project via mean-pooling or slice-matching
-            adaptive_matmul(&y_gated, out_proj, hidden_size)
-        }
+        y_gated.matmul(out_proj)
     } else {
         adaptive_fallback(y_gated, hidden_size)
     }
@@ -160,6 +181,22 @@ fn broadcast_to_dim(t: Tensor, target_dim: usize) -> Tensor {
         }
     }
     Tensor::from_vec(out, vec![seq_len, target_dim])
+}
+
+/// Group norm: normalize all channels together per sequence position.
+fn apply_group_norm(x: &mut Tensor, seq_len: usize, channels: usize, weight: &Tensor, eps: f32) {
+    for s in 0..seq_len {
+        let base = s * channels;
+        let mut sq_sum = 0.0f32;
+        for c in 0..channels {
+            let v = x.data[base + c];
+            sq_sum += v * v;
+        }
+        let rms = (sq_sum / channels as f32 + eps).sqrt();
+        for c in 0..channels {
+            x.data[base + c] = (x.data[base + c] / rms) * weight.data[c % weight.data.len()];
+        }
+    }
 }
 
 /// Adaptive matmul when inner dims don't match.
@@ -270,10 +307,13 @@ fn causal_conv1d_cached(
             let global_t = state_len + t;
             for k in 0..kernel_size.min(global_t + 1) {
                 let x_val = full_input[(global_t - k) * channels + c];
+                // PyTorch Conv1d convention: w[k-1] is the coefficient for the CURRENT input.
+                // Reverse the kernel index to match exported weights.
+                let w_idx = kernel_size - 1 - k;
                 let w_val = if weight.shape.len() == 1 {
-                    weight.data[k]
+                    weight.data[w_idx]
                 } else {
-                    weight.data[k * weight.shape[1] + c]
+                    weight.data[w_idx * weight.shape[1] + c]
                 };
                 sum += x_val * w_val;
             }
