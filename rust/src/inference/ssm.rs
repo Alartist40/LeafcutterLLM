@@ -77,11 +77,10 @@ pub fn ssm_forward(
     let mut x = Tensor::from_vec(x_data, vec![seq_len, half]);
     let z_gate = Tensor::from_vec(z_data, vec![seq_len, half]);
 
-    // 4. SiLU on conv output (X only, not z_gate)
-    let mut x_conv = x_conv;
-    for i in 0..x_conv.data.len() {
-        let v = x_conv.data[i];
-        x_conv.data[i] = v * (1.0 / (1.0 + (-v).exp()));
+    // 4. SiLU on X (the selective-scan input, not z_gate)
+    for i in 0..x.data.len() {
+        let v = x.data[i];
+        x.data[i] = v * (1.0 / (1.0 + (-v).exp()));
     }
 
     // 5. B and C projections from hidden state
@@ -126,7 +125,7 @@ pub fn ssm_forward(
     };
 
     // 7. Broadcast B, C, delta to match X channels (half = hidden_size)
-    let conv_channels = x_conv.shape[1];
+    let conv_channels = x.shape[1];
     let b_proj = broadcast_to_dim(b_raw, conv_channels);
     let c_proj = broadcast_to_dim(c_raw, conv_channels);
     let dt_proj = broadcast_to_dim(dt_raw, conv_channels);
@@ -136,10 +135,10 @@ pub fn ssm_forward(
         .map(|t| t.data.iter().map(|&a_log| -a_log.exp()).collect::<Vec<f32>>())
         .unwrap_or_else(|| vec![-1.0f32; state_size]);
 
-    // 9. Selective scan
+    // 9. Selective scan on x (4096 channels), not the full conv output
     let initial_state = ssm_cache.get(layer_idx, conv_channels);
     let (y, final_state) = selective_scan(
-        &x_conv, &b_proj, &c_proj, &dt_proj, &a_vec,
+        &x, &b_proj, &c_proj, &dt_proj, &a_vec,
         conv_channels, Some(&initial_state),
     );
     ssm_cache.set(layer_idx, final_state);
