@@ -9,6 +9,23 @@ server
 test-suite
 tui
 
+# Diagnostic / debug binaries in rust/src/bin/ (temporary test tools)
+rust/src/bin/check_*.rs
+rust/src/bin/test_*.rs
+rust/src/bin/dump_*.rs
+rust/src/bin/diagnose_*.rs
+rust/src/bin/debug_*.rs
+rust/src/bin/profile_*.rs
+rust/src/bin/bench_*.rs
+rust/src/bin/ref_*.rs
+rust/src/bin/compare_*.rs
+rust/src/bin/scan_*.rs
+rust/src/bin/split_*.rs
+rust/src/bin/list_*.rs
+rust/src/bin/diag_*.rs
+rust/src/bin/*.bak
+rust/synthetic_*.py
+
 # Build artifacts
 coverage.out
 rust/target/
