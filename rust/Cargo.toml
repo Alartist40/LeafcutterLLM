@@ -62,6 +62,10 @@ path = "src/bin/ref_layers.rs"
 name = "diagnose_qwen36"
 path = "src/bin/diagnose_qwen36.rs"
 
+[[bin]]
+name = "test_ssm_synthetic"
+path = "src/bin/test_ssm_synthetic.rs"
+
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
@@ -87,7 +91,27 @@ which = "7.0"
 libc = "0.2"
 shellexpand = "3.1"
 hex = "0.4.3"
-gemm = "0.17"
+matrixmultiply = "0.3"
+
+[[bin]]
+name = "comprehensive_diagnostic"
+path = "src/bin/comprehensive_diagnostic.rs"
+
+[[bin]]
+name = "test_real_deltanet"
+path = "src/bin/test_real_deltanet.rs"
+
+[[bin]]
+name = "test_deltanet_accumulation"
+path = "src/bin/test_deltanet_accumulation.rs"
+
+[[bin]]
+name = "test_qwen_ffi"
+path = "src/bin/test_qwen_ffi.rs"
+
+[[bin]]
+name = "benchmark_models"
+path = "src/bin/benchmark_models.rs"
 
 [features]
 default = []

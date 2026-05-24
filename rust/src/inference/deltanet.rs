@@ -111,6 +111,8 @@ pub fn deltanet_forward(
     let beta = compute_beta_gates(hidden_states, weights, params, seq_len);
     // beta shape: [seq_len, num_qk_heads]
 
+
+
     // 7. Delta rule state update + output
     let output_dim_per_token = params.num_v_heads * params.head_v_dim;
     let mut output = vec![0.0f32; seq_len * output_dim_per_token];
@@ -160,22 +162,27 @@ pub fn deltanet_forward(
                 }
 
                 // 2. State update: S = decay * S + beta * ((v - v_pred) outer k)
+                let mut max_delta_v = 0.0f32;
                 for i in 0..params.head_v_dim {
                     let delta_v = v_h[i] - v_pred[i];
+                    max_delta_v = max_delta_v.max(delta_v.abs());
                     for j in 0..params.head_k_dim {
                         let idx = state_stride + i * params.head_k_dim + j;
                         state[idx] = decay_h * state[idx] + beta_h * delta_v * k_h[j];
                     }
                 }
 
-                // 3. Output: o = S @ q
+
+
+                // 3. Output: o = scale * S @ q
+                let scale = 1.0f32 / (params.head_k_dim as f32).sqrt();
                 let out_base = s * output_dim_per_token + h_v * params.head_v_dim;
                 for i in 0..params.head_v_dim {
                     let mut sum = 0.0f32;
                     for j in 0..params.head_k_dim {
                         sum += state[state_stride + i * params.head_k_dim + j] * q_h[j];
                     }
-                    output[out_base + i] = sum;
+                    output[out_base + i] = scale * sum;
                 }
             }
         }
@@ -183,20 +190,22 @@ pub fn deltanet_forward(
 
     let mut output_tensor = Tensor::from_vec(output, vec![seq_len, output_dim_per_token]);
 
-    // 8. Group norm (ssm_norm) — CRITICAL for stable state magnitudes
-    // ssm_norm.weight = [head_v_dim] — applied per V-head
+    // 8. Group norm — 128 groups over 4096 channels, 32 channels per group
     if let Some(norm_w) = weights.get("ssm_norm.weight") {
-        apply_per_head_rms_norm(&mut output_tensor, seq_len, params.num_v_heads, params.head_v_dim, norm_w, 1e-6);
+        let num_groups = norm_w.data.len();
+        apply_group_norm(&mut output_tensor.data, seq_len, output_dim_per_token, num_groups, norm_w, 1e-5);
     }
 
     // 9. Output projection
-    if let Some(out_w) = weights.get("ssm_out.weight")
+    let mut output = if let Some(out_w) = weights.get("ssm_out.weight")
         .or_else(|| weights.get("ssm_out_proj.weight"))
     {
         output_tensor.matmul(out_w)
     } else {
         adaptive_project(&output_tensor, hidden_size)
-    }
+    };
+
+    output
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -243,9 +252,8 @@ fn compute_decay_rates(
         for h in 0..num_heads {
             let alpha_val = alpha_proj.data[s * num_heads + h];
             let dt_val = dt_bias.get(h).copied().unwrap_or(0.0);
-            let a_log = a_vals(h, &a_vec);
-            // Mamba discretization: A = -exp(A_log), decay = exp(dt * A)
-            let a = -a_log.exp();
+            let a = a_vals(h, &a_vec);
+            // ssm_a is already A = -exp(A_log) from GGUF conversion
             let dt = softplus(alpha_val + dt_val);
             decay[s * num_heads + h] = (dt * a).exp();
         }
@@ -283,6 +291,30 @@ fn softplus(x: f32) -> f32 {
 
 fn sigmoid(x: f32) -> f32 {
     1.0f32 / (1.0f32 + (-x).exp())
+}
+
+fn max_abs(data: &[f32]) -> f32 {
+    data.iter().map(|&v| v.abs()).fold(0.0f32, f32::max)
+}
+
+/// Group norm: normalize channels per-group.
+fn apply_group_norm(data: &mut [f32], seq_len: usize, channels: usize, num_groups: usize, weight: &Tensor, eps: f32) {
+    let channels_per_group = channels / num_groups;
+    for s in 0..seq_len {
+        for g in 0..num_groups {
+            let base = s * channels + g * channels_per_group;
+            let mut sq_sum = 0.0f32;
+            for c in 0..channels_per_group {
+                let v = data[base + c];
+                sq_sum += v * v;
+            }
+            let rms = (sq_sum / channels_per_group as f32 + eps).sqrt();
+            let w = weight.data[g % weight.data.len()];
+            for c in 0..channels_per_group {
+                data[base + c] = (data[base + c] / rms) * w;
+            }
+        }
+    }
 }
 
 /// Causal conv1d with state caching for autoregressive generation.

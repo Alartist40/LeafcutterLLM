@@ -18,6 +18,10 @@ use crate::inference::speculative::SpeculativeHead;
 use crate::tokenizer::GgufTokenizer;
 use rayon::prelude::*;
 use std::collections::HashMap;
+#[cfg(feature = "llama-ffi")]
+use crate::llama_ffi::{LlamaModel, LlamaContext};
+#[cfg(feature = "llama-ffi")]
+use std::path::Path;
 
 pub struct Engine {
     pub model: GGUFModel,
@@ -39,15 +43,72 @@ pub struct Engine {
     /// across forward calls within a generation session.
     pub seq_offset: usize,
     // Embedding lookup is on-demand via mmap — see embed_lookup_mmap()
+    #[cfg(feature = "llama-ffi")]
+    ffi_model: Option<LlamaModel>,
+    #[cfg(feature = "llama-ffi")]
+    ffi_context: Option<LlamaContext>,
 }
 
 impl Engine {
+    /// Quick architecture detection without full load.
+    fn detect_arch(path: &str) -> String {
+        if let Ok(model) = GGUFModel::load(path) {
+            model.architecture.name().to_lowercase()
+        } else {
+            String::new()
+        }
+    }
+
+    #[cfg(feature = "llama-ffi")]
+    fn load_ffi(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let model = LlamaModel::load(Path::new(path), 0)
+            .map_err(|e| format!("Failed to load model via FFI: {}", e))?;
+        let context = LlamaContext::new(&model, 4096, 4)
+            .map_err(|e| format!("Failed to create FFI context: {}", e))?;
+
+        // Still load GGUFModel for metadata (config, tokenizer info, etc.)
+        let gguf_model = GGUFModel::load(path)?;
+        let config = gguf_model.config.clone();
+
+        Ok(Self {
+            model: gguf_model,
+            config,
+            kv_cache: KVCache::new(0),
+            special_weights: HashMap::new(),
+            attn_params: AttentionParams::default(),
+            ssm_config: SSMConfig::default(),
+            deltanet_params: DeltaNetParams::default(),
+            speculative_head: None,
+            lm_head_tied: false,
+            ssm_cache: SSMStateCache::new(),
+            deltanet_cache: DeltaNetStateCache::new(),
+            seq_offset: 0,
+            ffi_model: Some(model),
+            ffi_context: Some(context),
+        })
+    }
+
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        #[cfg(feature = "llama-ffi")]
+        {
+            let arch = Self::detect_arch(path);
+            if arch == "qwen3.5" || arch == "qwen3.6" {
+                eprintln!("Detected {} — using llama.cpp FFI backend", arch);
+                return Self::load_ffi(path);
+            }
+        }
+
         let model = GGUFModel::load(path)?;
 
         // Run pre-flight capability report
         let report = model.capability_report();
         if !report.can_run {
+            #[cfg(feature = "llama-ffi")]
+            if !report.quant_summary.unsupported.is_empty() {
+                eprintln!("Native unsupported quants: {:?}, falling back to llama.cpp FFI...",
+                    report.quant_summary.unsupported);
+                return Self::load_ffi(path);
+            }
             eprintln!("\n{}", report.print());
             return Err(format!(
                 "Model cannot run: architecture={} unsupported_quant={} missing_tensors={}",
@@ -61,17 +122,10 @@ impl Engine {
         let mut special_weights = model.load_special()?;
         let kv_cache = KVCache::new(config.num_hidden_layers);
 
-        // Build attention params with fused QKV / compressed KV support
-        let attn_params = AttentionParams {
-            num_heads: config.num_attention_heads,
-            num_kv_heads: config.num_key_value_heads,
-            head_dim: config.head_dim,
-            kv_head_dim: config.kv_head_dim,
-            rope_theta: config.rope_theta,
-            use_fused_qkv: report.uses_fused_qkv,
-            use_gate: report.uses_ssm,
-            ..Default::default()
-        };
+        // Build attention params from actual weight shapes (metadata may lie)
+        let mut attn_params = Self::infer_attention_params(&model, &config);
+        attn_params.use_fused_qkv = report.uses_fused_qkv;
+        attn_params.use_gate = report.uses_ssm;
 
         // Build DeltaNet params for hybrid architectures
         let deltanet_params = if report.uses_ssm {
@@ -90,8 +144,15 @@ impl Engine {
                 }
                 None
             };
+            // Read actual state_size from ssm_a tensor (metadata may lie)
+            let actual_state_size = (0..config.num_hidden_layers)
+                .find_map(|i| {
+                    model.file.get_tensor_info(&format!("blk.{}.ssm_a", i))
+                        .map(|t| t.dimensions.iter().map(|&d| d as usize).product())
+                })
+                .unwrap_or(128);
             SSMConfig {
-                state_size: get_meta(&["qwen35.ssm.state_size", "ssm.state_size"]).map(|v| v as usize).unwrap_or(128),
+                state_size: actual_state_size,
                 inner_size: get_meta(&["qwen35.ssm.inner_size", "ssm.inner_size"]).map(|v| v as usize).unwrap_or(config.intermediate_size),
                 time_step_rank: get_meta(&["qwen35.ssm.time_step_rank", "ssm.time_step_rank"]).map(|v| v as usize).unwrap_or(32),
                 conv_kernel: get_meta(&["qwen35.ssm.conv_kernel", "ssm.conv_kernel"]).map(|v| v as usize).unwrap_or(4),
@@ -143,6 +204,10 @@ impl Engine {
             ssm_cache: SSMStateCache::new(),
             deltanet_cache: DeltaNetStateCache::new(),
             seq_offset: 0,
+            #[cfg(feature = "llama-ffi")]
+            ffi_model: None,
+            #[cfg(feature = "llama-ffi")]
+            ffi_context: None,
         })
     }
 
@@ -162,27 +227,23 @@ impl Engine {
                     // GGUF stores 2-D weights as [in_dim, out_dim]
                     let conv_dim = dims[1];
 
-                    // num_qk_heads comes from attention config, NOT ssm_alpha columns.
-                    // ssm_alpha/ssm_beta columns = num_v_heads (decay/beta is per-V-head).
-                    let num_qk_heads = config.num_attention_heads;
+                    // num_v_heads = ssm_a length (one decay param per V-head)
+                    let num_v_heads = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_a"))
+                        .map(|t| t.dimensions.iter().map(|&d| d as usize).product())
+                        .unwrap_or(32);
 
-                    let head_v_dim = if let Some(norm_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_norm.weight")) {
-                        norm_info.dimensions.iter().map(|&d| d as usize).product()
-                    } else if let Some(a_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_a")) {
-                        a_info.dimensions.iter().map(|&d| d as usize).product()
+                    // head_v_dim from ssm_out input_dim / num_v_heads
+                    let head_v_dim = if let Some(out_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_out.weight")) {
+                        let out_dims: Vec<usize> = out_info.dimensions.iter().map(|&d| d as usize).collect();
+                        out_dims[0] / num_v_heads.max(1)
                     } else { 128 };
 
-                    let (num_v_heads, head_k_dim) = if let Some(out_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_out.weight")) {
-                        let out_dims: Vec<usize> = out_info.dimensions.iter().map(|&d| d as usize).collect();
-                        let out_input_dim = out_dims[0]; // [in_dim, out_dim]
-                        let nvh = out_input_dim / head_v_dim.max(1);
-                        let hk = if num_qk_heads > 0 && conv_dim > nvh * head_v_dim {
-                            (conv_dim - nvh * head_v_dim) / (2 * num_qk_heads)
-                        } else { head_v_dim };
-                        (nvh, hk)
-                    } else {
-                        (num_qk_heads, head_v_dim)
-                    };
+                    // Assume num_qk_heads = num_v_heads for DeltaNet layers
+                    let num_qk_heads = num_v_heads;
+
+                    let head_k_dim = if num_qk_heads > 0 && conv_dim > num_v_heads * head_v_dim {
+                        (conv_dim - num_v_heads * head_v_dim) / (2 * num_qk_heads)
+                    } else { head_v_dim };
 
                     let conv_kernel = if let Some(conv_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_conv1d.weight")) {
                         conv_info.dimensions[0] as usize
@@ -207,14 +268,96 @@ impl Engine {
         DeltaNetParams::default()
     }
 
+    // -------------------------------------------------------------------------
+    // Attention parameter inference from actual weight shapes
+    // -------------------------------------------------------------------------
+    fn infer_attention_params(model: &GGUFModel, config: &ModelConfig) -> AttentionParams {
+        let num_layers = config.num_hidden_layers;
+        let mut q_out_dim = 0usize;
+        let mut kv_out_dim = 0usize;
+        let mut o_in_dim = 0usize;
+        for layer_idx in 0..num_layers.min(8) {
+            if let Some(info) = model.file.get_tensor_info(&format!("blk.{}.attn_q.weight", layer_idx)) {
+                q_out_dim = info.dimensions[1] as usize;
+                if let Some(k_info) = model.file.get_tensor_info(&format!("blk.{}.attn_k.weight", layer_idx)) {
+                    kv_out_dim = k_info.dimensions[1] as usize;
+                }
+                if let Some(o_info) = model.file.get_tensor_info(&format!("blk.{}.attn_output.weight", layer_idx)) {
+                    // GGUF stores 2-D weights as [in_dim, out_dim]
+                    o_in_dim = o_info.dimensions[0] as usize;
+                }
+                break;
+            }
+        }
+
+        if q_out_dim == 0 {
+            return AttentionParams {
+                num_heads: config.num_attention_heads,
+                num_kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+                kv_head_dim: config.kv_head_dim,
+                rope_theta: config.rope_theta,
+                use_fused_qkv: false,
+                use_gate: false,
+            };
+        }
+
+        let num_kv_heads = model.file.get_metadata_int("qwen35.attention.head_count_kv")
+            .or_else(|| model.file.get_metadata_int("attention.head_count_kv"))
+            .or_else(|| model.file.get_metadata_int("llama.attention.head_count_kv"))
+            .map(|v| v as usize)
+            .unwrap_or(config.num_key_value_heads);
+
+        let kv_head_dim = if num_kv_heads > 0 { kv_out_dim / num_kv_heads } else { config.kv_head_dim };
+        // Derive num_heads from O_proj's expected input rather than Q's total dims.
+        // Q may have extra dimensions (e.g. 12288 = 48 × 256) but O_proj expects
+        // only num_heads × kv_head_dim input dims (e.g. 6144 = 24 × 256).
+        let num_heads = if kv_head_dim > 0 && o_in_dim > 0 { o_in_dim / kv_head_dim } else { config.num_attention_heads };
+        let head_dim = if num_heads > 0 { q_out_dim / num_heads } else { config.head_dim };
+
+        let rope_theta = model.file.get_metadata_int("qwen35.rope.freq_base")
+            .or_else(|| model.file.get_metadata_int("llama.rope.freq_base"))
+            .map(|v| v as f32)
+            .unwrap_or(config.rope_theta);
+
+        eprintln!("  Attention: heads={}, kv_h={}, hd={}, kv_hd={}, rope={}, o_in={}",
+            num_heads, num_kv_heads, head_dim, kv_head_dim, rope_theta, o_in_dim);
+
+        AttentionParams {
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            kv_head_dim,
+            rope_theta,
+            use_fused_qkv: false,
+            use_gate: false,
+        }
+    }
+
+    /// Public generate dispatch — uses FFI for Qwen, native for others.
     pub fn generate(&mut self, tokens: &[usize], max_tokens: usize, temperature: f32, top_p: f32) -> Vec<usize> {
+        #[cfg(feature = "llama-ffi")]
+        if let Some(model) = &self.ffi_model {
+            // Recreate context to ensure fresh KV cache (test_generation calls forward before generate)
+            let mut ctx = LlamaContext::new(model, 4096, 4)
+                .expect("Failed to recreate FFI context");
+            let tokens_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            let eos = model.eos_token();
+            let generated = ctx.generate(&tokens_i32, max_tokens, temperature, eos);
+            self.ffi_context = Some(ctx);
+            return generated.into_iter().map(|t| t as usize).collect();
+        }
+        self.generate_native(tokens, max_tokens, temperature, top_p)
+    }
+
+    pub fn generate_native(&mut self, tokens: &[usize], max_tokens: usize, temperature: f32, top_p: f32) -> Vec<usize> {
         self.kv_cache.clear();
         self.ssm_cache.clear();
         self.deltanet_cache.clear();
         self.seq_offset = 0;
 
         // Prefill
-        let mut logits = self.forward(tokens);
+        let mut logits = self.forward_native(tokens);
         self.seq_offset = tokens.len();
         let mut next_token = sample_top_p(&logits, temperature, top_p);
         let mut generated = vec![next_token];
@@ -225,7 +368,7 @@ impl Engine {
 
         // Decode loop
         for _ in 0..max_tokens - 1 {
-            logits = self.forward(&[next_token]);
+            logits = self.forward_native(&[next_token]);
             self.seq_offset += 1;
             next_token = sample_top_p(&logits, temperature, top_p);
             generated.push(next_token);
@@ -238,8 +381,44 @@ impl Engine {
         generated
     }
 
-    /// Hybrid forward pass supporting both standard transformers and SSM/Transformer hybrids.
+    /// Tokenize text using the model's native tokenizer (FFI path only).
+    pub fn tokenize(&self, text: &str, add_special: bool) -> Vec<usize> {
+        #[cfg(feature = "llama-ffi")]
+        if let Some(ctx) = &self.ffi_context {
+            return ctx.tokenize(text, add_special, true).into_iter().map(|t| t as usize).collect();
+        }
+        Vec::new()
+    }
+
+    /// Decode tokens to text using the model's native tokenizer (FFI path only).
+    pub fn decode(&self, tokens: &[usize]) -> String {
+        #[cfg(feature = "llama-ffi")]
+        if let Some(ctx) = &self.ffi_context {
+            return tokens.iter().map(|&t| ctx.token_to_piece(t as i32)).collect();
+        }
+        String::new()
+    }
+
+    /// Returns true if this engine uses the llama.cpp FFI backend.
+    pub fn is_ffi(&self) -> bool {
+        #[cfg(feature = "llama-ffi")]
+        return self.ffi_context.is_some();
+        #[cfg(not(feature = "llama-ffi"))]
+        false
+    }
+
+    /// Public forward dispatch — uses FFI for Qwen, native for others.
     pub fn forward(&mut self, tokens: &[usize]) -> Vec<f32> {
+        #[cfg(feature = "llama-ffi")]
+        if let Some(ctx) = &mut self.ffi_context {
+            let tokens_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            return ctx.forward(&tokens_i32).expect("FFI forward failed");
+        }
+        self.forward_native(tokens)
+    }
+
+    /// Hybrid forward pass supporting both standard transformers and SSM/Transformer hybrids.
+    pub fn forward_native(&mut self, tokens: &[usize]) -> Vec<f32> {
         let seq_len = tokens.len();
 
         // Embedding lookup via mmap (avoids loading full embed matrix into RAM)
@@ -268,7 +447,10 @@ impl Engine {
             if has_standard_attn {
                 let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
                 hidden = hidden.add(&attn_out);
-            } else if has_deltanet || has_ssm {
+            } else if has_deltanet {
+                let deltanet_out = deltanet_forward(&normed, &layer_weights, &self.deltanet_params, &mut self.deltanet_cache, layer_idx);
+                hidden = hidden.add(&deltanet_out);
+            } else if has_ssm {
                 let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
                 hidden = hidden.add(&ssm_out);
             }

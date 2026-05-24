@@ -2,6 +2,7 @@
 
 use super::Backend;
 use crate::kernels::simd;
+use matrixmultiply;
 
 /// Global singleton CPU backend.
 /// Uses the best available instruction set for the target architecture.
@@ -18,14 +19,14 @@ impl Backend for CpuBackend {
         // gemm's overhead isn't worth it.
         if m * n >= 256 {
             unsafe {
-                gemm::gemm(
-                    m, n, k,
-                    result.as_mut_ptr(), 1, n as isize, false,
-                    a.as_ptr(), 1, k as isize,
-                    b.as_ptr(), 1, n as isize,
-                    1.0, 0.0,
-                    false, false, false,
-                    gemm::Parallelism::Rayon(0),
+                // matrixmultiply uses (m, k, n) order and row-major strides
+                matrixmultiply::sgemm(
+                    m, k, n,
+                    1.0,
+                    a.as_ptr(), k as isize, 1,
+                    b.as_ptr(), n as isize, 1,
+                    0.0,
+                    result.as_mut_ptr(), n as isize, 1,
                 );
             }
         } else {

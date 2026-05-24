@@ -1,7 +1,4 @@
-//! Generation quality test for Qwen3.5 models
-//!
-//! Usage:
-//!   cargo run --release --bin test_generation -- --model /path/to/model.gguf --prompt "Hello" --tokens 10
+//! Generation quality test
 
 use clap::Parser;
 use leafcutter::inference::engine::Engine;
@@ -43,21 +40,32 @@ fn main() {
     println!("   Max tokens: {}", args.tokens);
     println!("   Raw mode: {}", args.raw);
 
-    let tok = if std::path::Path::new(tok_path).exists() {
-        Tokenizer::from_file(tok_path).expect("Failed to load tokenizer")
-    } else {
-        eprintln!("❌ Tokenizer not found at {}", tok_path);
-        std::process::exit(1);
-    };
-
     let mut engine = Engine::load(&args.model).expect("Failed to load engine");
     println!("✅ Engine loaded: {} layers, hidden_size={}", engine.config.num_hidden_layers, engine.config.hidden_size);
 
-    let prompt_tokens = if args.raw {
-        tok.encode(&args.prompt)
+    // For FFI backend (Qwen3.5/3.6), use the model's built-in tokenizer.
+    // For native backend, use the external tokenizer.json.
+    let use_ffi_tok = engine.is_ffi();
+    let prompt_tokens = if use_ffi_tok {
+        let prompt = if args.raw {
+            args.prompt.clone()
+        } else {
+            format!("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", args.prompt)
+        };
+        engine.tokenize(&prompt, false)
     } else {
-        let prompt = tok.apply_chat_template(&args.prompt);
-        tok.encode(&prompt)
+        let tok = if std::path::Path::new(tok_path).exists() {
+            Tokenizer::from_file(tok_path).expect("Failed to load tokenizer")
+        } else {
+            eprintln!("❌ Tokenizer not found at {}", tok_path);
+            std::process::exit(1);
+        };
+        if args.raw {
+            tok.encode(&args.prompt)
+        } else {
+            let prompt = tok.apply_chat_template(&args.prompt);
+            tok.encode(&prompt)
+        }
     };
     println!("📝 Prompt tokens: {}", prompt_tokens.len());
 
@@ -68,15 +76,16 @@ fn main() {
         .max_by(|(_,a),(_,b)| a.partial_cmp(b).unwrap())
         .map(|(i,v)| (i, *v))
         .unwrap();
-    println!("   Top prefill token: {} (logit={:.2}) -> '{}'", top_prefill.0, top_prefill.1,
-        tok.decode(&[top_prefill.0], false));
+    let top_piece = if use_ffi_tok { engine.decode(&[top_prefill.0]) } else { String::new() };
+    println!("   Top prefill token: {} (logit={:.2}) -> '{}'", top_prefill.0, top_prefill.1, top_piece);
 
     // Check top-5 prefill tokens
     let mut indexed: Vec<(usize, f32)> = logits.iter().copied().enumerate().collect();
     indexed.sort_by(|(_,a),(_,b)| b.partial_cmp(a).unwrap());
     println!("   Top-5 prefill tokens:");
     for (i, (tid, logit)) in indexed.iter().take(5).enumerate() {
-        println!("     [{}] id={:>6} logit={:>7.2} -> '{}'", i, tid, logit, tok.decode(&[*tid], false));
+        let piece = if use_ffi_tok { engine.decode(&[*tid]) } else { String::new() };
+        println!("     [{}] id={:>6} logit={:>7.2} -> '{}'", i, tid, logit, piece);
     }
 
     // Now run generate
@@ -91,12 +100,12 @@ fn main() {
     // Decode each generated token individually
     println!("\n🔍 Token-by-token breakdown:");
     for (i, &tid) in generated.iter().enumerate() {
-        let text = tok.decode(&[tid], false);
+        let text = if use_ffi_tok { engine.decode(&[tid]) } else { String::new() };
         println!("   [{}] id={:>6} -> '{}'", i, tid, text);
     }
 
     let all_tokens: Vec<usize> = prompt_tokens.iter().chain(generated.iter()).copied().collect();
-    let decoded = tok.decode(&all_tokens, false);
+    let decoded = if use_ffi_tok { engine.decode(&all_tokens) } else { String::new() };
     println!("\n📝 Full decoded output:\n{}", decoded);
 
     // Basic coherence check: flag repetitive tokens

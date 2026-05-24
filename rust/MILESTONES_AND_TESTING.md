@@ -216,13 +216,50 @@ Attention layers also differ: Qwen3.5 uses **MRoPE** (multi-section RoPE) and ou
 
 ---
 
+## Phase 8: Auto-FFI Fallback + Dual-Backend Routing (2026-05-19)
+
+### Milestone 8.1: Architecture-Based Backend Routing
+- **File:** `src/inference/engine.rs`
+- **What:** `detect_arch()` peeks GGUF metadata; qwen3.5/qwen3.6 → `load_ffi()`, others → native.
+- **Status:** ✅ Complete
+
+### Milestone 8.2: Auto-FFI Fallback for Unsupported Quants
+- **File:** `src/inference/engine.rs`
+- **What:** When `capability_report()` reports unsupported quant types (IQ1_M=31, Q2_K, IQ2_XXS, etc.), engine automatically calls `load_ffi()` instead of returning error.
+- **Tests:** Llama-3.1-70B-IQ1_M auto-routes to FFI, loads, and prefills successfully.
+- **Status:** ✅ Complete
+
+### Milestone 8.3: Native DeltaNet Forward Pass
+- **File:** `src/inference/deltanet.rs`
+- **What:** Correct delta rule `S_t = decay*S + beta*(v - S^T@k) ⊗ k`, L2-normalized Q/K, softplus decay gates, group norm output gating.
+- **Tests:** `test_real_deltanet` produces healthy output magnitudes (~0.2).
+- **Status:** ✅ Math correct in isolation; full model coherence WIP.
+
+### Milestone 8.4: Context Lifecycle Fix
+- **File:** `src/inference/engine.rs`
+- **What:** `generate_ffi()` recreates `LlamaContext` on each call to avoid KV cache position conflicts.
+- **Status:** ✅ Complete
+
+---
+
+## Test Results (Latest)
+
+| Model | Backend | Route | tok/sec | Coherent? |
+|-------|---------|-------|---------|-----------|
+| Llama-3.2-3B Q4_K | Native | Direct | ~0.12 | ✅ Yes |
+| Qwen3.5-0.8B Q4_0 | FFI | Explicit | 14.68 | ✅ Yes |
+| Qwen3.5-9B IQ4_NL | FFI | Explicit | 2.38 | ✅ Yes |
+| Llama-3.1-70B IQ1_M | FFI | Auto-fallback | ~0.03 | ✅ Loads + prefill |
+
+---
+
 ## Next Milestones (Proposed)
 
-1. **Speed optimization** — Scalar GEMM is ~142s/token on 70B. Need SIMD matmul or `gemm` crate.
-2. **Q4_K_M passthrough support** — Load pre-quantized GGUF Q4_K_M models into shards without re-quantization
-3. **ARM dotprod (`vdotq_s32`) optimization** — Pi 5 Cortex-A76 has dot-product instructions; potential 2-3× INT8 GEMM boost
-4. **Pi 5 field testing** — Deploy and benchmark on actual hardware
-5. **GPU element-wise ops** — vec_add, silu, softmax on WGPU for full GPU offload
+1. **Native Qwen3.5 coherence** — Debug interaction between DeltaNet layers, attention layers, FFN, and residuals.
+2. **SIMD quantized GEMM** — Scalar GEMM is ~142s/token on 70B. Need NEON/AVX2 paths.
+3. **Q4_K_M passthrough support** — Load pre-quantized GGUF Q4_K_M models without re-quantization.
+4. **ARM dotprod (`vdotq_s32`) optimization** — Pi 5 Cortex-A76 dot-product instructions.
+5. **Pi 5 field testing** — Deploy and benchmark on actual hardware.
 
 ---
 
@@ -236,17 +273,19 @@ Attention layers also differ: Qwen3.5 uses **MRoPE** (multi-section RoPE) and ou
 - [x] Autoregressive generation: prefill + greedy/temperature sampling loop
 - [x] `llama_tokenize` negative-return bug fixed
 - [x] `llama_progress_callback` bool return type fixed
-- [x] Unified CLI: `leafcutter {server,generate,chat,list-models}`
-- [x] Single-line installer (`install.sh`)
-- [x] Cynapse integration docs and connector script
+- [x] Context recreation in `generate_ffi()` to avoid KV cache position conflicts
+- [x] Unified tokenizer: FFI path uses llama.cpp's built-in tokenizer
 
 ### Test Results
 - ✅ Llama-3.2-3B-Instruct Q4_K_XL: coherent generation verified
 - ✅ Llama-3.2-3B-Instruct IQ4_NL: coherent generation verified  
 - ✅ Qwen3.5-9B-Instruct IQ4_NL: coherent generation + reasoning verified
+- ✅ Qwen3.5-0.8B Q4_0: 14.68 tok/sec, coherent
 - ❌ Qwen3.5-9B-UD-Q8_K_XL (13GB): OOM on 8GB system (expected)
+- ✅ Llama-3.1-70B-IQ1_M: auto-fallback to FFI, loads, prefill works
 
 ### Performance
 - 3B Q4_K_XL on CPU: ~2-3 tok/sec
-- 9B IQ4_NL on CPU: ~1 tok/sec
+- 9B IQ4_NL on CPU: ~2.4 tok/sec
+- 0.8B Q4_0 on CPU: ~14.7 tok/sec
 - Startup: instant (no subprocess spawn)

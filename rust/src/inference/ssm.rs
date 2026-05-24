@@ -65,6 +65,7 @@ pub fn ssm_forward(
         x_inner.clone()
     };
 
+
     // 3. Split conv output into X (first half) and z_gate (second half)
     let half = hidden_size;
     let mut x_data = vec![0.0f32; seq_len * half];
@@ -83,17 +84,17 @@ pub fn ssm_forward(
         x.data[i] = v * (1.0 / (1.0 + (-v).exp()));
     }
 
-    // 5. B and C projections from hidden state
+    // 5. B and C projections from x (conv output + SiLU) — Mamba standard
     let state_size = _config.state_size;
     let b_raw = if let Some(b_w) = weights.get("ssm_beta.weight")
         .or_else(|| weights.get("ssm_B.weight")) {
-        hidden_states.matmul(b_w)
+        x.matmul(b_w)
     } else {
         Tensor::zeros(vec![seq_len, state_size])
     };
     let c_raw = if let Some(c_w) = weights.get("ssm_alpha.weight")
         .or_else(|| weights.get("ssm_C.weight")) {
-        hidden_states.matmul(c_w)
+        x.matmul(c_w)
     } else {
         Tensor::zeros(vec![seq_len, state_size])
     };
@@ -136,7 +137,8 @@ pub fn ssm_forward(
         .unwrap_or_else(|| vec![-1.0f32; state_size]);
 
     // 9. Selective scan on x (4096 channels), not the full conv output
-    let initial_state = ssm_cache.get(layer_idx, conv_channels);
+    let state_len = conv_channels * state_size;
+    let initial_state = ssm_cache.get(layer_idx, state_len);
     let (y, final_state) = selective_scan(
         &x, &b_proj, &c_proj, &dt_proj, &a_vec,
         conv_channels, Some(&initial_state),
@@ -146,7 +148,8 @@ pub fn ssm_forward(
     // 10. Group norm (ssm_norm.weight = [state_size/num_groups])
     let mut y_normed = y.clone();
     if let Some(norm_w) = weights.get("ssm_norm.weight") {
-        apply_group_norm(&mut y_normed, seq_len, conv_channels, norm_w, 1e-5);
+        let num_groups = norm_w.data.len();
+        apply_group_norm(&mut y_normed, seq_len, conv_channels, num_groups, norm_w, 1e-5);
     }
 
     // 11. Gating: y * silu(z_gate)
@@ -155,14 +158,28 @@ pub fn ssm_forward(
     for i in 0..gated.len() {
         gated[i] = y_normed.data[i] * activated.data[i % activated.data.len()];
     }
+
     let y_gated = Tensor::from_vec(gated, y_normed.shape.clone());
 
     // 12. Output projection
-    if let Some(out_proj) = weights.get("ssm_out.weight")
+    let output = if let Some(out_proj) = weights.get("ssm_out.weight")
         .or_else(|| weights.get("ssm_out_proj.weight")) {
         y_gated.matmul(out_proj)
     } else {
         adaptive_fallback(y_gated, hidden_size)
+    };
+
+    // 13. Output gate (Gated DeltaNet): o = ssm_out * sigmoid(hidden @ attn_gate)
+    if let Some(gate_w) = weights.get("attn_gate.weight") {
+        let gate_logits = hidden_states.matmul(gate_w);
+        let mut gated = vec![0.0f32; output.data.len()];
+        for i in 0..gated.len() {
+            let sigmoid = 1.0f32 / (1.0f32 + (-gate_logits.data[i]).exp());
+            gated[i] = output.data[i] * sigmoid;
+        }
+        Tensor::from_vec(gated, output.shape.clone())
+    } else {
+        output
     }
 }
 
@@ -182,18 +199,22 @@ fn broadcast_to_dim(t: Tensor, target_dim: usize) -> Tensor {
     Tensor::from_vec(out, vec![seq_len, target_dim])
 }
 
-/// Group norm: normalize all channels together per sequence position.
-fn apply_group_norm(x: &mut Tensor, seq_len: usize, channels: usize, weight: &Tensor, eps: f32) {
+/// Group norm: normalize channels per-group.
+fn apply_group_norm(x: &mut Tensor, seq_len: usize, channels: usize, num_groups: usize, weight: &Tensor, eps: f32) {
+    let channels_per_group = channels / num_groups;
     for s in 0..seq_len {
-        let base = s * channels;
-        let mut sq_sum = 0.0f32;
-        for c in 0..channels {
-            let v = x.data[base + c];
-            sq_sum += v * v;
-        }
-        let rms = (sq_sum / channels as f32 + eps).sqrt();
-        for c in 0..channels {
-            x.data[base + c] = (x.data[base + c] / rms) * weight.data[c % weight.data.len()];
+        for g in 0..num_groups {
+            let base = s * channels + g * channels_per_group;
+            let mut sq_sum = 0.0f32;
+            for c in 0..channels_per_group {
+                let v = x.data[base + c];
+                sq_sum += v * v;
+            }
+            let rms = (sq_sum / channels_per_group as f32 + eps).sqrt();
+            let w = weight.data[g % weight.data.len()];
+            for c in 0..channels_per_group {
+                x.data[base + c] = (x.data[base + c] / rms) * w;
+            }
         }
     }
 }
@@ -277,7 +298,7 @@ fn causal_conv1d(x: &Tensor, weight: &Tensor, kernel_size: usize) -> Tensor {
 /// Causal conv1d with state caching for autoregressive generation.
 /// `conv_state` holds the last (kernel_size - 1) inputs per channel.
 /// Returns (output, updated_conv_state).
-fn causal_conv1d_cached(
+pub fn causal_conv1d_cached(
     x: &Tensor,
     weight: &Tensor,
     kernel_size: usize,
@@ -332,7 +353,7 @@ fn causal_conv1d_cached(
     (Tensor::from_vec(out, x.shape.clone()), new_state)
 }
 
-fn selective_scan(
+pub fn selective_scan(
     x: &Tensor,
     b: &Tensor,
     c: &Tensor,
@@ -342,28 +363,42 @@ fn selective_scan(
     initial_state: Option<&[f32]>,
 ) -> (Tensor, Vec<f32>) {
     let seq_len = x.shape[0];
+    let state_size = a_vec.len();
     let mut y = vec![0.0f32; seq_len * inner];
-    let mut final_state = vec![0.0f32; inner];
+    let state_len = inner * state_size;
+    let mut h = initial_state
+        .map(|s| s.to_vec())
+        .unwrap_or_else(|| vec![0.0f32; state_len]);
 
-    for i in 0..inner {
-        let a_i = a_vec.get(i % a_vec.len()).copied().unwrap_or(-1.0f32);
-        let mut h = initial_state.map(|s| s[i]).unwrap_or(0.0f32);
-        for t in 0..seq_len {
-            let dt = delta.data[t * inner + i].max(0.001);
+    for t in 0..seq_len {
+        for i in 0..inner {
+            let dt_raw = delta.data[t * delta.shape[1] + i];
+            let dt = softplus(dt_raw).max(0.001);
             let x_t = x.data[t * inner + i];
-            let b_t = b.data[t * inner + i];
-            let c_t = c.data[t * inner + i];
+            let mut y_ti = 0.0f32;
 
-            let a_bar = (dt * a_i).exp();
-            let b_bar = dt * b_t;
+            for d in 0..state_size {
+                let a_d = a_vec[d];
+                let b_t = b.data[t * b.shape[1] + (d % b.shape[1])];
+                let c_t = c.data[t * c.shape[1] + (d % c.shape[1])];
 
-            h = a_bar * h + b_bar * x_t;
-            y[t * inner + i] = c_t * h;
+                let decay = (dt * a_d).exp();
+                let b_bar = dt * b_t;
+
+                let idx = i * state_size + d;
+                h[idx] = decay * h[idx] + b_bar * x_t;
+                y_ti += c_t * h[idx];
+            }
+            y[t * inner + i] = y_ti;
         }
-        final_state[i] = h;
     }
 
-    (Tensor::from_vec(y, vec![seq_len, inner]), final_state)
+    (Tensor::from_vec(y, vec![seq_len, inner]), h)
+}
+
+#[inline]
+fn softplus(x: f32) -> f32 {
+    (1.0 + x.exp()).ln()
 }
 
 #[cfg(test)]

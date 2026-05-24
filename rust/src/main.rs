@@ -389,6 +389,7 @@ fn cmd_generate_native(
     };
 
     let tok = Tokenizer::from_file("tests/tokenizer_llama.json")
+        .or_else(|_| Tokenizer::from_file("tests/tokenizer_qwen35.json"))
         .unwrap_or_else(|_| {
             eprintln!("⚠️  tokenizer_llama.json not found, using byte fallback");
             Tokenizer::from_file("tests/tokenizer.json").unwrap_or_else(|_| {

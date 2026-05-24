@@ -262,33 +262,19 @@ The native Rust engine **loads and runs** Qwen3.5 models without numerical error
 
 ### Bug Fix: IQ4_NL Garbled Output
 
-**Symptom:** IQ4_NL quantized models (e.g., Llama-3.2-3B-IQ4_NL, Qwen3.5-9B-IQ4_NL) produced garbled/nonsensical output, while Q4_K models on the same architecture worked correctly.
+**Symptom:** IQ4_NL quantized models produced garbled/nonsensical output, while Q4_K models on the same architecture worked correctly.
 
-**Root Cause:** Two conflicting `IQ4NL_TABLE` definitions existed:
+**Root Cause:** Two conflicting `IQ4NL_TABLE` definitions existed. The wrong table produced values **30–300× smaller** than correct, collapsing activations to near-zero.
 
-| Location | Table Values | Used By |
-|----------|-------------|---------|
-| `src/kernels/iq4_nl.rs` | `[-127, -104, -83, …]` ✅ | GEMM kernels (`iq4_nl_matmul_*`) |
-| `src/kernels/mod.rs` | `[-1.0, -0.6962, -0.5251, …]` ❌ | `get_tensor_row_f32()` for embedding/LM head lookup |
+**Fix:** Replaced the wrong `IQ4NL_TABLE` in `src/kernels/mod.rs` with the correct llama.cpp `kvalues_iq4nl` values.
 
-The wrong table in `mod.rs` produced values **30–300× smaller** than correct. When `token_embd.weight` or `output.weight` were IQ4_NL quantized, embedding lookup and LM head projection used the wrong table, collapsing activations to near-zero.
-
-**Fix:** Replaced the wrong `IQ4NL_TABLE` in `src/kernels/mod.rs` with the correct llama.cpp `kvalues_iq4nl` values, matching `src/kernels/iq4_nl.rs`. Updated the unit test accordingly.
-
-**Verification:**
-- `cargo test --lib iq4` → **5 passed, 0 failed**
-- Cross-module consistency test (`verify_iq4_nl_fix`) confirms `get_tensor_row_f32()` and `Matrix::dequantize()` produce identical output for real model weights.
+**Verification:** `cargo test --lib iq4` → **5 passed, 0 failed**
 
 ---
 
 ### Validation: 70B Model Memory Claims
 
 **Claim:** A 70B parameter model can be loaded and run on consumer hardware with ~4 GB RAM using layer-streaming + mmap + `madvise(MADV_DONTNEED)`.
-
-**Test Setup:**
-- Model: `Meta-Llama-3.1-70B-Instruct-Q4_K_S.gguf` (40.3 GB file)
-- Architecture: 80 layers, hidden_size=8192, 64 attention heads, 8 KV heads
-- Hardware: Standard Linux workstation
 
 **Results:**
 
@@ -297,13 +283,69 @@ The wrong table in `mod.rs` produced values **30–300× smaller** than correct.
 | Load only | **39 MB** |
 | 1-token forward pass | **1,145 MB** |
 
-**Conclusion:** ✅ Claim validated. The 40 GB model file stays on disk via mmap. Layer streaming ensures only one layer (~500 MB quantized) is resident at a time, plus activations and KV cache. Peak RSS during inference stays well under 1.2 GB — leaving ample headroom on a 4 GB system.
-
-**Note:** Inference speed is currently ~142s/token on 70B CPU with naive scalar GEMM kernels. Speed is not the focus of this memory validation.
+**Conclusion:** ✅ Claim validated. Peak RSS stays well under 1.2 GB — leaving ample headroom on a 4 GB system.
 
 ---
 
-### Compilation Fixes
+## Update: 2026-05-19 — Auto-FFI Fallback + Dual-Backend Routing
 
-- `src/bin/check_layer_stats.rs` — Fixed `&HashMap` borrowing errors after `ffn_forward`/`attention_forward` API changes.
+### Feature: Automatic Backend Routing
+
+**File:** `src/inference/engine.rs`
+
+**What:** The engine now has three paths:
+1. **Native** — Llama, Mistral, Qwen2 with supported quants (Q4_K, Q8_0, etc.)
+2. **Explicit FFI** — Qwen3.5/3.6 detected via `general.architecture` metadata
+3. **Auto-FFI fallback** — Any model with unsupported quant types (IQ1_M=31, Q2_K, IQ2_XXS, etc.) automatically routes to llama.cpp FFI
+
+**Code:**
+```rust
+if !report.can_run {
+    #[cfg(feature = "llama-ffi")]
+    if !report.quant_summary.unsupported.is_empty() {
+        eprintln!("Native unsupported quants: {:?}, falling back to llama.cpp FFI...",
+            report.quant_summary.unsupported);
+        return Self::load_ffi(path);
+    }
+    // ... error path
+}
+```
+
+### Validation: Auto-Fallback on Real Models
+
+| Model | Quant | Route | Result |
+|-------|-------|-------|--------|
+| Meta-Llama-3.1-70B-Instruct-IQ1_M | IQ1_M + Q2_K + IQ2_XXS | Auto-FFI | ✅ Loads, prefill produces "Hello" (logit 19.55) |
+| Llama-3.2-3B-Instruct-UD-Q4_K_XL | Q4_K | Native | ✅ Prefill works, healthy logits |
+| Qwen3.5-9B-IQ4_NL | IQ4_NL | Explicit FFI | ✅ Generates 5 tokens at 2.38 tok/sec |
+| Qwen3.5-0.8B-Q4_0 | Q4_0 | Explicit FFI | ✅ Generates 5 tokens at 14.68 tok/sec |
+
+### Fixes: DeltaNet Forward Pass
+
+**File:** `src/inference/deltanet.rs`
+
+After 20+ debugging rounds, the native DeltaNet math is now correct in isolation:
+- **L2 normalization** on Q/K (enabled — fixes 0.0003 → 0.2 magnitude)
+- **Correct delta rule:** `S_t = decay*S + beta*(v - S^T@k) ⊗ k`
+- **Softplus decay:** `decay = exp(softplus(alpha + dt_bias) * ssm_a)`
+- **Beta gates:** `beta = sigmoid(hidden @ ssm_beta)`
+- **Output scale:** `1.0 / sqrt(head_k_dim)`
+
+**Status:** DeltaNet layers work in isolation but full model prefill is garbled due to attention layer interaction. **Mitigation:** FFI path provides correct output immediately.
+
+### Fix: Context Lifecycle in FFI
+
+**File:** `src/inference/engine.rs`
+
+**Problem:** Calling `forward()` then `generate()` on the same llama.cpp context caused KV cache position mismatch (`X=19, Y=0`).
+
+**Fix:** `generate_ffi()` now recreates the `LlamaContext` on each call, avoiding position conflicts.
+
+### Files Modified
+
+- `src/inference/engine.rs` — Auto-FFI fallback, context lifecycle fix
+- `src/inference/deltanet.rs` — Correct delta rule, L2 norm, decay gates
+- `src/bin/test_generation.rs` — Uses engine.tokenize()/decode() for FFI path
+- `src/model/quant.rs` — IQ1_M type 31 registered (for capability report)
+- `src/bin/test_iq4nl_matmul.rs` — Fixed private field access
 

@@ -460,18 +460,54 @@ Each fix is tagged with its ID (FIX-001, COMPILE-FIX-0, etc.) to match the audit
 
 ---
 
+## [0.9.0] — 2026-05-19 (Dual-Backend Inference Engine)
+
+### Added
+- **Auto-FFI Fallback**: When native loading hits unsupported quantization types (IQ1_M, Q2_K, IQ2_XXS, etc.), the engine automatically routes to llama.cpp FFI instead of hard-failing.
+- **Architecture-Based Backend Routing**: Qwen3.5/Qwen3.6 models are automatically detected and routed to llama.cpp FFI; Llama/Mistral/Qwen2 stay on the optimized native path.
+- **Native DeltaNet Forward Pass**: Implemented correct Gated Delta Net math (dual projection, L2-normalized Q/K, softplus decay gates, vector-state delta rule, group norm output gating) for hybrid SSM+Attention architectures.
+- **LLAMA_CPP_BUILD Environment Variable**: Build script supports overriding the llama.cpp build path via `LLAMA_CPP_BUILD=/path/to/build`.
+- **Capability Report Pre-Flight**: Every model gets a capability report before loading — checks architecture, quantization support, and tensor completeness.
+
+### Changed
+- **Language**: Project is now 100% Rust (Go codebase deprecated and removed).
+- **GEMM Backend**: Replaced `gemm` crate with `matrixmultiply` for better AMD Zen 3 compatibility.
+- **Build Feature**: Added `llama-ffi` Cargo feature flag for conditional llama.cpp FFI compilation.
+
+### Fixed
+- **DeltaNet Dispatch Bug**: DeltaNet layers were incorrectly sent to `ssm_forward`; now correctly routed to `deltanet_forward`.
+- **DeltaNet Parameter Inference**: `infer_deltanet_params()` now derives asymmetric head dims from actual tensor shapes instead of assuming symmetric.
+- **SSM_A Double-Conversion**: Removed duplicate `A = -exp(A_log)` conversion — GGUF already applies this.
+- **DeltaNet L2 Normalization**: Re-enabled Q/K L2 normalization, boosting output magnitude from ~0.0003 to ~0.2 (healthy signal).
+- **Attention Param Invariance**: Fixed attention layer Q-head dim mismatch (512 vs 256) for Qwen3.5 via shape-based inference.
+- **Llama Divide-by-Zero**: Guarded `seq_len == 0` case in `attention.rs:182`.
+- **Context Lifecycle in FFI**: `generate_ffi()` recreates context on each call to avoid KV cache position conflicts.
+- **Tokenizer Mismatch**: FFI path now uses llama.cpp's built-in tokenizer, avoiding ID mismatches between Qwen2.5 and Qwen3.5 vocabularies.
+- **IQ4_NL Lookup Table**: Fixed conflicting `IQ4NL_TABLE` definitions that caused 30–300× smaller activations.
+
+### Performance
+| Model | Backend | Peak RAM | tok/sec | Status |
+|-------|---------|----------|---------|--------|
+| Llama-3.2-3B Q4_K | Native | 534 MB | ~0.12 | ✅ Verified |
+| Meta-Llama-3.1-70B Q4_K | Native | 1,145 MB | ~0.007 | ✅ Verified |
+| Qwen3.5-0.8B Q4_0 | FFI | ~3 GB | 14.68 | ✅ Coherent |
+| Qwen3.5-9B IQ4_NL | FFI | ~6 GB | 2.38 | ✅ Coherent |
+| Llama-3.1-70B IQ1_M | Auto-FFI | ~16 GB | ~0.03 | ✅ Loads + prefill |
+
+---
+
 ## Next Steps
 
-- [ ] GGUF format support (llama.cpp compatibility)
-- [ ] GPU acceleration (CUDA, Metal)
+- [ ] Native Qwen3.5/3.6 DeltaNet + Attention full coherence (debug layer interaction)
+- [ ] SIMD quantized GEMM (Q4_K, Q5_K, Q6_K, IQ4_NL) — scalar done, NEON/AVX2 next
+- [ ] GPU acceleration (WGPU, CUDA, Metal)
 - [ ] Multi-node distributed inference
 - [ ] Production monitoring/observability
-- [ ] Official Python bindings
 
 See [README.md](README.md) for current capabilities and quick-start guide.
 
 ---
 
-**Last Updated:** 2026-04-23  
-**Project Status:** Production Ready (v0.4.0)  
+**Last Updated:** 2026-05-19  
+**Project Status:** Production Ready (v0.9.0)  
 **Maintained by:** Alartist40
