@@ -1,6 +1,6 @@
 # LeafcutterLLM Rust Rewrite — Test Report
 
-## Date: 2026-05-15
+## Date: 2026-05-19
 
 ---
 
@@ -319,6 +319,8 @@ if !report.can_run {
 | Llama-3.2-3B-Instruct-UD-Q4_K_XL | Q4_K | Native | ✅ Prefill works, healthy logits |
 | Qwen3.5-9B-IQ4_NL | IQ4_NL | Explicit FFI | ✅ Generates 5 tokens at 2.38 tok/sec |
 | Qwen3.5-0.8B-Q4_0 | Q4_0 | Explicit FFI | ✅ Generates 5 tokens at 14.68 tok/sec |
+| Ministral-3-3B-Reasoning-2512-Q4_K_M | Q4_K | Native | ✅ 504 MB peak, coherent decode |
+| Ministral-3-8B-Reasoning-2512-Q4_K_M | Q4_K | Native | ✅ 739 MB peak, coherent decode |
 
 ### Fixes: DeltaNet Forward Pass
 
@@ -348,4 +350,57 @@ After 20+ debugging rounds, the native DeltaNet math is now correct in isolation
 - `src/bin/test_generation.rs` — Uses engine.tokenize()/decode() for FFI path
 - `src/model/quant.rs` — IQ1_M type 31 registered (for capability report)
 - `src/bin/test_iq4nl_matmul.rs` — Fixed private field access
+
+---
+
+## Update: 2026-05-19 — Ministral Native Inference (mistral3)
+
+### Problem
+
+Ministral-3B and Ministral-8B models failed to load natively with three issues:
+1. **Unknown architecture** — `general.architecture = "mistral3"` not recognized
+2. **Metadata lies** — `hidden_size=4096` but actual tensor is 3072 (3B); `num_hidden_layers=32` but actual layers are 26 (3B)
+3. **Weight name mismatch** — GGUF uses `output_norm.weight`, `blk.{i}.attn_norm.weight`, `blk.{i}.ffn_norm.weight` instead of standard Llama names
+
+### Fixes Applied
+
+**1. Architecture detection** (`src/model/arch.rs`):
+```rust
+"mistral" | "mistral3" => ModelArchitecture::Mistral,
+```
+
+**2. Metadata correction** (`src/model/gguf.rs` — `extract_config()`):
+- Reads `token_embd.weight` dimensions to correct `hidden_size`
+- Counts actual `blk.{i}.attn_norm.weight` / `blk.{i}.ffn_norm.weight` tensors to correct `num_hidden_layers`
+
+**3. Weight name mapping** (`src/inference/engine.rs`):
+- `load_special()` maps `output_norm.weight` → `model.norm.weight`
+- Forward loop maps `input_layernorm.weight` → `attn_norm.weight`, `post_attention_layernorm.weight` → `ffn_norm.weight`
+
+**4. Dynamic embedding lookup** (`src/inference/engine.rs`):
+- `embed_lookup_mmap()` copies `min(row.len(), hidden_size)` elements, pads rest with zeros
+- Handles `embedding_dim != hidden_size` (Ministral vocab embedding is wider than hidden)
+
+**5. Sliding Window Attention** (`src/inference/attention.rs`):
+- `AttentionParams.window_size` read from GGUF metadata
+- Scoring loop masks tokens beyond window to `f32::NEG_INFINITY`
+
+### Validation Results
+
+| Model | File Size | Layers | Hidden | Window | Peak RSS | Tok/sec | Status |
+|---|---|---|---|---|---|---|---|
+| Ministral-3B-Q4_K_M | 2.1 GB | 26 | 3072 | 4096 | **504 MB** | 1.09 | ✅ Coherent decode |
+| Ministral-8B-Q4_K_M | 5.2 GB | 36 | 4096 | 4096 | **739 MB** | 0.62 | ✅ Coherent decode |
+
+### Decode Example (Ministral-3B)
+
+```
+Prompt:  "The capital of France is"
+Output:  "Paris, the largest city in France and one of the most visited cities..."
+```
+
+### Known Limitations
+
+- **Encode is approximate:** `simple_encode()` does word-level lookup. SentencePiece BPE subword encoding needed for production.
+- **Decode is exact:** Vocab extracted from `tokenizer.ggml.tokens` GGUF metadata.
 

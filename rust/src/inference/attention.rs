@@ -21,6 +21,7 @@ pub struct AttentionParams {
     pub rope_theta: f32,
     pub use_fused_qkv: bool,
     pub use_gate: bool,
+    pub window_size: usize, // 0 = disabled (full causal), >0 = sliding window
 }
 
 impl Default for AttentionParams {
@@ -33,6 +34,7 @@ impl Default for AttentionParams {
             rope_theta: 10000.0,
             use_fused_qkv: false,
             use_gate: false,
+            window_size: 0,
         }
     }
 }
@@ -245,6 +247,8 @@ pub fn attention_forward(
                 for t in 0..total_seq_len {
                     if t > cache_len + s {
                         scores[t] = f32::NEG_INFINITY;
+                    } else if params.window_size > 0 && t + params.window_size <= cache_len + s {
+                        scores[t] = f32::NEG_INFINITY; // SWA: block tokens beyond window
                     } else {
                         let mut dot = 0.0f32;
                         for d in 0..params.kv_head_dim {

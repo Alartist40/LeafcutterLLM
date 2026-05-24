@@ -1,8 +1,8 @@
 # Handoff: LeafcutterLLM (The Pathfinder Eye)
 
 **Date:** 2026-05-23  
-**Session:** IQ4_NL Bug Fix + 70B Memory Validation  
-**Git commits:** To be pushed  
+**Session:** IQ4_NL Bug Fix + 70B Memory Validation + Ministral Native Support + SWA  
+**Git commits:** Pushed to origin/main  
 **Author:** Kimi Code CLI
 
 ---
@@ -30,6 +30,10 @@ Fix the IQ4_NL garbled output bug and validate the 70B-on-4GB memory claim with 
 | 4 | **70B loads in < 100 MB** | Real `Meta-Llama-3.1-70B-Instruct-Q4_K_S.gguf` (40.3 GB) → **39 MB peak RSS at load** |
 | 5 | **70B forward pass < 2.5 GB** | Same 70B model, 1-token forward pass → **1,145 MB peak RSS** |
 | 6 | **IQ4_NL dequant consistency** | `get_tensor_row_f32()` and `Matrix::dequantize()` produce identical output on real model weights |
+| 7 | **Ministral-3B native** | `Ministral-3-3B-Reasoning-2512-Q4_K_M.gguf` → **504 MB peak RSS**, 1.09 tok/sec |
+| 8 | **Ministral-8B native** | `Ministral-3-8B-Reasoning-2512-Q4_K_M.gguf` → **739 MB peak RSS**, 0.62 tok/sec |
+| 9 | **SWA auto-detection** | `window_size` read from GGUF metadata, masking applied in attention scoring loop |
+| 10 | **Metadata resilience** | `hidden_size` and `num_hidden_layers` corrected from actual tensor shapes |
 
 ---
 
@@ -93,6 +97,55 @@ cargo run --release --bin verify_iq4_nl_fix   # Max diff = 0, paths match exactl
 
 ---
 
+## Ministral-3B / 8B Native — DETAILED
+
+### What Was Fixed
+
+Ministral models (arch: `mistral3`) had **three metadata lies** that broke native inference:
+
+1. **Architecture detection** — `mistral3` not recognized → added `"mistral3"` → `ModelArchitecture::Mistral` mapping.
+2. **hidden_size lie** — Metadata says 4096, actual tensor is 3072 (3B). `extract_config()` now reads `token_embd.weight` dimensions and corrects the config.
+3. **num_hidden_layers lie** — Metadata says 32, actual layers are 26 (3B). `extract_config()` now counts `blk.{i}.attn_norm.weight` / `blk.{i}.ffn_norm.weight` to find real layers.
+
+### Weight Name Mapping
+
+Ministral GGUF uses non-standard names. `load_special()` and forward loop now map:
+
+| Ministral GGUF Name | Standard Name | Notes |
+|--------------------|-------------|-------|
+| `output_norm.weight` | `model.norm.weight` | Final RMSNorm |
+| `token_embd.weight` | `model.embed_tokens.weight` | Vocab embedding |
+| `blk.{i}.attn_norm.weight` | `model.layers.{i}.input_layernorm.weight` | Pre-attention norm |
+| `blk.{i}.ffn_norm.weight` | `model.layers.{i}.post_attention_layernorm.weight` | Post-attention norm |
+| `output.weight` | `model.lm_head.weight` | Language model head |
+
+### Embedding Lookup
+
+Ministral `token_embd.weight` has dimensions `[vocab_size, embedding_dim]` where `embedding_dim != hidden_size`. `embed_lookup_mmap()` now copies `min(row.len(), hidden_size)` elements and pads the rest with zeros.
+
+### Results
+
+| Model | File Size | Hidden | Layers | Window | Peak RSS | Tokens/sec |
+|-------|----------|--------|--------|--------|----------|-----------|
+| Ministral-3B (Q4_K_M) | 2.1 GB | 3072 | 26 | 4096 | **504 MB** | 1.09 |
+| Ministral-8B (Q4_K_M) | 5.2 GB | 4096 | 36 | 4096 | **739 MB** | 0.62 |
+
+### Decode Quality
+
+`test_generation.rs` extracts `tokenizer.ggml.tokens` from GGUF metadata for vocabulary. Output example (Ministral-3B):
+
+```
+Prompt: "The capital of France is"
+Output: "Paris, the largest city in France and one of the most visited cities..."
+```
+
+### Known Limitations
+
+- **Encode is approximate:** `simple_encode()` does word-level lookup. SentencePiece BPE subword encoding needed for production tokenization.
+- **Decode works correctly:** Vocab array indexing is exact.
+
+---
+
 ## What We Know Is CORRECT
 
 1. **Dequantization** — Block-by-block comparison against Python `gguf` library shows exact match for Q4_K, Q5_K, Q6_K, IQ4_NL.
@@ -105,6 +158,9 @@ cargo run --release --bin verify_iq4_nl_fix   # Max diff = 0, paths match exactl
 8. **Coherent generation** — Verified on Llama-3.2-3B: "The capital of France is" → `France\nParis\nParis` (greedy decode, no NaN/Inf).
 9. **70B memory claim** — Real 40.3 GB model loads at 39 MB and runs forward pass at 1,145 MB peak.
 10. **IQ4_NL fix** — Embedding and LM head dequantization now matches GEMM kernel path exactly.
+11. **Ministral-3B/8B native** — Both models load and generate with metadata correction and weight name mapping.
+12. **SWA masking** — Sliding window attention blocks tokens beyond `window_size` in the scoring loop.
+13. **Metadata resilience** — `hidden_size` and `num_hidden_layers` corrected from actual tensor shapes when metadata is wrong.
 
 ---
 
@@ -131,6 +187,8 @@ No change from previous handoff. See `TEST_REPORT.md` for full Delta Net archite
 | Model | Hidden | Layers | File Size | Peak RSS | Status |
 |---|---|---|---|---|---|
 | Llama-3.2-3B | 3072 | 28 | 2.0 GB | **534 MB** | ✅ Measured |
+| Ministral-3B | 3072 | 26 | 2.1 GB | **504 MB** | ✅ Measured |
+| Ministral-8B | 4096 | 36 | 5.2 GB | **739 MB** | ✅ Measured |
 | Meta-Llama-3.1-70B | 8192 | 80 | 40.3 GB | **1,145 MB** | ✅ Measured |
 | Llama-2-7B (est.) | 4096 | 32 | ~4 GB | ~780 MB | 📋 Estimated |
 | Llama-2-13B (est.) | 5120 | 40 | ~8 GB | ~1.1 GB | 📋 Estimated |
@@ -146,6 +204,14 @@ LLAMA_CPP_BUILD="" cargo build --release
 ```
 
 This skips linking against `libllama` and `libggml`, allowing binaries like `compare_full_model` to compile and run.
+
+### Memory Profiler
+
+```bash
+cd rust && cargo run --release --bin profile_memory -- /path/to/model.gguf
+```
+
+Runs 5 forward passes and reports RSS/peak. Used to validate Ministral-3B (504 MB) and Ministral-8B (739 MB).
 
 ---
 

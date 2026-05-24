@@ -25,14 +25,15 @@ impl ModelArchitecture {
     pub fn detect(file: &GGUFile) -> Self {
         if let Some(GGUFValue::String(arch)) = file.metadata.get("general.architecture") {
             match arch.as_str() {
-                "llama"   => ModelArchitecture::Llama,
-                "qwen2"   => ModelArchitecture::Qwen2,
-                "qwen35"  => ModelArchitecture::Qwen35,
-                "qwen36"  => ModelArchitecture::Qwen36,
-                "mistral" => ModelArchitecture::Mistral,
-                "phi"     => ModelArchitecture::Phi,
-                "gemma"   => ModelArchitecture::Gemma,
-                _         => ModelArchitecture::Unknown,
+                "llama"    => ModelArchitecture::Llama,
+                "qwen2"    => ModelArchitecture::Qwen2,
+                "qwen35"   => ModelArchitecture::Qwen35,
+                "qwen36"   => ModelArchitecture::Qwen36,
+                "mistral"  => ModelArchitecture::Mistral,
+                "mistral3" => ModelArchitecture::Mistral,
+                "phi"      => ModelArchitecture::Phi,
+                "gemma"    => ModelArchitecture::Gemma,
+                _          => ModelArchitecture::Unknown,
             }
         } else {
             ModelArchitecture::Unknown

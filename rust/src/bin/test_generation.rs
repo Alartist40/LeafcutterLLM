@@ -1,8 +1,9 @@
-//! Generation quality test
+//! Generation quality test — with GGUF-native tokenizer support
 
 use clap::Parser;
 use leafcutter::inference::engine::Engine;
-use leafcutter::tokenizer::Tokenizer;
+use leafcutter::model::gguf::{GGUFile, GGUFValue};
+use std::collections::HashMap;
 use std::time::Instant;
 
 #[derive(Parser, Debug)]
@@ -23,16 +24,65 @@ struct Args {
     #[arg(long, default_value_t = 0.9)]
     top_p: f32,
 
-    #[arg(long)]
-    tokenizer: Option<String>,
-
     #[arg(long, default_value_t = false)]
     raw: bool,
 }
 
+/// Extract vocabulary from GGUF metadata.
+fn extract_vocab(path: &str) -> (Vec<String>, usize, usize) {
+    let file = GGUFile::open(path).expect("Failed to open GGUF for vocab extraction");
+
+    let vocab = match file.metadata.get("tokenizer.ggml.tokens") {
+        Some(GGUFValue::Array(arr)) => {
+            arr.iter()
+                .map(|v| match v {
+                    GGUFValue::String(s) => s.clone(),
+                    _ => String::new(),
+                })
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+
+    let bos = file.get_metadata_int("tokenizer.ggml.bos_token_id")
+        .map(|v| v as usize)
+        .unwrap_or(1);
+    let eos = file.get_metadata_int("tokenizer.ggml.eos_token_id")
+        .map(|v| v as usize)
+        .unwrap_or(2);
+
+    (vocab, bos, eos)
+}
+
+/// Simple word-level tokenizer (good enough for English test prompts).
+fn simple_encode(text: &str, vocab_map: &HashMap<String, usize>, vocab: &[String], bos: usize) -> Vec<usize> {
+    let mut tokens = vec![bos];
+    for word in text.split_whitespace() {
+        let key = word.to_lowercase();
+        if let Some(&id) = vocab_map.get(&key) {
+            tokens.push(id);
+        } else if let Some(&id) = vocab_map.get(word) {
+            tokens.push(id);
+        } else {
+            // fallback: space + word
+            let spaced = format!(" {word}");
+            if let Some(&id) = vocab_map.get(&spaced) {
+                tokens.push(id);
+            }
+        }
+    }
+    tokens
+}
+
+fn simple_decode(tokens: &[usize], vocab: &[String]) -> String {
+    tokens.iter()
+        .map(|&t| vocab.get(t).cloned().unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 fn main() {
     let args = Args::parse();
-    let tok_path = args.tokenizer.as_deref().unwrap_or("tests/tokenizer.json");
 
     println!("🌿 Leafcutter Generation Test");
     println!("   Model: {}", args.model);
@@ -40,12 +90,19 @@ fn main() {
     println!("   Max tokens: {}", args.tokens);
     println!("   Raw mode: {}", args.raw);
 
+    // Extract vocab from GGUF before loading engine
+    let (vocab, bos_id, _eos_id) = extract_vocab(&args.model);
+    let vocab_map: HashMap<String, usize> = vocab.iter().enumerate()
+        .map(|(i, s)| (s.clone(), i))
+        .collect();
+    println!("📚 Vocab extracted: {} tokens", vocab.len());
+
     let mut engine = Engine::load(&args.model).expect("Failed to load engine");
     println!("✅ Engine loaded: {} layers, hidden_size={}", engine.config.num_hidden_layers, engine.config.hidden_size);
 
-    // For FFI backend (Qwen3.5/3.6), use the model's built-in tokenizer.
-    // For native backend, use the external tokenizer.json.
     let use_ffi_tok = engine.is_ffi();
+
+    // Tokenize prompt
     let prompt_tokens = if use_ffi_tok {
         let prompt = if args.raw {
             args.prompt.clone()
@@ -54,18 +111,13 @@ fn main() {
         };
         engine.tokenize(&prompt, false)
     } else {
-        let tok = if std::path::Path::new(tok_path).exists() {
-            Tokenizer::from_file(tok_path).expect("Failed to load tokenizer")
+        // Use GGUF vocab for native models
+        let text = if args.raw {
+            args.prompt.clone()
         } else {
-            eprintln!("❌ Tokenizer not found at {}", tok_path);
-            std::process::exit(1);
+            format!("Hello! How can I help you with '{}'?", args.prompt)
         };
-        if args.raw {
-            tok.encode(&args.prompt)
-        } else {
-            let prompt = tok.apply_chat_template(&args.prompt);
-            tok.encode(&prompt)
-        }
+        simple_encode(&text, &vocab_map, &vocab, bos_id)
     };
     println!("📝 Prompt tokens: {}", prompt_tokens.len());
 
@@ -76,7 +128,11 @@ fn main() {
         .max_by(|(_,a),(_,b)| a.partial_cmp(b).unwrap())
         .map(|(i,v)| (i, *v))
         .unwrap();
-    let top_piece = if use_ffi_tok { engine.decode(&[top_prefill.0]) } else { String::new() };
+    let top_piece = if use_ffi_tok {
+        engine.decode(&[top_prefill.0])
+    } else {
+        vocab.get(top_prefill.0).cloned().unwrap_or_default()
+    };
     println!("   Top prefill token: {} (logit={:.2}) -> '{}'", top_prefill.0, top_prefill.1, top_piece);
 
     // Check top-5 prefill tokens
@@ -84,7 +140,11 @@ fn main() {
     indexed.sort_by(|(_,a),(_,b)| b.partial_cmp(a).unwrap());
     println!("   Top-5 prefill tokens:");
     for (i, (tid, logit)) in indexed.iter().take(5).enumerate() {
-        let piece = if use_ffi_tok { engine.decode(&[*tid]) } else { String::new() };
+        let piece = if use_ffi_tok {
+            engine.decode(&[*tid])
+        } else {
+            vocab.get(*tid).cloned().unwrap_or_default()
+        };
         println!("     [{}] id={:>6} logit={:>7.2} -> '{}'", i, tid, logit, piece);
     }
 
@@ -100,12 +160,20 @@ fn main() {
     // Decode each generated token individually
     println!("\n🔍 Token-by-token breakdown:");
     for (i, &tid) in generated.iter().enumerate() {
-        let text = if use_ffi_tok { engine.decode(&[tid]) } else { String::new() };
+        let text = if use_ffi_tok {
+            engine.decode(&[tid])
+        } else {
+            vocab.get(tid).cloned().unwrap_or_default()
+        };
         println!("   [{}] id={:>6} -> '{}'", i, tid, text);
     }
 
     let all_tokens: Vec<usize> = prompt_tokens.iter().chain(generated.iter()).copied().collect();
-    let decoded = if use_ffi_tok { engine.decode(&all_tokens) } else { String::new() };
+    let decoded = if use_ffi_tok {
+        engine.decode(&all_tokens)
+    } else {
+        simple_decode(&all_tokens, &vocab)
+    };
     println!("\n📝 Full decoded output:\n{}", decoded);
 
     // Basic coherence check: flag repetitive tokens

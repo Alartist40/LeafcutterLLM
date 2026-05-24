@@ -460,6 +460,26 @@ Each fix is tagged with its ID (FIX-001, COMPILE-FIX-0, etc.) to match the audit
 
 ---
 
+## [0.10.0] — 2026-05-19 (Ministral Native + SWA + Metadata Resilience)
+
+### Added
+- **Ministral Native Inference**: Ministral-3B and Ministral-8B models now run natively on the optimized path.
+  - Architecture detection: `"mistral3"` → `ModelArchitecture::Mistral`
+  - Metadata resilience: `hidden_size` and `num_hidden_layers` corrected from actual tensor shapes when GGUF metadata is incorrect
+  - Weight name mapping: bridges non-standard Ministral GGUF names (`output_norm.weight`, `blk.{i}.attn_norm.weight`) to standard names
+  - Dynamic embedding lookup: handles `embedding_dim != hidden_size` via `min(row.len(), hidden_size)` + zero pad
+- **Sliding Window Attention (SWA)**: `window_size` auto-read from GGUF metadata (`llama.attention.sliding_window`, `mistral.attention.sliding_window`, `qwen35.attention.sliding_window`). Tokens beyond the window are masked to `-inf` in the attention scoring loop.
+- **Memory Profiler Binary**: `profile_memory.rs` runs 5 forward passes and reports RSS/peak. Used to validate Ministral-3B (504 MB) and Ministral-8B (739 MB).
+- **GGUF-Native Vocab Extraction**: `test_generation.rs` extracts `tokenizer.ggml.tokens` from GGUF metadata for decode without external tokenizer files.
+
+### Performance
+| Model | Backend | Peak RAM | tok/sec | Status |
+|-------|---------|----------|---------|--------|
+| Ministral-3B Q4_K_M | Native | **504 MB** | 1.09 | ✅ Verified |
+| Ministral-8B Q4_K_M | Native | **739 MB** | 0.62 | ✅ Verified |
+
+---
+
 ## [0.9.0] — 2026-05-19 (Dual-Backend Inference Engine)
 
 ### Added
@@ -509,5 +529,5 @@ See [README.md](README.md) for current capabilities and quick-start guide.
 ---
 
 **Last Updated:** 2026-05-19  
-**Project Status:** Production Ready (v0.9.0)  
+**Project Status:** Production Ready (v0.10.0)  
 **Maintained by:** Alartist40

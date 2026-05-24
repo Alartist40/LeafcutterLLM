@@ -118,7 +118,30 @@ impl Engine {
             ).into());
         }
 
-        let config = model.config.clone();
+        let mut config = model.config.clone();
+        // Verify hidden_size against actual tensor dimensions — metadata may lie
+        // (e.g. Ministral-3B: metadata says 4096, token_embd.weight is 3072)
+        if let Some(info) = model.file.get_tensor_info("token_embd.weight") {
+            let actual_hidden = info.dimensions[0] as usize;
+            if actual_hidden != config.hidden_size && actual_hidden > 0 {
+                eprintln!("  Correcting hidden_size: metadata={} → actual={}",
+                    config.hidden_size, actual_hidden);
+                config.hidden_size = actual_hidden;
+            }
+        }
+        // Verify num_hidden_layers against actual tensor presence — metadata may lie
+        // (e.g. Ministral-3B: metadata says 32, but only 26 layers exist)
+        let actual_layers = (0..config.num_hidden_layers)
+            .filter(|&i| {
+                model.file.get_tensor_info(&format!("blk.{}.attn_norm.weight", i)).is_some()
+                    || model.file.get_tensor_info(&format!("blk.{}.ffn_norm.weight", i)).is_some()
+            })
+            .count();
+        if actual_layers != config.num_hidden_layers && actual_layers > 0 {
+            eprintln!("  Correcting num_hidden_layers: metadata={} → actual={}",
+                config.num_hidden_layers, actual_layers);
+            config.num_hidden_layers = actual_layers;
+        }
         let mut special_weights = model.load_special()?;
         let kv_cache = KVCache::new(config.num_hidden_layers);
 
@@ -290,6 +313,12 @@ impl Engine {
             }
         }
 
+        let window_size = model.file.get_metadata_int("llama.attention.sliding_window")
+            .or_else(|| model.file.get_metadata_int("mistral.attention.sliding_window"))
+            .or_else(|| model.file.get_metadata_int("qwen35.attention.sliding_window"))
+            .map(|v| v as usize)
+            .unwrap_or(0);
+
         if q_out_dim == 0 {
             return AttentionParams {
                 num_heads: config.num_attention_heads,
@@ -299,6 +328,7 @@ impl Engine {
                 rope_theta: config.rope_theta,
                 use_fused_qkv: false,
                 use_gate: false,
+                window_size,
             };
         }
 
@@ -331,6 +361,7 @@ impl Engine {
             rope_theta,
             use_fused_qkv: false,
             use_gate: false,
+            window_size,
         }
     }
 
@@ -579,7 +610,10 @@ impl Engine {
             let idx = token.min(vocab_size - 1);
             let row = self.model.file.get_tensor_row_f32("token_embd.weight", idx)
                 .expect("Failed to read embedding row");
-            data[i * hidden_size..(i + 1) * hidden_size].copy_from_slice(&row);
+            // Embedding dim may differ from hidden_size (e.g. Ministral-3B: 3072 vs 4096)
+            let copy_len = row.len().min(hidden_size);
+            data[i * hidden_size..i * hidden_size + copy_len].copy_from_slice(&row[..copy_len]);
+            // Remaining dims stay zero (padding)
         }
         Tensor::from_vec(data, vec![tokens.len(), hidden_size])
     }

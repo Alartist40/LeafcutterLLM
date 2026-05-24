@@ -104,7 +104,7 @@ Leafcutter implements a **dual-backend engine** with automatic routing:
 
 | Path | Trigger | Models | Memory | Speed |
 |------|---------|--------|--------|-------|
-| **Native optimized** | Supported arch + quants | Llama, Mistral, Qwen2 | ~1GB for 70B | ~0.12 t/s (3B) |
+| **Native optimized** | Supported arch + quants | Llama, Mistral, Ministral, Qwen2 | ~1GB for 70B | ~0.12 t/s (3B) |
 | **Explicit FFI** | Architecture = qwen3.5/3.6 | Qwen3.5, Qwen3.6 | Standard | 2–14 t/s |
 | **Auto-FFI fallback** | Unsupported quant types | Any IQ1_M, Q2_K, etc. | Standard | Varies |
 
@@ -506,6 +506,8 @@ Measured on x86_64 desktop (AMD Ryzen 7 5800HS, 16GB RAM):
 | Model | Backend | Quant | Size | Verified | Peak RAM | tok/sec |
 |-------|---------|-------|------|----------|----------|---------|
 | Llama-3.2-3B-Instruct | **Native** | Q4_K_XL | 1.9 GB | ✅ Forward + generation | **534 MB** | ~0.12 |
+| Ministral-3-3B-Reasoning-2512 | **Native** | Q4_K_M | 2.1 GB | ✅ Forward + generation | **504 MB** | 1.09 |
+| Ministral-3-8B-Reasoning-2512 | **Native** | Q4_K_M | 5.2 GB | ✅ Forward + generation | **739 MB** | 0.62 |
 | Meta-Llama-3.1-70B-Instruct | **Native** | Q4_K_S | 40.3 GB | ✅ Load + forward | **1,145 MB** | ~0.007 |
 | Qwen3.5-0.8B | **FFI** | Q4_0 | 0.5 GB | ✅ Coherent generation | ~3 GB | **14.68** |
 | Qwen3.5-9B-Instruct | **FFI** | IQ4_NL | 5.0 GB | ✅ Coherent + reasoning | ~6 GB | **2.38** |
@@ -516,6 +518,10 @@ Measured on x86_64 desktop (AMD Ryzen 7 5800HS, 16GB RAM):
 Llama-3.2-3B (native):
   Prompt:  "The capital of France is"
   Output:  "Paris"
+
+Ministral-3B (native):
+  Prompt:  "The capital of France is"
+  Output:  "Paris, the largest city in France and one of the most visited cities..."
 
 Qwen3.5-9B (FFI):
   Prompt:  "60km in 30min = ?"
@@ -532,6 +538,7 @@ Qwen3.5-0.8B (FFI):
 |--------|--------|---------|
 | Tokens/sec (3B Q4_K, x86_64) | 2–5 tok/s | **~0.12 tok/s** (scalar GEMM) |
 | 3B model on 8GB RAM | ✅ Load + forward | **Achieved** ✅ |
+| 8B model on 8GB RAM | ✅ Native, 739 MB peak (Ministral) | **Achieved** ✅ |
 | 27B model on 16GB RAM | ✅ Via FFI | **Achieved** ✅ |
 | 70B on 4GB (native) | Layer streaming + madvise | **Achieved** ✅ (1,145 MB) |
 | 70B exotic quants (auto-FFI) | Routes to llama.cpp mmap | **Achieved** ✅ |
@@ -541,6 +548,7 @@ Qwen3.5-0.8B (FFI):
 | Compressed KV cache | — | ✅ 256-dim keys/values |
 | Speculative decoding | 2×–3× speedup | ✅ Eagle draft heads loaded |
 | **Auto-FFI fallback** | Universal model support | **✅ WORKING** |
+| Ministral native | mistral3 arch + metadata correction | **✅ WORKING** |
 
 ---
 
@@ -602,9 +610,13 @@ Leafcutter is **fully open source** (MIT license). Every kernel, every architect
 | Model | Size | Quant | Native Status | Bridge Status | Peak RAM |
 |-------|------|-------|---------------|---------------|----------|
 | Llama-3.2-3B-Instruct | 1.9 GB | Q4_K_XL | ✅ Forward + generation | ✅ | ~570 MB |
+| Ministral-3-3B-Reasoning-2512 | 2.1 GB | Q4_K_M | ✅ Forward + generation | — | **504 MB** |
+| Ministral-3-8B-Reasoning-2512 | 5.2 GB | Q4_K_M | ✅ Forward + generation | — | **739 MB** |
 | Qwen3.6-27B | 16 GB | IQ4_NL | ⚠️ Loads, attention OOB | ✅ | ~1.2 GB |
 
 **Llama-3.2-3B verification:** Python reference comparison shows max diff < 0.003 across all 28 layers. Greedy decode produces coherent output.
+
+**Ministral verification:** Both 3B and 8B models load, run forward pass, and produce coherent greedy decode output. Metadata lies (hidden_size, num_layers) corrected from actual tensor shapes. Weight name mapping bridges non-standard GGUF naming. SWA auto-detected and masked.
 
 **Qwen3.6-27B blocker:** Attention architecture mismatch. Model uses `head_count=24`, `key_length=256`, `value_length=256`, `rope.dimension_count=64`, and fused QKV `[5120, 10240]`. Standard `head_dim = hidden_size / num_heads` formula does not apply. Use bridge as fallback.
 

@@ -290,6 +290,38 @@ State growth: monotonic, no NaN/Inf
 
 ---
 
+## 2026-05-19 — Ministral Native Inference Validated
+
+### Models Tested
+
+| Model | File Size | Layers | Hidden | Window | Peak RSS | Tok/sec | Status |
+|---|---|---|---|---|---|---|---|
+| Ministral-3-3B-Reasoning-2512-Q4_K_M | 2.1 GB | 26 | 3072 | 4096 | **504 MB** | 1.09 | ✅ Validated |
+| Ministral-3-8B-Reasoning-2512-Q4_K_M | 5.2 GB | 36 | 4096 | 4096 | **739 MB** | 0.62 | ✅ Validated |
+
+### Fixes Required
+
+1. **Architecture detection:** `"mistral3"` → `ModelArchitecture::Mistral`
+2. **Metadata correction:** `hidden_size` 4096→3072 (3B), `num_hidden_layers` 32→26 (3B) — corrected from actual tensor shapes
+3. **Weight name mapping:** `output_norm.weight` → `model.norm.weight`, `blk.{i}.attn_norm.weight` → `input_layernorm.weight`, etc.
+4. **Embedding lookup:** handles `embedding_dim != hidden_size` via `min(row.len(), hidden_size)` + zero pad
+5. **Sliding Window Attention:** `window_size=4096` read from GGUF, masked in attention scoring loop
+
+### Decode Quality
+
+Ministral-3B with GGUF-native vocab extraction:
+```
+Prompt: "The capital of France is"
+Output: "Paris, the largest city in France and one of the most visited cities..."
+```
+
+### Known Limitations
+
+- **Encode is approximate:** word-level lookup in `simple_encode()`. SentencePiece BPE subword encoding needed for production.
+- **Decode is exact:** vocab array indexing from `tokenizer.ggml.tokens` metadata.
+
+---
+
 ## 2026-05-19 Evening — llama.cpp FFI Bridge: Coherent Generation Achieved
 
 ### Breakthrough

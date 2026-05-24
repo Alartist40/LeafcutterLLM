@@ -104,6 +104,19 @@
 
 ---
 
+### Milestone 12: Ministral Native Inference (mistral3)
+- **File:** `src/model/arch.rs`, `src/model/gguf.rs`, `src/inference/engine.rs`, `src/inference/attention.rs`
+- **What:** Ministral-3B and Ministral-8B now run natively with layer streaming.
+  - Architecture detection: `"mistral3"` → `ModelArchitecture::Mistral`
+  - Metadata correction: `hidden_size` and `num_hidden_layers` corrected from actual tensor shapes (metadata lies: 4096→3072, 32→26 for 3B)
+  - Weight name mapping: `output_norm.weight` → `model.norm.weight`, `blk.{i}.attn_norm.weight` → `input_layernorm.weight`, etc.
+  - Embedding lookup: handles `embedding_dim != hidden_size` by copying `min(row.len(), hidden_size)` and padding zeros
+  - Sliding Window Attention (SWA): `window_size` read from GGUF metadata, masked in attention scoring loop
+- **Tests:** `test_generation.rs` — coherent decode verified on both 3B and 8B models
+- **Status:** ✅ Complete
+
+---
+
 ## Benchmarks
 
 ### Environment
@@ -119,6 +132,8 @@
 | Model | Params | File Size | Peak RSS | Status |
 |---|---|---|---|---|
 | Llama-3.2-3B-Instruct | 3B | 2.0 GB | **534 MB** | ✅ Measured (Q4_K_XL) |
+| Ministral-3-3B-Reasoning-2512 | 3B | 2.1 GB | **504 MB** | ✅ Measured (Q4_K_M) |
+| Ministral-3-8B-Reasoning-2512 | 8B | 5.2 GB | **739 MB** | ✅ Measured (Q4_K_M) |
 | Meta-Llama-3.1-70B-Instruct | 70B | 40.3 GB | **1,145 MB** | ✅ Measured (Q4_K_S) |
 
 ### `bench_shard` — Synthetic 4-layer, 512-hidden model

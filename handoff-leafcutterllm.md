@@ -30,6 +30,7 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 ### What's In Progress
 - Speed optimization — quantized GEMM kernels are naive scalar loops (~0.12 tok/sec on 3B)
 - Llama-70B end-to-end validation — download + run real 70B model to confirm ~2.4 GB peak
+- Ministral-3B / 8B native inference — architecture detection, metadata correction, weight name mapping, sliding window attention (SWA)
 
 ### What's Blocked
 - **Qwen3.6-27B native attention** — architectural mismatch. Model uses `head_count=24`, `key_length=256`, `value_length=256`, `rope.dimension_count=64`, and fused QKV shape `[5120, 10240]`. Our code assumes `head_dim = hidden_size / num_heads`, which gives 213, but this doesn't divide the fused QKV evenly. RoPE partial application (64 dims) and compressed KV dimensions are also unimplemented.
@@ -43,10 +44,13 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 | Llama-3.2-3B (generation) | — | ✅ | ✅ Coherent greedy decode | **PASS** |
 | Synthetic 80-layer stress test | 27 MB | ✅ | ✅ 80 layers, 30 MB peak | **PASS** |
 | Qwen3.6-27B-IQ4_NL | 16 GB | ✅ | ❌ Attention index OOB | **BLOCKED** |
+| Ministral-3B-Q4_K_M | 2.1 GB | ✅ | ✅ 504 MB peak, coherent decode | **PASS** |
+| Ministral-8B-Q4_K_M | 5.2 GB | ✅ | ✅ 739 MB peak, coherent decode | **PASS** |
 
 **Key findings:**
 - Quantized loading reduces per-layer memory 4× (70MB vs 280MB for 3B, 217MB vs 870MB for 27B)
 - Llama-style models work end-to-end natively
+- **Ministral models now work natively** — metadata lies (hidden_size, num_layers) corrected from actual tensor shapes; weight name mapping bridges non-standard GGUF naming; SWA auto-detected and masked
 - Qwen3.6 requires architecture research before native support
 
 ---
@@ -62,12 +66,12 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/q6_k_gemm.rs` | Q6_K transposed-B GEMM (scalar reference) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/iq4_nl_gemm.rs` | IQ4_NL transposed-B GEMM (scalar reference) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/q8_0_gemm.rs` | Q8_0 transposed-B GEMM (scalar reference) |
-| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/attention.rs` | **M4+M5: Attention** — RoPE + GQA + fused QKV + compressed KV + gated attention |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/attention.rs` | **M4+M5: Attention** — RoPE + GQA + fused QKV + compressed KV + gated attention + **sliding window attention (SWA)** |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/ssm.rs` | **M7: SSM layer** — causal conv1d + selective scan for Mamba layers (stubs) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/speculative.rs` | **M6: Speculative decoding** — Eagle draft heads (`nextn.*` tensors) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/engine.rs` | **M7: Hybrid engine** — routes SSM/Attention per layer, loads from GGUF |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/cache/mod.rs` | **M5: Compressed KV cache** — per-layer seq len tracking |
-| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/model/arch.rs` | Architecture detection — Llama, Qwen2, Qwen35, Phi3, Mistral, BitNet |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/model/arch.rs` | Architecture detection — Llama, Qwen2, Qwen35, Phi3, Mistral, **Mistral3 (Ministral)**, BitNet |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/api/mod.rs` | HTTP API (Axum) — `/health`, `/generate`, `/v1/chat/completions` |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/model/loader.rs` | Layer-streaming GGUF loader + capability report + quantized weight loading |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/model/tensor.rs` | f32 Tensor + quantized Tensor dual storage with matmul dispatch |

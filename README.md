@@ -35,6 +35,8 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 |-------|------|---------|--------|----------|---------|
 | Llama-3.2-3B-Instruct | 1.9 GB | **Native** | ✅ Forward + generation | **534 MB** | ~0.12 |
 | Meta-Llama-3.1-70B-Instruct | 40.3 GB | **Native** | ✅ Load + forward | **1,145 MB** | ~0.007 |
+| Ministral-3-8B Q4_K_M | 4.9 GB | **Native** | ✅ Forward + generation | **739 MB** | 0.62 |
+| Ministral-3-3B Q4_K_M | 2.0 GB | **Native** | ✅ Forward + generation | **504 MB** | 1.09 |
 | Qwen3.5-0.8B | 0.5 GB | **FFI** | ✅ Coherent generation | ~3 GB | 14.68 |
 | Qwen3.5-9B | 5.0 GB | **FFI** | ✅ Coherent + reasoning | ~6 GB | 2.38 |
 | Synthetic 80-layer | 27 MB | **Native** | ✅ Layer streaming stress test | **30 MB** | N/A |
@@ -109,12 +111,14 @@ See [`CYNAPSE_INTEGRATION.md`](CYNAPSE_INTEGRATION.md) for full details.
 
 ✅ **Offline inference** — no WiFi, no cloud, no API costs  
 ✅ **Three-Path Backend** — Native optimized + Explicit FFI + Auto-FFI fallback  
-✅ **Hybrid Architecture Support** — Native SSM+Attention (Qwen3.5 DeltaNet), standard transformers (Llama, Qwen2, Mistral)  
+✅ **Hybrid Architecture Support** — Native SSM+Attention (Qwen3.5 DeltaNet), standard transformers (Llama, Qwen2, Mistral, Ministral)  
+✅ **Sliding Window Attention** — Ministral/Mistral-style SWA with auto-detection from GGUF metadata  
 ✅ **Aggressive Quantization** — Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ1_M, and BitNet I2_S ternary  
 ✅ **Cross-Platform** — Native support for Linux, macOS, and Windows  
 ✅ **Low latency** — sub-2 second response on Pi 5, <500ms on modern CPU  
 ✅ **Layer Streaming** — Run **13B models on 8GB RAM** today; 70B on 4GB with quantized embed WIP  
 ✅ **Auto-Detection** — Architecture detection + capability report + automatic backend routing  
+✅ **Metadata Resilience** — Corrects bad `hidden_size` / `num_hidden_layers` from actual tensor shapes  
 ✅ **Memory Tuning** — Manual control over context length to fit massive models on tiny RAM  
 ✅ **Testing Framework** — Automated suite benchmarking models from 0.5B to 70B  
 ✅ **Speculative decoding** — Eagle-style draft heads for 3-4× speedup  
