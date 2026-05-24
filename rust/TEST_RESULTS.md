@@ -267,7 +267,9 @@ State growth: monotonic, no NaN/Inf
 
 > **Option C (Full Rust Rewrite) is production-ready.**  
 > Three-path backend works: native optimized + explicit FFI + auto-FFI fallback.  
-> 70B models validated on 16GB RAM. Qwen3.5 generates coherent text via FFI.  
+> 70B Q4_K validated at 1,145 MB peak RSS via native layer streaming.  
+> Qwen3.5 generates coherent text via FFI.  
+> Auto-FFI fallback routes exotic quants to llama.cpp.  
 > Binary: ~3 MB. Zero Python dependencies. Ready for GitHub push.
 
 ---

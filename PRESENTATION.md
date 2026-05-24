@@ -509,7 +509,7 @@ Measured on x86_64 desktop (AMD Ryzen 7 5800HS, 16GB RAM):
 | Meta-Llama-3.1-70B-Instruct | **Native** | Q4_K_S | 40.3 GB | ✅ Load + forward | **1,145 MB** | ~0.007 |
 | Qwen3.5-0.8B | **FFI** | Q4_0 | 0.5 GB | ✅ Coherent generation | ~3 GB | **14.68** |
 | Qwen3.5-9B-Instruct | **FFI** | IQ4_NL | 5.0 GB | ✅ Coherent + reasoning | ~6 GB | **2.38** |
-| Llama-3.1-70B-IQ1_M | **Auto-FFI** | IQ1_M | 15.6 GB | ✅ Load + prefill | ~16 GB | ~0.03 |
+| Llama-3.1-70B-IQ1_M | **Auto-FFI** | IQ1_M | 15.6 GB | ✅ Load + prefill | *llama.cpp mmap* | ~0.03 |
 
 **Verified generation examples:**
 ```
@@ -534,7 +534,7 @@ Qwen3.5-0.8B (FFI):
 | 3B model on 8GB RAM | ✅ Load + forward | **Achieved** ✅ |
 | 27B model on 16GB RAM | ✅ Via FFI | **Achieved** ✅ |
 | 70B on 4GB (native) | Layer streaming + madvise | **Achieved** ✅ (1,145 MB) |
-| 70B on 16GB (auto-FFI) | IQ1_M fallback | **Achieved** ✅ |
+| 70B exotic quants (auto-FFI) | Routes to llama.cpp mmap | **Achieved** ✅ |
 | BitNet speedup vs Q4_0 | 1.5×–3× | ✅ LUT GEMM implemented |
 | Native DeltaNet | Correct math | ✅ Isolated layers pass |
 | Fused QKV attention | — | ✅ Llama/Qwen2 style |

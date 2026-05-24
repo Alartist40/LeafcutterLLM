@@ -492,7 +492,7 @@ Each fix is tagged with its ID (FIX-001, COMPILE-FIX-0, etc.) to match the audit
 | Meta-Llama-3.1-70B Q4_K | Native | 1,145 MB | ~0.007 | ✅ Verified |
 | Qwen3.5-0.8B Q4_0 | FFI | ~3 GB | 14.68 | ✅ Coherent |
 | Qwen3.5-9B IQ4_NL | FFI | ~6 GB | 2.38 | ✅ Coherent |
-| Llama-3.1-70B IQ1_M | Auto-FFI | ~16 GB | ~0.03 | ✅ Loads + prefill |
+| Llama-3.1-70B IQ1_M | Auto-FFI | *llama.cpp mmap* | ~0.03 | ✅ Loads + prefill |
 
 ---
 

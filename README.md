@@ -37,13 +37,12 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 | Meta-Llama-3.1-70B-Instruct | 40.3 GB | **Native** | ✅ Load + forward | **1,145 MB** | ~0.007 |
 | Qwen3.5-0.8B | 0.5 GB | **FFI** | ✅ Coherent generation | ~3 GB | 14.68 |
 | Qwen3.5-9B | 5.0 GB | **FFI** | ✅ Coherent + reasoning | ~6 GB | 2.38 |
-| Meta-Llama-3.1-70B-IQ1_M | 15.6 GB | **Auto-FFI** | ✅ Load + prefill | ~16 GB | ~0.03 |
 | Synthetic 80-layer | 27 MB | **Native** | ✅ Layer streaming stress test | **30 MB** | N/A |
 
 * 534 MB measured on x86_64 with `madvise(MADV_DONTNEED)` layer streaming (Llama-3.2-3B Q4_K_XL).
 * 1,145 MB measured on x86_64 with real 70B Q4_K_S model, 1-token forward pass.
-* 39 MB load-only RSS for 70B — model stays entirely on disk via mmap.
-* IQ1_M models auto-fallback to llama.cpp FFI when native lacks dequant support.
+* 39 MB load-only RSS for 70B native — model stays entirely on disk via mmap.
+* Auto-FFI fallback routes exotic quants (IQ1_M, Q2_K, etc.) to llama.cpp, which uses its own mmap model (higher RSS than native layer streaming).
 
 **Key technique:** After computing each layer, `madvise(MADV_DONTNEED)` drops the layer's mmap pages from OS cache. Next layer faults back from disk. RSS stays bounded to ~1 layer + engine overhead (~500 MB for 3B, ~2.4 GB for 70B).
 
@@ -371,21 +370,22 @@ Response (token or text)
 | **Binary Size** | ~5 MB | ~500 MB (Python) | **~3 MB** |
 | **Memory Safety** | Manual (C) | GC (Python) | **Borrow checker (Rust)** |
 
-### Concrete Example: Running 70B on 16GB Laptop
+### Concrete Example: Running 70B on Limited RAM
 
-**llama.cpp alone:**
-- Loads and runs everything via mmap
-- Works, but no layer streaming optimization
-- Verdict: ✅ Works, but memory not bounded
+**llama.cpp alone (standard mmap):**
+- Loads and runs via mmap, OS pages on demand
+- Works, but no explicit layer eviction — RSS grows with cache pressure
+- Verdict: ✅ Works, but memory not tightly bounded
 
-**LeafcutterLLM native:**
-- Peak RAM: **1,145 MB** (measured) via layer streaming + madvise
-- Verdict: ✅ **8x less RAM** than naive loading
+**LeafcutterLLM native (layer streaming):**
+- Peak RAM: **1,145 MB** (measured) via layer streaming + `madvise(MADV_DONTNEED)`
+- Only ~1 layer resident at a time; explicit eviction after each layer
+- Verdict: ✅ **Proven on real 70B model** — fits in 4GB with 3.5× headroom
 
-**LeafcutterLLM with auto-fallback:**
-- IQ1_M model (unsupported natively) → automatically routes to FFI
-- No manual intervention needed
-- Verdict: ✅ "It just works"
+**LeafcutterLLM with auto-fallback (exotic quants):**
+- IQ1_M model (unsupported natively) → automatically routes to llama.cpp FFI
+- Uses llama.cpp's memory model (mmap + repack buffers); RSS varies by model size
+- Verdict: ✅ "It just works" — but memory efficiency is llama.cpp's, not layer streaming
 
 ---
 
