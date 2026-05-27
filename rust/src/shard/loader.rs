@@ -282,6 +282,17 @@ mod tests {
     }
 }
 
+/// Transpose row-major f32 data from [rows, cols] to [cols, rows].
+fn transpose_row_major(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0.0f32; data.len()];
+    for r in 0..rows {
+        for c in 0..cols {
+            out[c * rows + r] = data[r * cols + c];
+        }
+    }
+    out
+}
+
 /// Parse a shard file from a memory-mapped buffer.
 /// Copies all tensor data into owned `Vec<f32>` Tensors.
 fn parse_shard_from_mmap(mmap: &[u8]) -> Result<HashMap<String, Tensor>, Box<dyn std::error::Error>> {
@@ -331,11 +342,15 @@ fn parse_shard_from_mmap(mmap: &[u8]) -> Result<HashMap<String, Tensor>, Box<dyn
                     ).into());
                 }
                 let blocks = crate::kernels::q8_0::blocks_from_bytes(data_bytes);
-                // Only create a quantized Tensor if it's a 2D matrix with cols multiple of 32.
-                // 1D tensors (norm weights, biases) just get dequantized to f32.
-                if shape.len() == 2 && shape[1] % 32 == 0 {
-                    let q8 = Q8Matrix { rows: shape[0], cols: shape[1], blocks };
-                    tensors.insert(meta.name, Tensor::from_q8_0(q8, shape));
+                // 2D weight tensors in our convention are [k, n]; the shard writer
+                // transposes to GGUF [n, k] before quantizing.  We reconstruct the
+                // Q8Matrix in [n, k] layout (cols = k must be a multiple of 32).
+                if shape.len() == 2 && shape[0] % 32 == 0 {
+                    let q8 = Q8Matrix { rows: shape[1], cols: shape[0], blocks };
+                    let dequant_nk = q8.dequantize(); // [n, k] row-major
+                    let dequant_kn = transpose_row_major(&dequant_nk, shape[1], shape[0]);
+                    let tensor = Tensor::from_vec(dequant_kn, shape).with_q8_0(q8);
+                    tensors.insert(meta.name, tensor);
                 } else {
                     let mut out = vec![0.0f32; element_count];
                     crate::kernels::dequantize_q8_0(data_bytes, &mut out);
@@ -351,9 +366,12 @@ fn parse_shard_from_mmap(mmap: &[u8]) -> Result<HashMap<String, Tensor>, Box<dyn
                     ).into());
                 }
                 let blocks = crate::kernels::q4_0::blocks_from_bytes(data_bytes);
-                if shape.len() == 2 && shape[1] % 32 == 0 {
-                    let q4 = crate::kernels::q4_0::Matrix { rows: shape[0], cols: shape[1], blocks };
-                    tensors.insert(meta.name, Tensor::from_q4_0(q4, shape));
+                if shape.len() == 2 && shape[0] % 32 == 0 {
+                    let q4 = crate::kernels::q4_0::Matrix { rows: shape[1], cols: shape[0], blocks };
+                    let dequant_nk = q4.dequantize(); // [n, k] row-major
+                    let dequant_kn = transpose_row_major(&dequant_nk, shape[1], shape[0]);
+                    let tensor = Tensor::from_vec(dequant_kn, shape).with_q4_0(q4);
+                    tensors.insert(meta.name, tensor);
                 } else {
                     let mut out = vec![0.0f32; element_count];
                     crate::kernels::dequantize_q4_0(data_bytes, &mut out);

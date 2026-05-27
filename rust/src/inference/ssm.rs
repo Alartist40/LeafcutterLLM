@@ -425,7 +425,7 @@ mod tests {
     fn test_ssm_forward_qwen_shapes() {
         let mut weights = HashMap::new();
         let hidden = 16;
-        let inner = 48; // 3 * hidden
+        let inner = 32; // 2 * hidden — conv output split into x and z_gate
 
         weights.insert("attn_qkv.weight".to_string(), Tensor::from_vec(vec![0.01; hidden * inner], vec![hidden, inner]));
         weights.insert("ssm_out.weight".to_string(), Tensor::from_vec(vec![0.01; hidden * hidden], vec![hidden, hidden]));

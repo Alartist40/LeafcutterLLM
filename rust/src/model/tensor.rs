@@ -186,6 +186,19 @@ impl Tensor {
         self.q_data.is_some()
     }
 
+    /// Attach Q8_0 quantized data to an existing tensor (used by shard loader
+    /// after it has separately dequantized + transposed the f32 data).
+    pub fn with_q8_0(mut self, q8: crate::kernels::q8_0::Matrix) -> Self {
+        self.q_data = Some(QuantizedData::Q8_0(q8));
+        self
+    }
+
+    /// Attach Q4_0 quantized data to an existing tensor.
+    pub fn with_q4_0(mut self, q4: crate::kernels::q4_0::Matrix) -> Self {
+        self.q_data = Some(QuantizedData::Q4_0(q4));
+        self
+    }
+
     /// Report approximate memory used by quantized data (bytes).
     pub fn quantized_memory_bytes(&self) -> usize {
         match &self.q_data {

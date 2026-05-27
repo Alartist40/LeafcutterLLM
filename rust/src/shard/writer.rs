@@ -46,7 +46,21 @@ impl ShardWriter {
         }
     }
 
+    /// Transpose row-major 2D data from [k, n] to [n, k].
+    fn transpose_2d(data: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; data.len()];
+        for r in 0..rows {
+            for c in 0..cols {
+                out[c * rows + r] = data[r * cols + c];
+            }
+        }
+        out
+    }
+
     /// Write tensor data in the configured quantization format.
+    /// For 2D quantized tensors we transpose to GGUF [n, k] layout
+    /// so the shard loader can use the same Q*Matrix convention as
+    /// the direct GGUF loader.
     fn write_tensor_data<W: Write>(&self, writer: &mut W, tensor: &Tensor) -> std::io::Result<()> {
         match self.quant_format {
             QuantFormat::F32 => {
@@ -55,11 +69,21 @@ impl ShardWriter {
                 }
             }
             QuantFormat::Q8_0 => {
-                let q8_bytes = crate::kernels::q8_0::quantize_f32_to_q8_0(&tensor.data);
+                let data = if tensor.shape.len() == 2 {
+                    Self::transpose_2d(&tensor.data, tensor.shape[0], tensor.shape[1])
+                } else {
+                    tensor.data.clone()
+                };
+                let q8_bytes = crate::kernels::q8_0::quantize_f32_to_q8_0(&data);
                 writer.write_all(&q8_bytes)?;
             }
             QuantFormat::Q4_0 => {
-                let q4_bytes = crate::kernels::q4_0::quantize_f32_to_q4_0(&tensor.data);
+                let data = if tensor.shape.len() == 2 {
+                    Self::transpose_2d(&tensor.data, tensor.shape[0], tensor.shape[1])
+                } else {
+                    tensor.data.clone()
+                };
+                let q4_bytes = crate::kernels::q4_0::quantize_f32_to_q4_0(&data);
                 writer.write_all(&q4_bytes)?;
             }
         }
@@ -370,10 +394,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output_dir = dir.path().to_str().unwrap();
 
-        // Create fake layer weights (cols must be multiple of 32 for native Q8_0 matmul)
+        // Create fake layer weights (inner dim k must be multiple of 32 for native Q8_0 matmul)
         let mut weights = HashMap::new();
         let q_data: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1 - 3.2).collect();
-        weights.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(q_data.clone(), vec![2, 32]));
+        weights.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(q_data.clone(), vec![32, 2]));
 
         let config = ModelConfig {
             hidden_size: 32,
@@ -420,7 +444,7 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         let q = loaded.get("self_attn.q_proj.weight").unwrap();
-        assert_eq!(q.shape, vec![2, 32]);
+        assert_eq!(q.shape, vec![32, 2]);
 
         // Check roundtrip error is small (< 1% relative)
         for i in 0..q.data.len() {
@@ -433,8 +457,8 @@ mod tests {
         assert!(q.is_quantized(), "Q8_0-loaded tensor should carry Q8_0 metadata");
 
         // Verify INT8 GEMM path produces the same result as f32 matmul
-        // a [4, 2] @ q [2, 32] -> [4, 32]
-        let a = Tensor::from_vec((0..8).map(|i| (i as f32) * 0.1).collect(), vec![4, 2]);
+        // a [4, 32] @ q [32, 2] -> [4, 2]
+        let a = Tensor::from_vec((0..128).map(|i| (i as f32) * 0.01).collect(), vec![4, 32]);
         let c_q8 = a.matmul(q);
         let q_f32 = Tensor::from_vec(q.data.clone(), q.shape.clone());
         let c_f32 = a.matmul(&q_f32);
@@ -449,9 +473,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output_dir = dir.path().to_str().unwrap();
 
+        // inner dim k must be multiple of 32 for native Q4_0 matmul
         let mut weights = HashMap::new();
         let q_data: Vec<f32> = (0..64).map(|i| (i as f32) * 0.1 - 3.2).collect();
-        weights.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(q_data.clone(), vec![2, 32]));
+        weights.insert("self_attn.q_proj.weight".to_string(), Tensor::from_vec(q_data.clone(), vec![32, 2]));
 
         let config = ModelConfig {
             hidden_size: 32,
@@ -498,7 +523,7 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         let q = loaded.get("self_attn.q_proj.weight").unwrap();
-        assert_eq!(q.shape, vec![2, 32]);
+        assert_eq!(q.shape, vec![32, 2]);
 
         // Q4_0 has higher error tolerance (~0.5 max)
         for i in 0..q.data.len() {
@@ -510,7 +535,8 @@ mod tests {
         assert!(q.is_quantized(), "Q4_0-loaded tensor should carry quantized metadata");
 
         // Verify Q4_0 GEMM path
-        let a = Tensor::from_vec((0..8).map(|i| (i as f32) * 0.1).collect(), vec![4, 2]);
+        // a [4, 32] @ q [32, 2] -> [4, 2]
+        let a = Tensor::from_vec((0..128).map(|i| (i as f32) * 0.01).collect(), vec![4, 32]);
         let c_q4 = a.matmul(q);
         let q_f32 = Tensor::from_vec(q.data.clone(), q.shape.clone());
         let c_f32 = a.matmul(&q_f32);
