@@ -17,6 +17,7 @@ pub enum ModelArchitecture {
     Mistral,
     Phi,
     Gemma,
+    Yi,
     Unknown,
 }
 
@@ -31,8 +32,9 @@ impl ModelArchitecture {
                 "qwen36"   => ModelArchitecture::Qwen36,
                 "mistral"  => ModelArchitecture::Mistral,
                 "mistral3" => ModelArchitecture::Mistral,
-                "phi"      => ModelArchitecture::Phi,
-                "gemma"    => ModelArchitecture::Gemma,
+                "phi" | "phi3" | "phi4" => ModelArchitecture::Phi,
+                "gemma" | "gemma2" | "gemma3" => ModelArchitecture::Gemma,
+                "yi"       => ModelArchitecture::Yi,
                 _          => ModelArchitecture::Unknown,
             }
         } else {
@@ -50,6 +52,7 @@ impl ModelArchitecture {
             ModelArchitecture::Mistral => "Mistral",
             ModelArchitecture::Phi     => "Phi",
             ModelArchitecture::Gemma   => "Gemma",
+            ModelArchitecture::Yi      => "Yi",
             ModelArchitecture::Unknown => "Unknown",
         }
     }
@@ -64,6 +67,7 @@ impl ModelArchitecture {
             ModelArchitecture::Mistral => "llama", // Mistral uses llama.* keys
             ModelArchitecture::Phi     => "phi",
             ModelArchitecture::Gemma   => "gemma",
+            ModelArchitecture::Yi      => "llama", // Yi uses llama.* keys in GGUF
             ModelArchitecture::Unknown => "llama", // best-effort fallback
         }
     }
@@ -78,7 +82,8 @@ impl ModelArchitecture {
             ModelArchitecture::Qwen2 |
             ModelArchitecture::Qwen35 |
             ModelArchitecture::Qwen36 |
-            ModelArchitecture::Mistral
+            ModelArchitecture::Mistral |
+            ModelArchitecture::Yi
         )
     }
 

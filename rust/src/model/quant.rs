@@ -109,6 +109,11 @@ impl QuantType {
             27 => Some(QuantType::IQ4_K),
             31 => Some(QuantType::IQ1_M),
             30 => Some(QuantType::BF16),
+            28 => {
+                eprintln!("ERROR: Q4_0_4_4 (type 28) was removed from llama.cpp in Dec 2024.");
+                eprintln!("       Download a standard Q4_K_M or Q4_0 quant instead.");
+                None
+            }
             _  => None,
         }
     }

@@ -4,8 +4,10 @@
 //!   - `Tokenizer`: HuggingFace `tokenizers` crate (exact, needs `tokenizer.json`)
 //!   - `GgufTokenizer`: GGUF vocab fallback (no external deps, greedy longest-match)
 
+pub mod chat_template;
 pub mod gguf;
 
+pub use chat_template::{apply_chat_template_from_gguf, TemplateFamily};
 pub use gguf::GgufTokenizer;
 
 use tokenizers::Tokenizer as HFTokenizer;
