@@ -22,6 +22,8 @@ pub struct ModelConfig {
     pub vocab_size: usize,
     pub rope_theta: f32,
     pub attention_interval: usize,
+    /// Gemma-style logit soft-capping: output = cap * tanh(output / cap)
+    pub logit_soft_cap: f32,
 }
 
 impl Default for ModelConfig {
@@ -38,6 +40,7 @@ impl Default for ModelConfig {
             vocab_size: 32000,
             rope_theta: 10000.0,
             attention_interval: 1,
+            logit_soft_cap: 0.0,
         }
     }
 }
@@ -167,8 +170,29 @@ impl GGUFModel {
                     .and_then(|v| if let crate::model::gguf::GGUFValue::Array(arr) = v { Some(arr.len()) } else { None })
             })
             .unwrap_or(cfg.vocab_size);
-        cfg.rope_theta = Self::get_meta_int(file, &[&format!("{}.rope.freq_base", prefix), "llama.rope.freq_base", "qwen2.rope.freq_base", "qwen35.rope.freq_base"])
-            .map(|v| v as f32).unwrap_or(cfg.rope_theta);
+        cfg.rope_theta = Self::get_meta_int(file, &[
+                &format!("{}.rope.freq_base", prefix),
+                "llama.rope.freq_base",
+                "qwen2.rope.freq_base",
+                "qwen35.rope.freq_base",
+                "mistral3.rope.freq_base",
+                "phi3.rope.freq_base",
+                "phi4.rope.freq_base",
+                "gemma.rope.freq_base",
+                "gemma2.rope.freq_base",
+                "gemma3.rope.freq_base",
+            ])
+            .map(|v| v as f32)
+            .unwrap_or(cfg.rope_theta);
+
+        // Gemma logit soft-capping (e.g., gemma3.logit_cap = 30.0)
+        cfg.logit_soft_cap = Self::get_meta_f32(file, &[
+                &format!("{}.logit_cap", prefix),
+                "gemma.logit_cap",
+                "gemma2.logit_cap",
+                "gemma3.logit_cap",
+            ])
+            .unwrap_or(cfg.logit_soft_cap);
 
         // Compute head dimensions
         // For most models: head_dim = hidden_size / num_attention_heads.
@@ -197,6 +221,15 @@ impl GGUFModel {
     fn get_meta_int(file: &GGUFile, keys: &[&str]) -> Option<i64> {
         for key in keys {
             if let Some(v) = file.get_metadata_int(key) {
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    fn get_meta_f32(file: &GGUFile, keys: &[&str]) -> Option<f32> {
+        for key in keys {
+            if let Some(v) = file.get_metadata_f32(key) {
                 return Some(v);
             }
         }

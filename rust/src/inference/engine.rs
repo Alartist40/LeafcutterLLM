@@ -514,11 +514,21 @@ impl Engine {
         hidden = hidden.rms_norm(final_norm, 1e-5);
 
         // LM head — computed via outer-product over rows from mmap (no full matrix in RAM)
-        if self.lm_head_tied {
+        let mut logits = if self.lm_head_tied {
             self.lm_head_tied_forward(&hidden, seq_len)
         } else {
             self.lm_head_separate_forward(&hidden, seq_len)
+        };
+
+        // Gemma logit soft-capping: prevents extreme logits
+        let cap = self.config.logit_soft_cap;
+        if cap > 0.0 {
+            for logit in logits.iter_mut() {
+                *logit = cap * (*logit / cap).tanh();
+            }
         }
+
+        logits
     }
 
     /// Forward pass with per-layer RSS debugging.

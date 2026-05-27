@@ -18,6 +18,8 @@ pub enum ModelArchitecture {
     Phi,
     Gemma,
     Yi,
+    Nemotron,
+    Falcon,
     Unknown,
 }
 
@@ -35,6 +37,8 @@ impl ModelArchitecture {
                 "phi" | "phi3" | "phi4" => ModelArchitecture::Phi,
                 "gemma" | "gemma2" | "gemma3" => ModelArchitecture::Gemma,
                 "yi"       => ModelArchitecture::Yi,
+                "nemotron" | "nvidia_nemotron" => ModelArchitecture::Nemotron,
+                "falcon" | "falcon3" | "falcon2" => ModelArchitecture::Falcon,
                 _          => ModelArchitecture::Unknown,
             }
         } else {
@@ -53,6 +57,8 @@ impl ModelArchitecture {
             ModelArchitecture::Phi     => "Phi",
             ModelArchitecture::Gemma   => "Gemma",
             ModelArchitecture::Yi      => "Yi",
+            ModelArchitecture::Nemotron => "Nemotron",
+            ModelArchitecture::Falcon  => "Falcon",
             ModelArchitecture::Unknown => "Unknown",
         }
     }
@@ -67,8 +73,10 @@ impl ModelArchitecture {
             ModelArchitecture::Mistral => "llama", // Mistral uses llama.* keys
             ModelArchitecture::Phi     => "phi",
             ModelArchitecture::Gemma   => "gemma",
-            ModelArchitecture::Yi      => "llama", // Yi uses llama.* keys in GGUF
-            ModelArchitecture::Unknown => "llama", // best-effort fallback
+            ModelArchitecture::Yi       => "llama", // Yi uses llama.* keys in GGUF
+            ModelArchitecture::Nemotron => "llama", // Nemotron uses llama.* keys
+            ModelArchitecture::Falcon   => "falcon", // Falcon uses falcon.* keys
+            ModelArchitecture::Unknown  => "llama", // best-effort fallback
         }
     }
 
@@ -83,7 +91,8 @@ impl ModelArchitecture {
             ModelArchitecture::Qwen35 |
             ModelArchitecture::Qwen36 |
             ModelArchitecture::Mistral |
-            ModelArchitecture::Yi
+            ModelArchitecture::Yi |
+            ModelArchitecture::Nemotron
         )
     }
 
