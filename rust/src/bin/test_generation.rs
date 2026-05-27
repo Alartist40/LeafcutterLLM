@@ -3,6 +3,7 @@
 use clap::Parser;
 use leafcutter::inference::engine::Engine;
 use leafcutter::model::gguf::{GGUFile, GGUFValue};
+use leafcutter::tokenizer::chat_template::apply_chat_template_from_gguf;
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -216,22 +217,34 @@ fn main() {
 
     let use_ffi_tok = engine.is_ffi();
 
+    // Load GGUF metadata for chat template detection
+    let gguf_file = GGUFile::open(&args.model).expect("Failed to open GGUF");
+    let has_chat_template = gguf_file.metadata.contains_key("tokenizer.chat_template");
+
+    // Format prompt using chat template auto-detection
+    let formatted_prompt = if args.raw {
+        args.prompt.clone()
+    } else if has_chat_template {
+        let templated = apply_chat_template_from_gguf(&gguf_file.metadata, "", &args.prompt);
+        println!("🎭 Chat template applied (detected: {})", 
+            if templated.starts_with("[SYSTEM_PROMPT]") { "Ministral" }
+            else if templated.contains("<|start_header_id|>") { "Llama-3" }
+            else if templated.contains("[INST]") { "Mistral" }
+            else if templated.contains("<|im_start|>") { "ChatML" }
+            else if templated.contains("<start_of_turn>") { "Gemma" }
+            else { "Unknown" }
+        );
+        templated
+    } else {
+        // Fallback for models without chat template
+        format!("{}", args.prompt)
+    };
+
     // Tokenize prompt
     let prompt_tokens = if use_ffi_tok {
-        let prompt = if args.raw {
-            args.prompt.clone()
-        } else {
-            format!("<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n", args.prompt)
-        };
-        engine.tokenize(&prompt, false)
+        engine.tokenize(&formatted_prompt, false)
     } else {
-        // Use GGUF vocab for native models
-        let text = if args.raw {
-            args.prompt.clone()
-        } else {
-            format!("Hello! How can I help you with '{}'?", args.prompt)
-        };
-        tokenizer.encode(&text)
+        tokenizer.encode(&formatted_prompt)
     };
     println!("📝 Prompt tokens: {}", prompt_tokens.len());
 
