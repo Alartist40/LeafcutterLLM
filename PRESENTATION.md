@@ -104,7 +104,7 @@ Leafcutter implements a **dual-backend engine** with automatic routing:
 
 | Path | Trigger | Models | Memory | Speed |
 |------|---------|--------|--------|-------|
-| **Native optimized** | Supported arch + quants | Llama, Mistral, Ministral, Qwen2 | ~1GB for 70B | ~0.12 t/s (3B) |
+| **Native optimized** | Supported arch + quants | Llama, Mistral, Ministral, Qwen2, Yi | ~1GB for 70B | ~0.12 t/s (3B) |
 | **Explicit FFI** | Architecture = qwen3.5/3.6 | Qwen3.5, Qwen3.6 | Standard | 2–14 t/s |
 | **Auto-FFI fallback** | Unsupported quant types | Any IQ1_M, Q2_K, etc. | Standard | Varies |
 
@@ -228,7 +228,7 @@ LeafcutterLLM/rust/
 │   │
 │   ├── model/
 │   │   ├── mod.rs              # Submodule exports
-│   │   ├── arch.rs             # Architecture detection: Llama, Qwen2, Qwen35, Phi3, Mistral, BitNet
+│   │   ├── arch.rs             # Architecture detection: Llama, Qwen2/3/3.5/3.6, Phi/Phi3/Phi4, Mistral/Mistral3, Gemma/Gemma2/Gemma3, Yi, BitNet
 │   │   ├── gguf.rs             # GGUF v3 parser: mmap, metadata KV, tensor info, raw data access
 │   │   ├── loader.rs           # Layer-streaming loader + quantized weight loading
 │   │   ├── quant.rs            # QuantType registry: 25 types, block sizes, bits/weight, support flags

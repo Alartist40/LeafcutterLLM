@@ -262,3 +262,34 @@ Loads model and runs 1-token forward pass. Reports RSS and time.
 ---
 
 *End of handoff document*
+
+---
+
+## Session Update: 2026-05-27 — Shard Convention Fix + Model Expansion
+
+**Commits:** `2dfc269`, `4c94bb2`, `e206bc6`
+
+### Fixes Applied
+
+| # | Fix | Location |
+|---|-----|----------|
+| 1 | **Shard dimension convention** | `src/shard/writer.rs`, `src/shard/loader.rs`, `src/model/tensor.rs` |
+| 2 | **SSM test** | `src/inference/ssm.rs` (test vector fix) |
+| 3 | **RoPE base loading** | `src/model/loader.rs` — reads `*.rope.freq_base` from GGUF per architecture |
+| 4 | **Gemma logit soft-capping** | `src/model/loader.rs` + `src/inference/engine.rs` |
+| 5 | **Q4_0_4_4 UX** | `src/model/quant.rs` — clear error for deprecated format |
+| 6 | **Chat templates** | `src/tokenizer/chat_template.rs` — 5 families detected |
+
+### Architecture Detection Expanded
+
+| Architecture | Status | Notes |
+|-------------|--------|-------|
+| Yi | ✅ Native | Standard Llama-family |
+| Gemma/Gemma2/Gemma3 | ✅ Native | + logit soft-capping |
+| Phi/Phi3/Phi4 | ✅ Native | Uses fused QKV |
+| Nemotron | ✅ Native | Reuses Llama mappings |
+| Falcon | ⚠️ Detected | Routes to FFI (different layer structure) |
+| Qwen3 | ✅ Native | Maps to Qwen2 (standard attention) |
+
+### Test Status
+- `cargo test --lib`: **113 passed, 0 failed, 3 ignored**

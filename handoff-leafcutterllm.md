@@ -99,11 +99,15 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
   - Fix: `is_quantized_supported` only true for types with native transposed-B GEMM kernels
   - Result: f32 fallbacks always get transposed; quantized tensors never do
 
+- **Shard dimension convention fix** — writer transposes to GGUF [n,k], loader reconstructs with transposed Q*Matrix shape; fixes Q4_0/Q8_0 roundtrip tests
+- **Q4_0_4_4 UX** — clear error message for deprecated quant type (removed from llama.cpp Dec 2024)
+- **Chat template infrastructure** — detects 5 families (Llama-3, Mistral, ChatML, Gemma, Ministral) from GGUF metadata
+- **Architecture expansion** — added Yi, gemma2/gemma3, phi3/phi4, mistral3 detection
 - **Quantized weight loading restored** — `_only` constructors re-enabled for Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL
   - Per-layer memory: 3B ~70MB, 27B ~217MB, 70B ~130MB (estimated)
 
 ### Verification
-- `cargo test --release` — **71 passed, 0 failed**
+- `cargo test --lib` — **113 passed, 0 failed**
 - Python reference comparison (v3) — **max diff < 0.003** across all 28 layers of Llama-3.2-3B
 - Coherent generation — **"The capital of France is" → `France\nParis\nParis`**
 - Qwen3.6-27B loads successfully but **attention panics** with index OOB
@@ -136,7 +140,7 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 
 **Command:** `cargo test --release -- --nocapture`
 **Date:** 2026-05-19
-**Result:** ✅ **72 passed; 0 failed; 3 ignored**
+**Result:** ✅ **113 passed; 0 failed; 3 ignored**
 
 #### Kernel Tests (14 passed)
 | Test | Module | Description |
@@ -259,7 +263,7 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 | `test_wgpu_matmul_large` | `backend::wgpu::tests` | Requires GPU |
 
 ### Total Test Coverage Summary
-- **Unit tests:** 72 passed, 0 failed
+- **Unit tests:** 113 passed, 0 failed, 3 ignored
 - **Integration tests:** 1 passed (engine load), 6 ignored (require real model)
 - **GPU tests:** 2 ignored (no GPU in test env)
 

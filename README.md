@@ -12,7 +12,7 @@
 
 ## What Is LeafcutterLLM?
 
-LeafcutterLLM is a **Rust-based** inference engine for running large language models locally on CPUs with limited RAM. It supports standard transformers (Llama, Qwen2, Mistral) and cutting-edge hybrid architectures like **Qwen3.5's Gated Delta Net** via a dual-backend design — without Python or CUDA dependencies.
+LeafcutterLLM is a **Rust-based** inference engine for running large language models locally on CPUs with limited RAM. It supports standard transformers (Llama, Qwen2, Mistral, Yi) and cutting-edge hybrid architectures like **Qwen3.5's Gated Delta Net** via a dual-backend design — without Python or CUDA dependencies.
 
 ### What Makes Leafcutter Different
 
@@ -111,7 +111,7 @@ See [`CYNAPSE_INTEGRATION.md`](CYNAPSE_INTEGRATION.md) for full details.
 
 ✅ **Offline inference** — no WiFi, no cloud, no API costs  
 ✅ **Three-Path Backend** — Native optimized + Explicit FFI + Auto-FFI fallback  
-✅ **Hybrid Architecture Support** — Native SSM+Attention (Qwen3.5 DeltaNet), standard transformers (Llama, Qwen2, Mistral, Ministral)  
+✅ **Hybrid Architecture Support** — Native SSM+Attention (Qwen3.5 DeltaNet), standard transformers (Llama, Qwen2, Mistral, Ministral, Yi, Gemma, Phi)  
 ✅ **Sliding Window Attention** — Ministral/Mistral-style SWA with auto-detection from GGUF metadata  
 ✅ **Aggressive Quantization** — Q4_K, Q5_K, Q6_K, Q8_K, IQ4_NL, IQ1_M, and BitNet I2_S ternary  
 ✅ **Cross-Platform** — Native support for Linux, macOS, and Windows  
