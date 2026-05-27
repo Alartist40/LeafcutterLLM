@@ -20,6 +20,10 @@ pub mod llama_ffi {
     pub struct LlamaModel;
     pub struct LlamaContext;
     pub struct LlamaBatch;
+
+    /// Check whether the real llama.cpp backend is available.
+    pub const fn is_available() -> bool { false }
+
     impl LlamaModel {
         pub fn load(_path: &std::path::Path, _n_gpu_layers: i32) -> Result<Self, String> {
             Err("llama.cpp FFI not available. Build with --features llama-ffi".into())

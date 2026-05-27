@@ -7,6 +7,7 @@
 //!
 //! For standard architectures (Llama, Qwen2, Mistral), all layers use attention.
 
+use crate::model::arch::ModelArchitecture;
 use crate::model::loader::{GGUFModel, ModelConfig};
 use crate::model::tensor::Tensor;
 use crate::cache::{KVCache, ssm_state::SSMStateCache, deltanet_state::DeltaNetStateCache};
@@ -50,15 +51,6 @@ pub struct Engine {
 }
 
 impl Engine {
-    /// Quick architecture detection without full load.
-    fn detect_arch(path: &str) -> String {
-        if let Ok(model) = GGUFModel::load(path) {
-            model.architecture.name().to_lowercase()
-        } else {
-            String::new()
-        }
-    }
-
     #[cfg(feature = "llama-ffi")]
     fn load_ffi(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let model = LlamaModel::load(Path::new(path), 0)
@@ -89,34 +81,51 @@ impl Engine {
     }
 
     pub fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        #[cfg(feature = "llama-ffi")]
-        {
-            let arch = Self::detect_arch(path);
-            if arch == "qwen3.5" || arch == "qwen3.6" {
-                eprintln!("Detected {} — using llama.cpp FFI backend", arch);
-                return Self::load_ffi(path);
+        // ── Load GGUF for architecture detection ──────────────────────
+        let model = GGUFModel::load(path)?;
+        let arch = model.architecture;
+
+        // ── Qwen3.5/3.6 ALWAYS need FFI ──────────────────────────────
+        if arch == ModelArchitecture::Qwen35 || arch == ModelArchitecture::Qwen36 {
+            if !crate::llama_ffi::is_available() {
+                return Err(
+                    "Qwen3.5/3.6 models require llama.cpp FFI. \
+                     Build with: cargo build --features llama-ffi".into()
+                );
             }
+            eprintln!("  Using llama.cpp FFI backend for {}", arch.name());
+            #[cfg(feature = "llama-ffi")]
+            return Self::load_ffi(path);
+            #[cfg(not(feature = "llama-ffi"))]
+            return Err("Qwen3.5/3.6 models require llama.cpp FFI.".into());
         }
 
-        let model = GGUFModel::load(path)?;
-
+        // ── Native path ──────────────────────────────────────────────
         // Run pre-flight capability report
         let report = model.capability_report();
         if !report.can_run {
-            #[cfg(feature = "llama-ffi")]
-            if !report.quant_summary.unsupported.is_empty() {
-                eprintln!("Native unsupported quants: {:?}, falling back to llama.cpp FFI...",
-                    report.quant_summary.unsupported);
-                return Self::load_ffi(path);
-            }
             eprintln!("\n{}", report.print());
-            return Err(format!(
-                "Model cannot run: architecture={} unsupported_quant={} missing_tensors={}",
-                report.architecture.name(),
-                report.quant_summary.unsupported.len(),
-                report.missing_tensors.len()
-            ).into());
+
+            // ── AUTO-FALLBACK: unsupported quants → try FFI ──────────
+            if crate::llama_ffi::is_available() {
+                eprintln!("  Native path blocked. Trying llama.cpp FFI fallback...");
+                #[cfg(feature = "llama-ffi")]
+                return Self::load_ffi(path);
+                #[cfg(not(feature = "llama-ffi"))]
+                return Err("Model cannot run natively. Build with --features llama-ffi for fallback support.".into());
+            } else {
+                return Err(format!(
+                    "Model cannot run natively (unsupported quant types). \
+                     Build with --features llama-ffi for auto-fallback support. \
+                     Details: architecture={} unsupported_quant={} missing_tensors={}",
+                    report.architecture.name(),
+                    report.quant_summary.unsupported.len(),
+                    report.missing_tensors.len()
+                ).into());
+            }
         }
+
+        eprintln!("  Using native backend for {}", arch.name());
 
         let mut config = model.config.clone();
         // Verify hidden_size against actual tensor dimensions — metadata may lie

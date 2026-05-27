@@ -39,6 +39,7 @@ pub enum QuantType {
     IQ5_NL,   // 25 (legacy, actually I16 in ggml)
     IQ5_K,    // 26 (legacy, actually I32 in ggml)
     IQ4_K,    // 27 (legacy, actually I64 in ggml)
+    IQ1_M,    // 31
     BF16,     // 30 (newer ggml)
 }
 
@@ -72,6 +73,7 @@ impl QuantType {
             QuantType::IQ5_NL  => 25,
             QuantType::IQ5_K   => 26,
             QuantType::IQ4_K   => 27,
+            QuantType::IQ1_M   => 31,
             QuantType::BF16    => 30,
         }
     }
@@ -105,6 +107,7 @@ impl QuantType {
             25 => Some(QuantType::IQ5_NL),
             26 => Some(QuantType::IQ5_K),
             27 => Some(QuantType::IQ4_K),
+            31 => Some(QuantType::IQ1_M),
             30 => Some(QuantType::BF16),
             _  => None,
         }
@@ -139,6 +142,7 @@ impl QuantType {
             QuantType::IQ5_NL  => "IQ5_NL",
             QuantType::IQ5_K   => "IQ5_K",
             QuantType::IQ4_K   => "IQ4_K",
+            QuantType::IQ1_M   => "IQ1_M",
             QuantType::BF16    => "BF16",
         }
     }
@@ -165,6 +169,7 @@ impl QuantType {
             QuantType::IQ2_XS  => 2.3125,
             QuantType::IQ3_XXS => 3.0625,
             QuantType::IQ1_S   => 1.75,
+            QuantType::IQ1_M   => 1.75,
             QuantType::IQ4_NL  => 4.5,
             QuantType::IQ3_S   => 3.4375,
             QuantType::IQ2_S   => 2.5,
@@ -188,7 +193,7 @@ impl QuantType {
             | QuantType::Q5_K | QuantType::Q6_K | QuantType::Q8_K
             | QuantType::IQ2_XXS | QuantType::IQ2_XS | QuantType::IQ3_XXS
             | QuantType::IQ1_S | QuantType::IQ3_S | QuantType::IQ2_S
-            | QuantType::IQ4_XS | QuantType::IQ4_K
+            | QuantType::IQ4_XS | QuantType::IQ4_K | QuantType::IQ1_M
             | QuantType::IQ5_0 | QuantType::IQ5_NL | QuantType::IQ5_K => 256,
         }
     }
@@ -247,6 +252,10 @@ impl QuantType {
             QuantType::IQ4_K   => {
                 // Similar to IQ4_XS but with K-scale
                 2 + 2 + 128 + 4
+            }
+            QuantType::IQ1_M => {
+                // IQ1_M: 256 weights in ~54 bytes (similar to IQ1_S)
+                54
             }
         }
     }

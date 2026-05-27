@@ -14,6 +14,9 @@ pub use bindings::{
     llama_pos, llama_token, llama_vocab, llama_batch,
 };
 
+/// Check whether the real llama.cpp backend is available.
+pub const fn is_available() -> bool { true }
+
 /// Safe wrapper around a loaded llama.cpp model.
 pub struct LlamaModel {
     ptr: NonNull<llama_model>,

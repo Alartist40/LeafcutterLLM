@@ -54,31 +54,147 @@ fn extract_vocab(path: &str) -> (Vec<String>, usize, usize) {
     (vocab, bos, eos)
 }
 
-/// Simple word-level tokenizer (good enough for English test prompts).
-fn simple_encode(text: &str, vocab_map: &HashMap<String, usize>, vocab: &[String], bos: usize) -> Vec<usize> {
-    let mut tokens = vec![bos];
-    for word in text.split_whitespace() {
-        let key = word.to_lowercase();
-        if let Some(&id) = vocab_map.get(&key) {
-            tokens.push(id);
-        } else if let Some(&id) = vocab_map.get(word) {
-            tokens.push(id);
+/// Greedy longest-match BPE tokenizer from GGUF vocabulary.
+///
+/// Sorts vocab by length (longest first), then greedily matches tokens.
+/// Handles BPE space convention: words after whitespace use "Ġ" prefix.
+struct GgufBpeTokenizer {
+    vocab_sorted: Vec<(String, usize)>, // (token_string, token_id), longest first
+    vocab_map: HashMap<String, usize>,
+    bos_token: usize,
+    eos_token: usize,
+}
+
+impl GgufBpeTokenizer {
+    fn new(vocab: Vec<String>, bos: usize, eos: usize) -> Self {
+        let vocab_map: HashMap<String, usize> = vocab.iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+
+        let mut vocab_sorted: Vec<(String, usize)> = vocab.into_iter()
+            .enumerate()
+            .map(|(i, s)| (s, i))
+            .collect();
+        vocab_sorted.sort_by(|a, b| {
+            b.0.len().cmp(&a.0.len())
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        Self { vocab_sorted, vocab_map, bos_token: bos, eos_token: eos }
+    }
+
+    /// Encode text to token IDs using greedy longest-match.
+    ///
+    /// BPE convention: prepend Ġ (U+0120) to words that follow whitespace,
+    /// then greedily match subword pieces within each word.
+    fn encode(&self, text: &str) -> Vec<usize> {
+        let mut tokens = vec![self.bos_token];
+
+        let words: Vec<&str> = text.split_whitespace().collect();
+        if words.is_empty() {
+            return tokens;
+        }
+
+        // First word: try without Ġ prefix first
+        let first = words[0];
+        let first_with_g = format!("\u{0120}{}", first);
+        if self.vocab_map.contains_key(&first_with_g) {
+            self.greedy_encode(&first_with_g, &mut tokens);
         } else {
-            // fallback: space + word
-            let spaced = format!(" {word}");
-            if let Some(&id) = vocab_map.get(&spaced) {
-                tokens.push(id);
+            self.greedy_encode(first, &mut tokens);
+        }
+
+        // Subsequent words: prepend Ġ, then greedy match subpieces
+        for word in &words[1..] {
+            let with_g = format!("\u{0120}{}", word);
+            self.greedy_encode(&with_g, &mut tokens);
+        }
+
+        tokens
+    }
+
+    /// Greedily encode a string by matching the longest vocab token at each position.
+    fn greedy_encode(&self, text: &str, tokens: &mut Vec<usize>) {
+        let mut remaining = text;
+
+        while !remaining.is_empty() {
+            let mut matched = false;
+
+            for (token_str, token_id) in &self.vocab_sorted {
+                if remaining.starts_with(token_str) {
+                    tokens.push(*token_id);
+                    remaining = &remaining[token_str.len()..];
+                    matched = true;
+                    break;
+                }
+            }
+
+            if !matched {
+                if let Some(first_char) = remaining.chars().next() {
+                    let char_str = first_char.to_string();
+                    if let Some(&id) = self.vocab_map.get(&char_str) {
+                        tokens.push(id);
+                    } else {
+                        for byte in char_str.bytes() {
+                            let byte_token = format!("<0x{:02X}>", byte);
+                            if let Some(&id) = self.vocab_map.get(&byte_token) {
+                                tokens.push(id);
+                            }
+                        }
+                    }
+                    remaining = &remaining[first_char.len_utf8()..];
+                } else {
+                    break;
+                }
             }
         }
     }
-    tokens
-}
 
-fn simple_decode(tokens: &[usize], vocab: &[String]) -> String {
-    tokens.iter()
-        .map(|&t| vocab.get(t).cloned().unwrap_or_default())
-        .collect::<Vec<_>>()
-        .join("")
+    /// Decode token IDs back to text.
+    /// Handles BPE space markers (Ġ → literal space).
+    fn decode(&self, tokens: &[usize], vocab: &[String]) -> String {
+        let mut result = String::new();
+        let space_marker = '\u{0120}';
+
+        for &token_id in tokens {
+            // Skip special tokens
+            if token_id == self.bos_token || token_id == self.eos_token {
+                continue;
+            }
+
+            if let Some(token_str) = vocab.get(token_id) {
+                // Skip other special tokens
+                if token_str.starts_with('<') && token_str.ends_with('>') {
+                    if token_str == "<0x0A>" {
+                        result.push('\n');
+                        continue;
+                    }
+                    if token_str.starts_with("<0x") {
+                        if let Ok(byte) = u8::from_str_radix(&token_str[3..token_str.len()-1], 16) {
+                            result.push(byte as char);
+                        }
+                        continue;
+                    }
+                    // Skip other special tokens like <|begin_of_text|>, <|end_of_text|>, etc.
+                    if token_str.starts_with("<|") {
+                        continue;
+                    }
+                }
+
+                if token_str.starts_with(space_marker) {
+                    // Ġ prefix → add space before
+                    result.push(' ');
+                    result.push_str(&token_str[space_marker.len_utf8()..]);
+                } else {
+                    // Replace BPE newline markers (Ċ = U+010A = byte 0x0A)
+                    let cleaned = token_str.replace('\u{010A}', "\n");
+                    result.push_str(&cleaned);
+                }
+            }
+        }
+        result
+    }
 }
 
 fn main() {
@@ -92,9 +208,7 @@ fn main() {
 
     // Extract vocab from GGUF before loading engine
     let (vocab, bos_id, _eos_id) = extract_vocab(&args.model);
-    let vocab_map: HashMap<String, usize> = vocab.iter().enumerate()
-        .map(|(i, s)| (s.clone(), i))
-        .collect();
+    let tokenizer = GgufBpeTokenizer::new(vocab.clone(), bos_id, _eos_id);
     println!("📚 Vocab extracted: {} tokens", vocab.len());
 
     let mut engine = Engine::load(&args.model).expect("Failed to load engine");
@@ -117,7 +231,7 @@ fn main() {
         } else {
             format!("Hello! How can I help you with '{}'?", args.prompt)
         };
-        simple_encode(&text, &vocab_map, &vocab, bos_id)
+        tokenizer.encode(&text)
     };
     println!("📝 Prompt tokens: {}", prompt_tokens.len());
 
@@ -172,7 +286,7 @@ fn main() {
     let decoded = if use_ffi_tok {
         engine.decode(&all_tokens)
     } else {
-        simple_decode(&all_tokens, &vocab)
+        tokenizer.decode(&all_tokens, &vocab)
     };
     println!("\n📝 Full decoded output:\n{}", decoded);
 
