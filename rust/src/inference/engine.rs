@@ -596,11 +596,17 @@ impl Engine {
         hidden = hidden.rms_norm(final_norm, 1e-5);
         println!("   [final norm] RSS: {} MB", read_rss_kb() / 1024);
 
-        let logits = if self.lm_head_tied {
+        let mut logits = if self.lm_head_tied {
             self.lm_head_tied_forward(&hidden, seq_len)
         } else {
             self.lm_head_separate_forward(&hidden, seq_len)
         };
+        let cap = self.config.logit_soft_cap;
+        if cap > 0.0 {
+            for logit in logits.iter_mut() {
+                *logit = cap * (*logit / cap).tanh();
+            }
+        }
         println!("   [lm_head] RSS: {} MB", read_rss_kb() / 1024);
         logits
     }

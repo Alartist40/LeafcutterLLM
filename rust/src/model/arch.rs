@@ -29,7 +29,7 @@ impl ModelArchitecture {
         if let Some(GGUFValue::String(arch)) = file.metadata.get("general.architecture") {
             match arch.as_str() {
                 "llama"    => ModelArchitecture::Llama,
-                "qwen2"    => ModelArchitecture::Qwen2,
+                "qwen2" | "qwen3" => ModelArchitecture::Qwen2,
                 "qwen35"   => ModelArchitecture::Qwen35,
                 "qwen36"   => ModelArchitecture::Qwen36,
                 "mistral"  => ModelArchitecture::Mistral,
@@ -272,5 +272,103 @@ impl CapabilityReport {
         ));
 
         lines.join("\n")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_minimal_gguf(path: &str, arch: &str) {
+        use std::io::Write;
+        let mut buf: Vec<u8> = Vec::new();
+        // Magic
+        buf.extend_from_slice(&0x46554747u32.to_le_bytes());
+        // Version
+        buf.extend_from_slice(&3u32.to_le_bytes());
+        // Tensor count
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        // Metadata count
+        buf.extend_from_slice(&1u64.to_le_bytes());
+        // Key: "general.architecture"
+        let key = b"general.architecture";
+        buf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        buf.extend_from_slice(key);
+        // Value type: String = 8
+        buf.extend_from_slice(&8u32.to_le_bytes());
+        // Value
+        let val = arch.as_bytes();
+        buf.extend_from_slice(&(val.len() as u64).to_le_bytes());
+        buf.extend_from_slice(val);
+        std::fs::write(path, buf).unwrap();
+    }
+
+    fn mock_gguf_with_arch(arch: &str) -> GGUFile {
+        let tmp = std::env::temp_dir().join(format!("test_arch_{}.gguf", arch.replace('.', "_")));
+        write_minimal_gguf(tmp.to_str().unwrap(), arch);
+        GGUFile::open(&tmp).expect("Failed to open mock GGUF")
+    }
+
+    #[test]
+    fn test_detect_llama() {
+        let f = mock_gguf_with_arch("llama");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::Llama);
+    }
+
+    #[test]
+    fn test_detect_mistral3() {
+        let f = mock_gguf_with_arch("mistral3");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::Mistral);
+    }
+
+    #[test]
+    fn test_detect_gemma3() {
+        let f = mock_gguf_with_arch("gemma3");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::Gemma);
+    }
+
+    #[test]
+    fn test_detect_phi4() {
+        let f = mock_gguf_with_arch("phi4");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::Phi);
+    }
+
+    #[test]
+    fn test_detect_yi() {
+        let f = mock_gguf_with_arch("yi");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::Yi);
+    }
+
+    #[test]
+    fn test_detect_nemotron() {
+        let f = mock_gguf_with_arch("nemotron");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::Nemotron);
+    }
+
+    #[test]
+    fn test_detect_falcon() {
+        let f = mock_gguf_with_arch("falcon");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::Falcon);
+    }
+
+    #[test]
+    fn test_detect_qwen3() {
+        let f = mock_gguf_with_arch("qwen3");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::Qwen2);
+    }
+
+    #[test]
+    fn test_yi_is_supported() {
+        assert!(ModelArchitecture::Yi.is_supported());
+    }
+
+    #[test]
+    fn test_nemotron_is_supported() {
+        assert!(ModelArchitecture::Nemotron.is_supported());
+    }
+
+    #[test]
+    fn test_falcon_not_supported() {
+        assert!(!ModelArchitecture::Falcon.is_supported());
     }
 }
