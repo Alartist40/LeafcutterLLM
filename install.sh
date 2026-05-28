@@ -7,7 +7,7 @@ LEAFCUTTER_VERSION="0.9.0"
 REPO_URL="https://github.com/Alartist40/LeafcutterLLM.git"
 INSTALL_DIR="${HOME}/.leafcutter"
 BIN_DIR="${HOME}/.local/bin"
-LLAMA_CPP_DIR="${INSTALL_DIR}/llama.cpp"
+LLAMA_CPP_DIR="${INSTALL_DIR}/LeafcutterLLM/rust/llama.cpp"
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -84,19 +84,7 @@ else
 fi
 ok "LeafcutterLLM source ready"
 
-# ─── Clone or update llama.cpp ───────────────────────────────────────────────
-if [ -d "${LLAMA_CPP_DIR}/.git" ]; then
-    info "Updating llama.cpp..."
-    cd "$LLAMA_CPP_DIR"
-    git pull --ff-only origin master || true
-else
-    info "Cloning llama.cpp..."
-    git clone --depth 1 https://github.com/ggml-org/llama.cpp.git "$LLAMA_CPP_DIR"
-    cd "$LLAMA_CPP_DIR"
-fi
-ok "llama.cpp source ready"
-
-# ─── Build llama.cpp shared libraries ────────────────────────────────────────
+# ─── Build vendored llama.cpp shared libraries ───────────────────────────────
 info "Building llama.cpp shared libraries..."
 cd "$LLAMA_CPP_DIR"
 
@@ -107,6 +95,9 @@ mkdir -p build && cd build
 cmake .. \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_COMMON=OFF \
+    -DLLAMA_BUILD_TOOLS=OFF \
+    -DLLAMA_BUILD_APP=OFF \
     -DBUILD_SHARED_LIBS=ON \
     -DLLAMA_ALL_WARNINGS=OFF \
     -DCMAKE_BUILD_TYPE=Release

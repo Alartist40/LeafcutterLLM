@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build llama.cpp shared libraries from the git submodule
+# Build llama.cpp shared libraries from vendored source
 # Usage: ./scripts/build_llama_cpp.sh
 
 set -e
@@ -12,9 +12,8 @@ echo "🔨 Building llama.cpp from submodule..."
 echo "   Source: ${LLAMA_DIR}"
 echo "   Build:  ${BUILD_DIR}"
 
-if [ ! -d "${LLAMA_DIR}/.git" ]; then
-    echo "❌ llama.cpp submodule not found."
-    echo "   Run: git submodule update --init --recursive"
+if [ ! -f "${LLAMA_DIR}/CMakeLists.txt" ]; then
+    echo "❌ llama.cpp source not found at ${LLAMA_DIR}"
     exit 1
 fi
 
@@ -33,6 +32,9 @@ cmake "${LLAMA_DIR}" \
     -DBUILD_SHARED_LIBS=ON \
     -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF \
+    -DLLAMA_BUILD_COMMON=OFF \
+    -DLLAMA_BUILD_TOOLS=OFF \
+    -DLLAMA_BUILD_APP=OFF \
     -DLLAMA_ALL_WARNINGS=OFF \
     -DCMAKE_BUILD_TYPE=Release
 

@@ -484,9 +484,8 @@ rustc --version  # Should be 1.86.0 or later
 # Debian/Ubuntu/Pi OS
 sudo apt-get install -y build-essential pkg-config
 
-# Optional: for llama.cpp FFI support, build llama.cpp first
-git clone https://github.com/ggerganov/llama.cpp.git
-cd llama.cpp && cmake -B build -DLLAMA_BUILD_TESTS=OFF && cmake --build build --config Release
+# Optional: for llama.cpp FFI support, build vendored llama.cpp first
+./scripts/build_llama_cpp.sh
 ```
 
 ### 3. Clone and build
@@ -499,7 +498,7 @@ cd LeafcutterLLM/rust
 cargo build --release
 
 # With llama.cpp FFI (enables Qwen3.5/3.6 and auto-fallback)
-export LLAMA_CPP_BUILD=/path/to/llama.cpp/build
+export LLAMA_CPP_BUILD=rust/llama.cpp/build
 cargo build --release --features llama-ffi
 ```
 

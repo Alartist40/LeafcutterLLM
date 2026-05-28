@@ -29,6 +29,7 @@ rust/synthetic_*.py
 # Build artifacts
 coverage.out
 rust/target/
+rust/llama.cpp/build/
 
 # Models and large files
 *.gguf

@@ -1,3 +1,0 @@
-[submodule "rust/llama.cpp"]
-	path = rust/llama.cpp
-	url = https://github.com/ggerganov/llama.cpp.git
