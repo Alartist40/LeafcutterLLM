@@ -147,22 +147,38 @@ cargo build --release --features llama-ffi
 
 The `llama-ffi` feature links against `libllama.so` and enables the dual-backend engine. Without it, only native Rust inference is available.
 
+> **Do I need llama.cpp?** No — for most models you don't. The native Rust path is fully self-contained and works without any external dependencies. You only need llama.cpp if you want to run Qwen3.5/3.6 or models with unsupported quantization formats.
+
+### What Works Without llama.cpp (Native Rust Only)
+
+| Model Family | Examples | Status |
+|-------------|----------|--------|
+| **Llama** | Llama-2/3/3.1/3.2, CodeLlama | ✅ Native |
+| **Mistral** | Mistral-7B, Mixtral, Ministral | ✅ Native |
+| **Qwen2** | Qwen2-0.5B/1.5B/7B | ✅ Native |
+| **Yi** | Yi-1.5-6B/9B | ✅ Native |
+| **Gemma** | Gemma-2B/4B/7B/9B | ✅ Native |
+| **Phi** | Phi-3/4 | ✅ Native |
+| **Qwen3.5/3.6** | Qwen3.5-0.8B through 27B | ❌ Requires FFI |
+| **DeepSeek** | DeepSeek-V3 | ❌ Requires FFI |
+| **Exotic quants** | IQ1_M, Q2_K, etc. | ❌ Requires FFI |
+
 ### 2. Download a model
 Download any GGUF or Safetensors model and place it in the `models/` directory. See `models/README.md` for recommendations.
 
 ### 3. Run with Auto-Detection
 ```bash
 # Native only
-./target/release/leafcutter-server
+./target/release/leafcutter server
 
 # With FFI fallback
-LD_LIBRARY_PATH=$LLAMA_CPP_BUILD/bin ./target/release/leafcutter-server
+LD_LIBRARY_PATH=$LLAMA_CPP_BUILD/bin ./target/release/leafcutter server
 ```
 LeafcutterLLM will automatically detect your model's architecture, check quantization compatibility, and route to the appropriate backend (native or FFI).
 
 ### 4. Check Compatibility Only
 ```bash
-./leafcutter-server --check-only
+./leafcutter --check-only
 ```
 See the **LeafcutterLLM Advantage** report showing how much RAM we save you.
 
@@ -254,7 +270,7 @@ Four. 2 + 2 = 4.
 ### Run the HTTP Server
 
 ```bash
-./leafcutter-server \
+./leafcutter server \
   --model /path/to/model \
   --port 8080 \
   --batch-size 8 \
@@ -276,12 +292,12 @@ curl -X POST http://localhost:8080/generate \
 ### Deploy with Podman
 
 ```bash
-podman build --network=host -t leafcutter-server .
+podman build --network=host -t leafcutter .
 
 podman run --rm -it \
   -p 8080:8080 \
   -v /path/to/models:/models \
-  leafcutter-server \
+  leafcutter server \
     --model /models/tinyllama \
     --port 8080 \
     --batch-size 8
@@ -503,7 +519,7 @@ cargo test --release --features llama-ffi
 ### Build image
 
 ```bash
-podman build --network=host -t leafcutter-server:latest .
+podman build --network=host -t leafcutter:latest .
 ```
 
 ### Run container
@@ -513,7 +529,7 @@ podman run --rm -it \
   -p 8080:8080 \
   -v /path/to/models:/models \
   -e MODEL_PATH=/models/tinyllama \
-  leafcutter-server:latest \
+  leafcutter:latest \
     --model /models/tinyllama \
     --port 8080 \
     --batch-size 8
@@ -542,7 +558,7 @@ services:
 
 ## API Reference
 
-### HTTP Server (`leafcutter-server`)
+### HTTP Server (`leafcutter server`)
 
 #### POST `/generate`
 
@@ -575,7 +591,7 @@ Check server status.
 ```json
 {
   "status": "ok",
-  "version": "leafcutter-server v0.4.0",
+  "version": "leafcutter v0.9.0",
   "total_requests": 42,
   "total_batches": 18,
   "dropped": 0,
@@ -615,9 +631,8 @@ print(response.latency_ms)
 # Install OpenBLAS development files
 sudo apt-get install libopenblas-dev
 
-# Or set PKG_CONFIG_PATH explicitly
-export PKG_CONFIG_PATH=/usr/lib/pkgconfig:/usr/local/lib/pkgconfig
-CGO_ENABLED=1 go build ./cmd/server
+# Build the Rust server
+cd rust && cargo build --release --bin leafcutter
 ```
 
 ### Server responds slowly (>5 seconds per token)
@@ -632,7 +647,7 @@ CGO_ENABLED=1 go build ./cmd/server
 
 **Solution:**
 ```bash
-podman build --network=host -t leafcutter-server .
+podman build --network=host -t leafcutter .
 ```
 
 The `--network=host` flag lets the builder access package mirrors without network interface delays.

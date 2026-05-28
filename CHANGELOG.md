@@ -5,6 +5,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.0] — 2026-05-28 (Cleanup & Self-Contained Build)
+
+### Removed
+- **Go codebase fully removed** — All Go source (`cmd/`, `internal/`, `pkg/`, `go.mod`) and compiled binaries (`go-backup/`, `bin/server`, `leafcutter-server`) deleted. Project is now 100% Rust.
+- **Go CI workflow** — `.github/workflows/go.yml` removed.
+
+### Added
+- **llama.cpp git submodule** — Added at `rust/llama.cpp/`. Run `git submodule update --init --recursive` to fetch it, then `./scripts/build_llama_cpp.sh` to build shared libraries.
+- **`scripts/build_llama_cpp.sh`** — One-script build for llama.cpp from submodule.
+- **Self-contained install** — `cargo build --release --features llama-ffi` now works after building the submodule; no external llama.cpp install required.
+
+### Changed
+- `rust/build.rs` — Now checks `rust/llama.cpp/build/` (submodule) before falling back to `LLAMA_CPP_BUILD` env var.
+- `Containerfile` — Rewritten for Rust; builds native-only leafcutter server.
+- `scripts/benchmark_all_models.sh` & `scripts/test_single_model.sh` — Updated to use Rust binary (`./rust/target/release/leafcutter`).
+- `README.md` — Removed all Go references; added "What Works Without llama.cpp" table; updated all `leafcutter-server` → `leafcutter server`.
+
+---
+
 ## [0.7.0] — 2026-05-13 (Progressive Testing Framework)
 
 ### Added

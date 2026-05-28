@@ -1,5 +1,5 @@
 #!/bin/bash
-# test_single_model.sh - Test one model
+# test_single_model.sh - Test one model using Rust server
 
 MODEL_PATH=$1
 MODEL_NAME=$(basename "$MODEL_PATH")
@@ -11,18 +11,20 @@ if [ -z "$MODEL_PATH" ]; then
   exit 1
 fi
 
-# Ensure server is built
-if [ ! -f "./leafcutter-server" ]; then
-    echo "🔨 Building leafcutter-server..."
-    CGO_ENABLED=1 go build -o leafcutter-server ./cmd/server
+# Ensure Rust server is built
+if [ ! -f "./rust/target/release/leafcutter-server" ]; then
+    echo "🔨 Building leafcutter-server (Rust)..."
+    cd rust && cargo build --release --bin leafcutter-server && cd ..
 fi
+
+SERVER_BIN="./rust/target/release/leafcutter-server"
 
 echo "🧪 Testing $MODEL_NAME on port $PORT..."
 echo ""
 
 # Start Leafcutter server
 echo "Starting Leafcutter server..."
-./leafcutter-server \
+"$SERVER_BIN" \
   --model "$MODEL_PATH" \
   --port "$PORT" \
   > /tmp/leafcutter.log 2>&1 &

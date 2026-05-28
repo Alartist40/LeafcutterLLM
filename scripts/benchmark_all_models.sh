@@ -1,5 +1,5 @@
 #!/bin/bash
-# benchmark_all_models.sh - Test all models in order
+# benchmark_all_models.sh - Test all models using Rust server
 
 MODELS=(
   "tinyllama-1.1b:TinyLlama-1.1B"
@@ -10,16 +10,17 @@ MODELS=(
 RESULTS_DIR="./results"
 mkdir -p "$RESULTS_DIR"
 
-# Ensure server is built
-if [ ! -f "./leafcutter-server" ]; then
-    echo "🔨 Building leafcutter-server..."
-    CGO_ENABLED=1 go build -o leafcutter-server ./cmd/server
+# Ensure Rust server is built
+if [ ! -f "./rust/target/release/leafcutter-server" ]; then
+    echo "🔨 Building leafcutter-server (Rust)..."
+    cd rust && cargo build --release --bin leafcutter-server && cd ..
 fi
 
 echo "🧪 Starting comprehensive Leafcutter testing..."
 echo ""
 
 PORT=8082
+SERVER_BIN="./rust/target/release/leafcutter-server"
 
 for MODEL_SPEC in "${MODELS[@]}"; do
   IFS=':' read -r MODEL_PATH MODEL_NAME <<< "$MODEL_SPEC"
@@ -39,7 +40,7 @@ for MODEL_SPEC in "${MODELS[@]}"; do
   
   # Start server
   echo "Starting Leafcutter server..."
-  ./leafcutter-server \
+  "$SERVER_BIN" \
     --model "$FULL_PATH" \
     --port "$PORT" \
     > /tmp/leafcutter.log 2>&1 &
@@ -84,7 +85,6 @@ for MODEL_SPEC in "${MODELS[@]}"; do
     }' > "$RESULT_FILE"
   
   # Inject model name into JSON
-  # This is a bit hacky, but works for the python script later
   sed -i "s|{|{\"model_name\": \"$MODEL_NAME\", \"hardware\": \"$(uname -a)\", |" "$RESULT_FILE"
   
   echo "Results saved to: $RESULT_FILE"
@@ -100,5 +100,5 @@ done
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "🎉 All tests complete!"
-echo "Results saved to: $RESULTS_DIR/"
+echo "Results saved to: $RESULT_DIR/"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
