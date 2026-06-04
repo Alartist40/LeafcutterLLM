@@ -243,6 +243,7 @@ impl Backend for WgpuBackend {
     fn vec_scale(&self, a: &[f32], scale: f32) -> Vec<f32> { CpuBackend.vec_scale(a, scale) }
     fn vec_scale_mul(&self, a: &[f32], scale: f32, b: &[f32]) -> Vec<f32> { CpuBackend.vec_scale_mul(a, scale, b) }
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, hidden_size: usize) -> Vec<f32> { CpuBackend.rms_norm(x, weight, eps, hidden_size) }
+    fn rms_norm_with_offset(&self, x: &[f32], weight: &[f32], eps: f32, hidden_size: usize, weight_offset: f32) -> Vec<f32> { CpuBackend.rms_norm_with_offset(x, weight, eps, hidden_size, weight_offset) }
     fn silu(&self, x: &[f32]) -> Vec<f32> { CpuBackend.silu(x) }
     fn softmax(&self, x: &[f32], hidden_size: usize) -> Vec<f32> { CpuBackend.softmax(x, hidden_size) }
     fn sum_sq(&self, x: &[f32]) -> f32 { CpuBackend.sum_sq(x) }

@@ -47,7 +47,7 @@ fn extract_vocab(path: &str) -> (Vec<String>, usize, usize) {
 
     let bos = file.get_metadata_int("tokenizer.ggml.bos_token_id")
         .map(|v| v as usize)
-        .unwrap_or(1);
+        .unwrap_or(usize::MAX); // usize::MAX means no BOS token
     let eos = file.get_metadata_int("tokenizer.ggml.eos_token_id")
         .map(|v| v as usize)
         .unwrap_or(2);
@@ -62,7 +62,7 @@ fn extract_vocab(path: &str) -> (Vec<String>, usize, usize) {
 struct GgufBpeTokenizer {
     vocab_sorted: Vec<(String, usize)>, // (token_string, token_id), longest first
     vocab_map: HashMap<String, usize>,
-    bos_token: usize,
+    bos_token: usize, // usize::MAX means no BOS token
     eos_token: usize,
 }
 
@@ -90,7 +90,11 @@ impl GgufBpeTokenizer {
     /// BPE convention: prepend Ġ (U+0120) to words that follow whitespace,
     /// then greedily match subword pieces within each word.
     fn encode(&self, text: &str) -> Vec<usize> {
-        let mut tokens = vec![self.bos_token];
+        let mut tokens = Vec::new();
+        // Only add BOS if it's defined (some models like Qwen3.5 have no BOS)
+        if self.bos_token != usize::MAX {
+            tokens.push(self.bos_token);
+        }
 
         let words: Vec<&str> = text.split_whitespace().collect();
         if words.is_empty() {
@@ -160,7 +164,7 @@ impl GgufBpeTokenizer {
 
         for &token_id in tokens {
             // Skip special tokens
-            if token_id == self.bos_token || token_id == self.eos_token {
+            if (self.bos_token != usize::MAX && token_id == self.bos_token) || token_id == self.eos_token {
                 continue;
             }
 

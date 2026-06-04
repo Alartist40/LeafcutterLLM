@@ -120,7 +120,7 @@ fn test_qwen_synthetic() {
 
     let dn_params = DeltaNetParams {
         num_qk_heads: 32, num_v_heads: 32, head_k_dim: 64, head_v_dim: 128,
-        conv_dim, conv_kernel: 4, state_size: 128,
+        conv_dim, conv_kernel: 4, state_size: 128, norm_eps: 1e-5,
     };
 
     let input = Tensor::from_vec(vec![0.01f32; 2 * hidden], vec![2, hidden]);

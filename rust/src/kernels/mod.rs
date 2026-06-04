@@ -23,6 +23,8 @@ use half::{f16, bf16};
 pub const QK_K: usize = 256;
 
 /// Dequantize Q4_0 blocks to f32
+/// Layout matches GGUF spec: each block is 18 bytes (scale f16 + 16 bytes of nibbles).
+/// Within each byte, low nibble = first element, high nibble = second element.
 pub fn dequantize_q4_0(data: &[u8], out: &mut [f32]) {
     let block_size = 32;
     let group_size = 18;
@@ -35,10 +37,11 @@ pub fn dequantize_q4_0(data: &[u8], out: &mut [f32]) {
 
         for j in 0..16 {
             let qs = block[2 + j];
-            let q0 = (qs & 0x0F) as f32 - 8.0;
-            let q1 = (qs >> 4) as f32 - 8.0;
-            out[i * block_size + j] = q0 * scale;
-            out[i * block_size + j + 16] = q1 * scale;
+            let low = (qs & 0x0F) as f32;
+            let high = ((qs >> 4) & 0x0F) as f32;
+            // Byte-interleaved: two consecutive elements come from one byte
+            out[i * block_size + j * 2] = (low - 8.0) * scale;
+            out[i * block_size + j * 2 + 1] = (high - 8.0) * scale;
         }
     }
 }

@@ -1,0 +1,107 @@
+   Compiling leafcutter v0.9.0 (/home/xander/Documents/portfolio/LeafcutterLLM/rust)
+warning: leafcutter@0.9.0: llama.cpp linked from llama.cpp/build/bin
+warning: unused import: `crate::model::arch::ModelArchitecture`
+  --> src/inference/engine.rs:10:5
+   |
+10 | use crate::model::arch::ModelArchitecture;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `rayon::prelude`
+  --> src/inference/engine.rs:20:5
+   |
+20 | use rayon::prelude::*;
+   |     ^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> src/inference/deltanet.rs:233:9
+    |
+233 |     let mut output = if let Some(out_w) = weights.get("ssm_out.weight")
+    |         ----^^^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `text`
+   --> src/inference/engine.rs:446:28
+    |
+446 |     pub fn tokenize(&self, text: &str, add_special: bool) -> Vec<usize> {
+    |                            ^^^^ help: if this is intentional, prefix it with an underscore: `_text`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `add_special`
+   --> src/inference/engine.rs:446:40
+    |
+446 |     pub fn tokenize(&self, text: &str, add_special: bool) -> Vec<usize> {
+    |                                        ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_add_special`
+
+warning: unused variable: `tokens`
+   --> src/inference/engine.rs:455:26
+    |
+455 |     pub fn decode(&self, tokens: &[usize]) -> String {
+    |                          ^^^^^^ help: if this is intentional, prefix it with an underscore: `_tokens`
+
+warning: unused variable: `seq_len`
+   --> src/inference/engine.rs:589:13
+    |
+589 |         let seq_len = tokens.len();
+    |             ^^^^^^^ help: if this is intentional, prefix it with an underscore: `_seq_len`
+
+warning: function `max_abs` is never used
+   --> src/inference/deltanet.rs:329:4
+    |
+329 | fn max_abs(data: &[f32]) -> f32 {
+    |    ^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `apply_group_norm` is never used
+   --> src/inference/deltanet.rs:334:4
+    |
+334 | fn apply_group_norm(data: &mut [f32], seq_len: usize, channels: usize, num_groups: usize, weight: &Tensor, eps: f32) {
+    |    ^^^^^^^^^^^^^^^^
+
+warning: function `apply_per_head_rms_norm` is never used
+   --> src/inference/deltanet.rs:359:4
+    |
+359 | fn apply_per_head_rms_norm(
+    |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `adaptive_matmul` is never used
+   --> src/inference/ssm.rs:224:4
+    |
+224 | fn adaptive_matmul(x: &Tensor, w: &Tensor, target_hidden: usize) -> Tensor {
+    |    ^^^^^^^^^^^^^^^
+
+warning: function `causal_conv1d` is never used
+   --> src/inference/ssm.rs:275:4
+    |
+275 | fn causal_conv1d(x: &Tensor, weight: &Tensor, kernel_size: usize) -> Tensor {
+    |    ^^^^^^^^^^^^^
+
+warning: `leafcutter` (lib) generated 12 warnings (run `cargo fix --lib -p leafcutter` to apply 6 suggestions)
+    Finished `release` profile [optimized] target(s) in 8.56s
+     Running `target/release/check_layer_stats ../models/Qwen3.5-0.8B-Q4_0.gguf`
+  Using native backend for Qwen3.5
+  Attention: heads=8, kv_h=2, hd=512, kv_hd=256, rope_dim=64, rope=10000000, o_in=2048
+  DeltaNet: qk_heads=16, v_heads=16, head_k=128, head_v=128, conv_dim=6144, conv_k=4
+  [layer  0 DELTA] hidden: min= -0.1765 max=  0.1445 mean=  0.001697 abs_mean=  0.0332
+  [layer  1 DELTA] hidden: min= -0.2630 max=  0.3334 mean=  0.003329 abs_mean=  0.0478
+  [layer  2 DELTA] hidden: min= -0.3111 max=  0.8384 mean=  0.002051 abs_mean=  0.0643
+  [layer  3 ATTN] hidden: min= -0.5266 max=  0.9234 mean=  0.001617 abs_mean=  0.1147
+  [layer  4 DELTA] hidden: min= -0.5261 max=  1.4356 mean=  0.003735 abs_mean=  0.1222
+  [layer  5 DELTA] hidden: min= -0.6315 max=  1.0424 mean=  0.003234 abs_mean=  0.1289
+  [layer  6 DELTA] hidden: min= -0.7475 max=  1.1719 mean=  0.002927 abs_mean=  0.1330
+  [layer  7 ATTN] hidden: min= -0.7276 max=  0.9085 mean=  0.001537 abs_mean=  0.1529
+  [layer 20 DELTA] hidden: min= -1.5895 max=  2.5501 mean=  0.004198 abs_mean=  0.3671
+  [layer 21 DELTA] hidden: min= -1.6956 max=  2.4167 mean=  0.003044 abs_mean=  0.3762
+  [layer 22 DELTA] hidden: min= -1.6126 max=  2.2242 mean=  0.002085 abs_mean=  0.3880
+  [layer 23 ATTN] hidden: min= -1.8167 max=  2.1012 mean= -0.003432 abs_mean=  0.4279
+  [pre-final-norm] hidden: min= -1.8167 max=  2.1012 abs_mean=  0.4279
+  [final_norm.weight] min=  0.2227 max=  6.3125 abs_mean=  4.3092
+  [final norm] hidden: min=-16.0821 max= 16.9408 abs_mean=  3.4381
+LOGITS | top_token=220 | top_value=11.695542
+TOKEN_19=3.702359 TOKEN_248068=2.267449

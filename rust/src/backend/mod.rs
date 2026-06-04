@@ -38,6 +38,9 @@ pub trait Backend: Send + Sync {
     /// RMSNorm over rows: out = x * rsqrt(mean(x^2) + eps) * weight
     fn rms_norm(&self, x: &[f32], weight: &[f32], eps: f32, hidden_size: usize) -> Vec<f32>;
 
+    /// RMSNorm over rows with weight offset: out = x * rsqrt(mean(x^2) + eps) * (weight + offset)
+    fn rms_norm_with_offset(&self, x: &[f32], weight: &[f32], eps: f32, hidden_size: usize, weight_offset: f32) -> Vec<f32>;
+
     /// SiLU activation: x * sigmoid(x)
     fn silu(&self, x: &[f32]) -> Vec<f32>;
 

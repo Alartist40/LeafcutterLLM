@@ -42,12 +42,14 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 
 ### What's In Progress
 
+- **DeltaNet HF alignment** — Native DeltaNet kernels implemented (`deltanet.rs`). Decay/beta gates match HF (CosSim > 0.98). `qkv_proj` CosSim ≈ 0.28 and improving after fixing GGUF dequantization orientation. Continuing to debug Q4_0 matmul kernel alignment.
 - Speed optimization — quantized GEMM kernels are naive scalar loops (~0.12 tok/sec on 3B, ~142s/token on 70B)
 - More quant formats — Q2_K, IQ2_XXS, Q4_1, BF16 have no native dequant kernels
 
 ### What's Blocked
 
-- **Qwen3.6-27B native attention** — architectural mismatch. Model uses `head_count=24`, `key_length=256`, `value_length=256`, `rope.dimension_count=64`, and fused QKV shape `[5120, 10240]`. Our code assumes `head_dim = hidden_size / num_heads`, which gives 213, but this doesn't divide the fused QKV evenly. RoPE partial application (64 dims) and compressed KV dimensions are also unimplemented.
+- **Qwen3.5/3.6 native DeltaNet coherence** — DeltaNet kernels implemented but `qkv_proj` output does not yet match HF reference. Pre-norm input is correct (decay/beta match). Suspected cause: Q4_0 quantized matmul kernel orientation or weight loading layout.
+- **Qwen3.6-27B attention layers** — compressed KV (`key_length=256`) and partial RoPE (`rope_dim=64`) are implemented, but the model has not been validated end-to-end due to the DeltaNet alignment blocker above.
 - **Workaround:** Use llama.cpp bridge for Qwen3.5/3.6 models.
 
 ### Real Model Validation Results
@@ -83,7 +85,8 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/iq4_nl_gemm.rs` | IQ4_NL transposed-B GEMM (scalar reference) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/kernels/q8_0_gemm.rs` | Q8_0 transposed-B GEMM (scalar reference) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/attention.rs` | **M4+M5: Attention** — RoPE + GQA + fused QKV + compressed KV + gated attention + sliding window attention (SWA) |
-| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/ssm.rs` | **M7: SSM layer** — causal conv1d + selective scan for Mamba layers (stubs) |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/deltanet.rs` | **M7: DeltaNet layer** — causal conv1d + delta rule + per-head norm + SiLU gate (implemented, debugging HF alignment) |
+| `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/ssm.rs` | Mamba selective scan (stubs — superseded by DeltaNet for Qwen3.5) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/speculative.rs` | **M6: Speculative decoding** — Eagle draft heads (`nextn.*` tensors) |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/inference/engine.rs` | **M7: Hybrid engine** — routes SSM/Attention per layer, loads from GGUF, Gemma logit soft-capping |
 | `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/cache/mod.rs` | **M5: Compressed KV cache** — per-layer seq len tracking |
@@ -185,7 +188,7 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 
 ## Next Steps
 
-1. **[BLOCKED] Qwen3.6 native attention** — Need Delta Net implementation. Use bridge as fallback.
+1. **[IN PROGRESS] Qwen3.5 native DeltaNet** — Kernels implemented; debugging `qkv_proj` alignment vs HF. Use bridge for production.
 2. **[HIGH] Speed optimization** — Quantized GEMM kernels are naive scalar loops. Need SIMD matmul or `gemm` crate.
 3. **[MEDIUM] More quant formats** — Q2_K, IQ2_XXS, Q4_1, BF16 have no native dequant kernels.
 4. **[MEDIUM] KV cache quantization** — Store KV cache as f16 or Q8_0 to reduce memory by 2-4×.

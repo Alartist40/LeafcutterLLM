@@ -1,8 +1,8 @@
 # LeafcutterLLM — Milestones & Testing Record
 
-**Last updated:** 2026-05-23  
+**Last updated:** 2026-05-29  
 **Git commit:** To be pushed  
-**Total tests:** 100 passed, 3 failed (pre-existing shard engine), 3 ignored  
+**Total tests:** 124 passed, 0 failed, 3 ignored (GPU tests)  
 
 ---
 

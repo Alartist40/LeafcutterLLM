@@ -1,0 +1,8 @@
+Loading ../models/Qwen3.5-0.8B-HF...
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+[transformers] The fast path is not available because one of the required library is not installed. Falling back to torch implementation. To install follow https://github.com/fla-org/flash-linear-attention#installation and https://github.com/Dao-AILab/causal-conv1d
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 8908.53it/s]
+Prompt tokens: [17, 10, 17, 28]
+
+LOGITS | top_token=19 | top_value=17.875000
+TOKEN_19=17.875000 TOKEN_248068=6.406250

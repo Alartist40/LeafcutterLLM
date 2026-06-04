@@ -8,9 +8,15 @@ pub mod chat_template;
 pub mod gguf;
 
 pub use chat_template::{apply_chat_template_from_gguf, TemplateFamily};
-pub use gguf::GgufTokenizer;
+pub use gguf::{GgufTokenizer, GgufBpeTokenizer};
 
 use tokenizers::Tokenizer as HFTokenizer;
+
+pub trait BaseTokenizer: Send + Sync {
+    fn encode(&self, text: &str) -> Vec<usize>;
+    fn decode(&self, tokens: &[usize]) -> String;
+    fn vocab_size(&self) -> usize;
+}
 
 pub struct Tokenizer {
     inner: HFTokenizer,
@@ -22,24 +28,38 @@ impl Tokenizer {
         Ok(Self { inner })
     }
 
-    pub fn encode(&self, text: &str) -> Vec<usize> {
-        let encoding = self.inner.encode(text, false).expect("Tokenizer encode failed");
-        encoding.get_ids().iter().map(|&id| id as usize).collect()
-    }
-
-    pub fn decode(&self, tokens: &[usize], skip_special: bool) -> String {
-        let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
-        self.inner.decode(&ids, skip_special).expect("Tokenizer decode failed")
-    }
-
-    pub fn vocab_size(&self) -> usize {
-        self.inner.get_vocab_size(true)
-    }
-
     pub fn apply_chat_template(&self, user_message: &str) -> String {
         format!(
             "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
             user_message
         )
+    }
+}
+
+impl BaseTokenizer for Tokenizer {
+    fn encode(&self, text: &str) -> Vec<usize> {
+        let encoding = self.inner.encode(text, false).expect("Tokenizer encode failed");
+        encoding.get_ids().iter().map(|&id| id as usize).collect()
+    }
+
+    fn decode(&self, tokens: &[usize]) -> String {
+        let ids: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+        self.inner.decode(&ids, true).expect("Tokenizer decode failed")
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.inner.get_vocab_size(true)
+    }
+}
+
+impl BaseTokenizer for GgufBpeTokenizer {
+    fn encode(&self, text: &str) -> Vec<usize> {
+        self.encode(text)
+    }
+    fn decode(&self, tokens: &[usize]) -> String {
+        self.decode(tokens)
+    }
+    fn vocab_size(&self) -> usize {
+        self.vocab_size()
     }
 }

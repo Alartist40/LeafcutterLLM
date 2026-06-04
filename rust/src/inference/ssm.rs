@@ -170,7 +170,7 @@ pub fn ssm_forward(
     };
 
     // 13. Output gate (Gated DeltaNet): o = ssm_out * sigmoid(hidden @ attn_gate)
-    if let Some(gate_w) = weights.get("attn_gate.weight") {
+    if let Some(gate_w) = weights.get("self_attn.gate_proj.weight") {
         let gate_logits = hidden_states.matmul(gate_w);
         let mut gated = vec![0.0f32; output.data.len()];
         for i in 0..gated.len() {

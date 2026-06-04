@@ -19,6 +19,7 @@ pub struct AttentionParams {
     pub head_dim: usize,
     pub kv_head_dim: usize,
     pub rope_theta: f32,
+    pub rope_dim: usize, // 0 = full head_dim (standard), >0 = partial RoPE
     pub use_fused_qkv: bool,
     pub use_gate: bool,
     pub window_size: usize, // 0 = disabled (full causal), >0 = sliding window
@@ -32,6 +33,7 @@ impl Default for AttentionParams {
             head_dim: 128,
             kv_head_dim: 128,
             rope_theta: 10000.0,
+            rope_dim: 0,
             use_fused_qkv: false,
             use_gate: false,
             window_size: 0,
@@ -39,18 +41,19 @@ impl Default for AttentionParams {
     }
 }
 
-pub fn apply_rotary_emb(x: &mut Tensor, seq_len: usize, num_heads: usize, head_dim: usize, theta: f32, position_offset: usize) {
+pub fn apply_rotary_emb(x: &mut Tensor, seq_len: usize, num_heads: usize, head_dim: usize, rope_dim: usize, theta: f32, position_offset: usize) {
+    let rope_dim = if rope_dim > 0 { rope_dim } else { head_dim };
     for i in 0..seq_len {
         for h in 0..num_heads {
-            for d in 0..head_dim / 2 {
-                let freq = 1.0 / theta.powf(2.0 * d as f32 / head_dim as f32);
+            for d in 0..rope_dim / 2 {
+                let freq = 1.0 / theta.powf(2.0 * d as f32 / rope_dim as f32);
                 let angle = (position_offset + i) as f32 * freq;
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
 
                 let base = i * num_heads * head_dim + h * head_dim;
                 let x1_idx = base + d;
-                let x2_idx = base + d + head_dim / 2;
+                let x2_idx = base + d + rope_dim / 2;
 
                 let x1 = x.data[x1_idx];
                 let x2 = x.data[x2_idx];
@@ -165,10 +168,39 @@ pub fn attention_forward(
     // -------------------------------------------------------------------------
     // Q/K per-head RMSNorm (Qwen3.5-style) — applied before RoPE
     // -------------------------------------------------------------------------
-    let q_normed = if let Some(q_norm_w) = weights.get("attn_q_norm.weight") {
-        apply_per_head_rms_norm(&q_data, params.num_heads, params.head_dim, q_norm_w, 1e-6)
+    // Qwen3.5 attention: Q head_dim may be 2× kv_head_dim (e.g. 512 vs 256).
+    // The first half is "content" (used for QK scoring), the second half is
+    // "gate" (applied as a sigmoid to the attention output).
+    // QK norm weights have kv_head_dim elements, so norm runs on content only.
+    // -------------------------------------------------------------------------
+    let use_q_split = params.head_dim > params.kv_head_dim;
+    let content_head_dim = params.kv_head_dim;
+
+    let (q_content, q_gate_opt) = if use_q_split {
+        // Q layout: [seq_len, num_heads, head_dim] where head_dim = 2 * content_head_dim
+        // Each head is [content(0..content_head_dim), gate(content_head_dim..head_dim)].
+        // We must extract content and gate PER-HEAD, not as contiguous halves.
+        let mut content = vec![0.0f32; seq_len * params.num_heads * content_head_dim];
+        let mut gate = vec![0.0f32; seq_len * params.num_heads * content_head_dim];
+        for s in 0..seq_len {
+            for h in 0..params.num_heads {
+                let src_base = s * params.num_heads * params.head_dim + h * params.head_dim;
+                let dst_base = s * params.num_heads * content_head_dim + h * content_head_dim;
+                content[dst_base..dst_base + content_head_dim]
+                    .copy_from_slice(&q_data[src_base..src_base + content_head_dim]);
+                gate[dst_base..dst_base + content_head_dim]
+                    .copy_from_slice(&q_data[src_base + content_head_dim..src_base + params.head_dim]);
+            }
+        }
+        (content, Some(gate))
     } else {
-        q_data
+        (q_data, None)
+    };
+
+    let q_normed = if let Some(q_norm_w) = weights.get("attn_q_norm.weight") {
+        apply_per_head_rms_norm(&q_content, params.num_heads, content_head_dim, q_norm_w, 1e-6)
+    } else {
+        q_content
     };
     let k_normed = if let Some(k_norm_w) = weights.get("attn_k_norm.weight") {
         apply_per_head_rms_norm(&k_data, params.num_kv_heads, params.kv_head_dim, k_norm_w, 1e-6)
@@ -176,42 +208,15 @@ pub fn attention_forward(
         k_data
     };
 
-    // -------------------------------------------------------------------------
-    // Adaptive reshape to [seq_len, heads, head_dim] for RoPE
-    // Qwen3.5 attention layers may have larger Q dims (e.g. 4096 vs expected 2048)
-    // -------------------------------------------------------------------------
-    let expected_q_dim = params.num_heads * params.head_dim;
-    let actual_q_dim = q_normed.len() / seq_len;
-    let _effective_q_heads = if actual_q_dim >= expected_q_dim {
-        params.num_heads
-    } else {
-        actual_q_dim / params.head_dim
-    };
-
-    // Truncate or pad q_normed to expected_q_dim
-    let q_data_trimmed: Vec<f32> = if actual_q_dim == expected_q_dim {
-        q_normed
-    } else if actual_q_dim > expected_q_dim {
-        (0..seq_len).flat_map(|s| q_normed[s * actual_q_dim..s * actual_q_dim + expected_q_dim].to_vec()).collect()
-    } else {
-        let mut padded = vec![0.0f32; seq_len * expected_q_dim];
-        for s in 0..seq_len {
-            for d in 0..actual_q_dim {
-                padded[s * expected_q_dim + d] = q_normed[s * actual_q_dim + d];
-            }
-        }
-        padded
-    };
-
-    let mut q = Tensor::from_vec(q_data_trimmed, vec![seq_len, params.num_heads, params.head_dim]);
+    let mut q = Tensor::from_vec(q_normed, vec![seq_len, params.num_heads, content_head_dim]);
     let mut k = Tensor::from_vec(k_normed, vec![seq_len, params.num_kv_heads, params.kv_head_dim]);
     let v = Tensor::from_vec(v.data, vec![seq_len, params.num_kv_heads, params.kv_head_dim]);
 
     // -------------------------------------------------------------------------
     // RoPE
     // -------------------------------------------------------------------------
-    apply_rotary_emb(&mut q, seq_len, params.num_heads, params.head_dim, params.rope_theta, position_offset);
-    apply_rotary_emb(&mut k, seq_len, params.num_kv_heads, params.kv_head_dim, params.rope_theta, position_offset);
+    apply_rotary_emb(&mut q, seq_len, params.num_heads, content_head_dim, params.rope_dim, params.rope_theta, position_offset);
+    apply_rotary_emb(&mut k, seq_len, params.num_kv_heads, params.kv_head_dim, params.rope_dim, params.rope_theta, position_offset);
 
     // -------------------------------------------------------------------------
     // KV Cache (M5: compressed dimensions)
@@ -253,7 +258,7 @@ pub fn attention_forward(
                         let mut dot = 0.0f32;
                         for d in 0..params.kv_head_dim {
                             // Q uses first kv_head_dim of its head_dim for scoring
-                            let q_val = q.data[s * params.num_heads * params.head_dim + h * params.head_dim + d];
+                            let q_val = q.data[s * params.num_heads * content_head_dim + h * content_head_dim + d];
                             let k_val = k_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d];
                             dot += q_val * k_val;
                         }
@@ -289,6 +294,14 @@ pub fn attention_forward(
                 attn_output[s * params.num_heads * output_dim_per_head + h * output_dim_per_head + d] =
                     head_outputs[h][s * output_dim_per_head + d];
             }
+        }
+    }
+
+    // If Q-split gate exists, apply sigmoid element-wise to attention output
+    if let Some(q_gate_data) = q_gate_opt {
+        for i in 0..attn_output.len() {
+            let sigmoid = 1.0 / (1.0 + (-q_gate_data[i]).exp());
+            attn_output[i] *= sigmoid;
         }
     }
 

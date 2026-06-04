@@ -1,7 +1,7 @@
 # LeafcutterLLM — Complete Update & Expansion Strategy
 
-> Last updated: 2026-05-27  
-> Status: 113 tests passing, 0 failures | 12 architectures | 8 models validated
+> Last updated: 2026-05-29  
+> Status: 124 tests passing, 0 failures | 12 architectures | 8 models validated
 
 ---
 

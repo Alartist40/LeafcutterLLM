@@ -20,6 +20,9 @@ use leafcutter::llama_ffi::{backend_init, backend_free, LlamaModel, LlamaContext
 #[cfg(feature = "llama-ffi")]
 use leafcutter::api::FfiEngine;
 
+use leafcutter::model::gguf::GGUFile;
+use leafcutter::tokenizer::chat_template::apply_chat_template_from_gguf;
+
 #[derive(Parser)]
 #[command(name = "leafcutter")]
 #[command(about = "LeafcutterLLM — Run LLMs locally, fast and light")]
@@ -43,6 +46,9 @@ enum Commands {
         /// HTTP port to listen on
         #[arg(short, long, default_value_t = 8081)]
         port: u16,
+        /// Engine type (native-streaming or llama-ffi)
+        #[arg(short, long, default_value = "native-streaming")]
+        engine: String,
         /// Run a quick benchmark instead of starting the server
         #[arg(long, default_value_t = false)]
         benchmark: bool,
@@ -55,6 +61,12 @@ enum Commands {
         /// Prompt text
         #[arg(short, long)]
         prompt: String,
+        /// System prompt (optional)
+        #[arg(long, default_value = "")]
+        system: String,
+        /// Skip chat-template formatting and use raw prompt
+        #[arg(long, default_value_t = false)]
+        raw: bool,
         /// Max tokens to generate
         #[arg(short, long, default_value = "128")]
         max_tokens: usize,
@@ -132,20 +144,20 @@ async fn main() {
     }
 
     match cli.command {
-        Some(Commands::Server { model, port, benchmark }) => {
+        Some(Commands::Server { model, port, engine, benchmark }) => {
             #[cfg(feature = "llama-ffi")]
-            run_server(&model, port, benchmark).await;
+            run_server(&model, port, &engine, benchmark).await;
             #[cfg(not(feature = "llama-ffi"))]
             {
                 eprintln!("❌ Server mode requires llama.cpp FFI. Build with: cargo build --features llama-ffi");
                 std::process::exit(1);
             }
         }
-        Some(Commands::Generate { model, prompt, max_tokens, temperature, threads, ctx_size, gpu_layers }) => {
+        Some(Commands::Generate { model, prompt, system, raw, max_tokens, temperature, threads, ctx_size, gpu_layers }) => {
             #[cfg(feature = "llama-ffi")]
-            cmd_generate(&model, &prompt, max_tokens, temperature, threads, ctx_size, gpu_layers);
+            cmd_generate(&model, &prompt, &system, raw, max_tokens, temperature, threads, ctx_size, gpu_layers);
             #[cfg(not(feature = "llama-ffi"))]
-            cmd_generate_native(&model, &prompt, max_tokens, temperature);
+            cmd_generate_native(&model, &prompt, &system, raw, max_tokens, temperature);
         }
         Some(Commands::Chat { model, system, max_tokens, temperature, threads, ctx_size, gpu_layers }) => {
             #[cfg(feature = "llama-ffi")]
@@ -165,6 +177,7 @@ async fn main() {
             run_server(
                 "/home/xander/Documents/portfolio/AI Models/Qwen3.5-9B-IQ4_NL.gguf",
                 8081,
+                "native-streaming",
                 false,
             ).await;
             #[cfg(not(feature = "llama-ffi"))]
@@ -183,18 +196,33 @@ async fn main() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "llama-ffi")]
-async fn run_server(model_path: &str, port: u16, benchmark: bool) {
-    println!("🌿 LeafcutterLLM v0.9.0 (FFI Server Mode)");
+async fn run_server(model_path: &str, port: u16, engine_type: &str, benchmark: bool) {
+    use leafcutter::api::{FfiEngine, NativeStreamingEngine, LeafcutterEngine};
+
+    println!("🌿 LeafcutterLLM v0.9.5 (Server Mode: {})", engine_type);
     println!("   Model: {}", model_path);
 
-    let engine = match FfiEngine::load(model_path) {
-        Ok(e) => {
-            println!("✅ Model loaded via direct llama.cpp FFI");
-            Arc::new(e)
+    let engine: Arc<dyn LeafcutterEngine> = if engine_type == "native-streaming" {
+        match NativeStreamingEngine::load(model_path) {
+            Ok(e) => {
+                println!("✅ Native Streaming Engine loaded (low RAM mode)");
+                Arc::new(e)
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to load native engine: {}", e);
+                std::process::exit(1);
+            }
         }
-        Err(e) => {
-            eprintln!("❌ Failed to load model: {}", e);
-            std::process::exit(1);
+    } else {
+        match FfiEngine::load(model_path) {
+            Ok(e) => {
+                println!("✅ llama.cpp FFI Engine loaded (Full load mode)");
+                Arc::new(e)
+            }
+            Err(e) => {
+                eprintln!("❌ Failed to load FFI engine: {}", e);
+                std::process::exit(1);
+            }
         }
     };
 
@@ -207,7 +235,7 @@ async fn run_server(model_path: &str, port: u16, benchmark: bool) {
 }
 
 #[cfg(feature = "llama-ffi")]
-fn run_ffi_benchmark(engine: &Arc<FfiEngine>) {
+fn run_ffi_benchmark(engine: &Arc<dyn leafcutter::api::LeafcutterEngine>) {
     use std::time::Instant;
 
     println!("\n🏁 Running benchmark...");
@@ -225,6 +253,8 @@ fn run_ffi_benchmark(engine: &Arc<FfiEngine>) {
 fn cmd_generate(
     model_path: &PathBuf,
     prompt: &str,
+    system: &str,
+    raw: bool,
     max_tokens: usize,
     temperature: f32,
     threads: i32,
@@ -252,8 +282,27 @@ fn cmd_generate(
         }
     };
 
-    let tokens = ctx.tokenize(prompt, true, true);
+    // Auto-detect chat template from GGUF metadata
+    let prompt_text = if raw {
+        prompt.to_string()
+    } else {
+        let gguf = GGUFile::open(model_path.to_str().unwrap()).ok();
+        let formatted = if let Some(ref file) = gguf {
+            apply_chat_template_from_gguf(&file.metadata, system, prompt)
+        } else {
+            if system.is_empty() {
+                prompt.to_string()
+            } else {
+                format!("{system}\n\n{prompt}")
+            }
+        };
+        eprintln!("🎭 Chat template applied");
+        formatted
+    };
+
+    let tokens = ctx.tokenize(&prompt_text, true, true);
     eprintln!("📝 Prompt tokens: {}", tokens.len());
+    eprintln!("📝 FFI Token IDs: {:?}", tokens);
 
     let generated = ctx.generate(&tokens, max_tokens, temperature, model.eos_token());
 
@@ -371,10 +420,12 @@ fn cmd_chat(
 fn cmd_generate_native(
     model_path: &PathBuf,
     prompt: &str,
+    system: &str,
+    raw: bool,
     max_tokens: usize,
     temperature: f32,
 ) {
-    use leafcutter::tokenizer::Tokenizer;
+    use leafcutter::tokenizer::{Tokenizer, GgufBpeTokenizer};
     use leafcutter::inference::engine::Engine;
 
     eprintln!("🌿 LeafcutterLLM Native Engine (no llama.cpp FFI)");
@@ -388,25 +439,89 @@ fn cmd_generate_native(
         }
     };
 
-    let tok = Tokenizer::from_file("tests/tokenizer_llama.json")
+    // Try HF tokenizer first, then fall back to GGUF-native BPE tokenizer
+    let expected_vocab = engine.config.vocab_size;
+    let hf_tok = Tokenizer::from_file("models/tokenizer_qwen35.json")
         .or_else(|_| Tokenizer::from_file("tests/tokenizer_qwen35.json"))
-        .unwrap_or_else(|_| {
-            eprintln!("⚠️  tokenizer_llama.json not found, using byte fallback");
-            Tokenizer::from_file("tests/tokenizer.json").unwrap_or_else(|_| {
-                eprintln!("❌ No tokenizer found. Place tests/tokenizer_llama.json or tests/tokenizer.json");
-                std::process::exit(1);
-            })
-        });
+        .or_else(|_| Tokenizer::from_file("tests/tokenizer_llama.json"))
+        .or_else(|_| Tokenizer::from_file("tests/tokenizer.json"))
+        .ok();
+    let gguf_tok = GgufBpeTokenizer::from_gguf(model_path.to_str().unwrap());
 
-    let prompt_text = tok.apply_chat_template(prompt);
-    let tokens = tok.encode(&prompt_text);
+    let use_hf = match (&hf_tok, &gguf_tok) {
+        (Some(t), _) if t.vocab_size() == expected_vocab => {
+            eprintln!("📝 Using HF tokenizer (vocab={})", t.vocab_size());
+            true
+        }
+        (Some(t), Some(_)) => {
+            // Temporarily allow HF tokenizer even with vocab mismatch for testing
+            eprintln!("⚠️  HF tokenizer vocab mismatch (HF={}, model={}), using HF tokenizer anyway for testing",
+                t.vocab_size(), expected_vocab);
+            true
+        }
+        (None, Some(_)) => {
+            eprintln!("📝 Using GGUF-native tokenizer (vocab={})", gguf_tok.as_ref().unwrap().vocab_size());
+            false
+        }
+        (Some(t), None) => {
+            eprintln!("⚠️  HF tokenizer vocab mismatch (HF={}, model={}), no GGUF vocab fallback",
+                t.vocab_size(), expected_vocab);
+            true
+        }
+        (None, None) => {
+            eprintln!("❌ No tokenizer found. Place tests/tokenizer_llama.json or ensure GGUF has tokenizer.ggml.tokens");
+            std::process::exit(1);
+        }
+    };
+
+    // Auto-detect chat template from GGUF metadata
+    let prompt_text = if raw {
+        prompt.to_string()
+    } else {
+        let gguf = GGUFile::open(model_path.to_str().unwrap()).ok();
+        if let Some(ref file) = gguf {
+            let formatted = apply_chat_template_from_gguf(&file.metadata, system, prompt);
+            let family = if formatted.starts_with("[SYSTEM_PROMPT]") {
+                "Ministral"
+            } else if formatted.contains("<|start_header_id|>") {
+                "Llama-3"
+            } else if formatted.contains("[INST]") {
+                "Mistral"
+            } else if formatted.contains("<|im_start|>") {
+                "ChatML"
+            } else if formatted.contains("<start_of_turn>") {
+                "Gemma"
+            } else {
+                "Unknown / plain"
+            };
+            eprintln!("🎭 Chat template applied (detected: {})", family);
+            formatted
+        } else {
+            if system.is_empty() {
+                prompt.to_string()
+            } else {
+                format!("{system}\n\n{prompt}")
+            }
+        }
+    };
+
+    let tokens = if use_hf {
+        hf_tok.as_ref().unwrap().encode(&prompt_text)
+    } else {
+        gguf_tok.as_ref().unwrap().encode(&prompt_text)
+    };
     eprintln!("📝 Prompt tokens: {}", tokens.len());
+    eprintln!("📝 Token IDs: {:?}", tokens);
 
     let info = engine.info();
     eprintln!("   Arch: {}  Layers: {}  Hidden: {}", info.architecture, info.total_layers, info.hidden_size);
 
     let generated = engine.generate(&tokens, max_tokens, temperature, 0.9);
-    let text = tok.decode(&generated, false);
+    let text = if use_hf {
+        hf_tok.as_ref().unwrap().decode(&generated, false)
+    } else {
+        gguf_tok.as_ref().unwrap().decode(&generated)
+    };
     println!("{}", text);
 }
 

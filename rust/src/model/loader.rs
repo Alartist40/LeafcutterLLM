@@ -24,6 +24,10 @@ pub struct ModelConfig {
     pub attention_interval: usize,
     /// Gemma-style logit soft-capping: output = cap * tanh(output / cap)
     pub logit_soft_cap: f32,
+    /// RoPE dimensions per head (partial RoPE for Qwen3.5/3.6)
+    pub rope_dim: usize,
+    /// RMS norm epsilon (read from GGUF metadata)
+    pub norm_eps: f32,
 }
 
 impl Default for ModelConfig {
@@ -41,6 +45,8 @@ impl Default for ModelConfig {
             rope_theta: 10000.0,
             attention_interval: 1,
             logit_soft_cap: 0.0,
+            rope_dim: 0,
+            norm_eps: 1e-5,
         }
     }
 }
@@ -84,7 +90,9 @@ impl GGUFModel {
                         if has_ssm && (gguf_suffix.starts_with("attn_q.weight")
                             || gguf_suffix.starts_with("attn_k.weight")
                             || gguf_suffix.starts_with("attn_v.weight")
-                            || gguf_suffix.starts_with("attn_output.weight")) {
+                            || gguf_suffix.starts_with("attn_output.weight")
+                            || gguf_suffix.starts_with("attn_q_norm")
+                            || gguf_suffix.starts_with("attn_k_norm")) {
                             continue;
                         }
                         if has_separate_attn && (*gguf_suffix == "attn_qkv.weight"
@@ -151,17 +159,26 @@ impl GGUFModel {
         let mut cfg = ModelConfig::default();
         let prefix = arch.metadata_prefix();
 
-        cfg.hidden_size = Self::get_meta_int(file, &[&format!("{}.embedding_length", prefix), "llama.embedding_length", "qwen2.embedding_length", "qwen35.embedding_length"])
+        cfg.hidden_size = Self::get_meta_int(file, &[&format!("{}.embedding_length", prefix), "llama.embedding_length", "mistral3.embedding_length", "qwen2.embedding_length", "qwen35.embedding_length"])
             .map(|v| v as usize).unwrap_or(cfg.hidden_size);
-        cfg.num_hidden_layers = Self::get_meta_int(file, &[&format!("{}.block_count", prefix), "llama.block_count", "qwen2.block_count", "qwen35.block_count"])
+        cfg.num_hidden_layers = Self::get_meta_int(file, &[&format!("{}.block_count", prefix), "llama.block_count", "mistral3.block_count", "qwen2.block_count", "qwen35.block_count"])
             .map(|v| v as usize).unwrap_or(cfg.num_hidden_layers);
-        cfg.num_attention_heads = Self::get_meta_int(file, &[&format!("{}.attention.head_count", prefix), "llama.attention.head_count", "qwen2.attention.head_count", "qwen35.attention.head_count"])
+        
+        // Qwen3.5/3.6: subtract NextN/MTP layers from the main transformer count
+        // (they are stored as extra decoder blocks but not executed in the main pass)
+        let nextn_layers = Self::get_meta_int(file, &[&format!("{}.nextn_predict_layers", prefix), "qwen35.nextn_predict_layers", "llama.nextn_predict_layers"])
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        if nextn_layers > 0 && nextn_layers < cfg.num_hidden_layers {
+            cfg.num_hidden_layers -= nextn_layers;
+        }
+        cfg.num_attention_heads = Self::get_meta_int(file, &[&format!("{}.attention.head_count", prefix), "llama.attention.head_count", "mistral3.attention.head_count", "qwen2.attention.head_count", "qwen35.attention.head_count"])
             .map(|v| v as usize).unwrap_or(cfg.num_attention_heads);
-        cfg.num_key_value_heads = Self::get_meta_int(file, &[&format!("{}.attention.head_count_kv", prefix), "llama.attention.head_count_kv", "qwen2.attention.head_count_kv", "qwen35.attention.head_count_kv"])
+        cfg.num_key_value_heads = Self::get_meta_int(file, &[&format!("{}.attention.head_count_kv", prefix), "llama.attention.head_count_kv", "mistral3.attention.head_count_kv", "qwen2.attention.head_count_kv", "qwen35.attention.head_count_kv"])
             .map(|v| v as usize).unwrap_or(cfg.num_key_value_heads);
-        cfg.intermediate_size = Self::get_meta_int(file, &[&format!("{}.feed_forward_length", prefix), "llama.feed_forward_length", "qwen2.feed_forward_length", "qwen35.feed_forward_length"])
+        cfg.intermediate_size = Self::get_meta_int(file, &[&format!("{}.feed_forward_length", prefix), "llama.feed_forward_length", "mistral3.feed_forward_length", "qwen2.feed_forward_length", "qwen35.feed_forward_length"])
             .map(|v| v as usize).unwrap_or(cfg.intermediate_size);
-        cfg.max_seq_len = Self::get_meta_int(file, &[&format!("{}.context_length", prefix), "llama.context_length", "qwen2.context_length", "qwen35.context_length"])
+        cfg.max_seq_len = Self::get_meta_int(file, &[&format!("{}.context_length", prefix), "llama.context_length", "mistral3.context_length", "qwen2.context_length", "qwen35.context_length"])
             .map(|v| v as usize).unwrap_or(cfg.max_seq_len);
         cfg.vocab_size = Self::get_meta_int(file, &[&format!("{}.vocab_size", prefix), "tokenizer.ggml.tokens.length", "tokenizer.ggml.vocab_size"])
             .map(|v| v as usize)
@@ -185,6 +202,23 @@ impl GGUFModel {
             .map(|v| v as f32)
             .unwrap_or(cfg.rope_theta);
 
+        // Partial RoPE dimension count (Qwen3.5/3.6: 64 of 256)
+        cfg.rope_dim = Self::get_meta_int(file, &[
+                &format!("{}.rope.dimension_count", prefix),
+                "qwen35.rope.dimension_count",
+                "llama.rope.dimension_count",
+            ])
+            .map(|v| v as usize)
+            .unwrap_or(cfg.head_dim);
+
+        // RMS norm epsilon (model-specific, e.g., Qwen35 uses 1e-6)
+        cfg.norm_eps = Self::get_meta_f32(file, &[
+                &format!("{}.attention.layer_norm_rms_epsilon", prefix),
+                "qwen35.attention.layer_norm_rms_epsilon",
+                "llama.attention.layer_norm_rms_epsilon",
+            ])
+            .unwrap_or(cfg.norm_eps);
+
         // Gemma logit soft-capping (e.g., gemma3.logit_cap = 30.0)
         cfg.logit_soft_cap = Self::get_meta_f32(file, &[
                 &format!("{}.logit_cap", prefix),
@@ -206,12 +240,12 @@ impl GGUFModel {
             .unwrap_or(cfg.hidden_size / cfg.num_attention_heads);
 
         // Compressed KV dimensions (M5) — for Qwen3.5, key_length != embedding_length / head_count
-        cfg.kv_head_dim = Self::get_meta_int(file, &[&format!("{}.attention.key_length", prefix), "llama.attention.key_length", "qwen35.attention.key_length"])
+        cfg.kv_head_dim = Self::get_meta_int(file, &[&format!("{}.attention.key_length", prefix), "llama.attention.key_length", "mistral3.attention.key_length", "qwen35.attention.key_length"])
             .map(|v| v as usize)
             .unwrap_or(cfg.head_dim);
 
         // Attention interval (M7) — for hybrid SSM/Transformer models like Qwen3.5
-        cfg.attention_interval = Self::get_meta_int(file, &[&format!("{}.full_attention_interval", prefix), "qwen35.full_attention_interval"])
+        cfg.attention_interval = Self::get_meta_int(file, &[&format!("{}.full_attention_interval", prefix), "qwen35.full_attention_interval", "mistral3.full_attention_interval"])
             .map(|v| v as usize)
             .unwrap_or(1);
 

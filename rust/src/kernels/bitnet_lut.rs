@@ -125,50 +125,51 @@ pub fn bitnet_matmul_lut_neon(a: &[f32], b_packed: &[u8], c: &mut [f32], m: usiz
     for i in 0..m {
         let mut j = 0;
         while j + 4 <= n {
-            // 4 output accumulators in parallel
-            let mut acc0 = vdupq_n_f32(0.0);
-            let mut acc1 = vdupq_n_f32(0.0);
-            let mut acc2 = vdupq_n_f32(0.0);
-            let mut acc3 = vdupq_n_f32(0.0);
+            unsafe {
+                // 4 output accumulators in parallel
+                let mut acc0 = vdupq_n_f32(0.0);
+                let mut acc1 = vdupq_n_f32(0.0);
+                let mut acc2 = vdupq_n_f32(0.0);
+                let mut acc3 = vdupq_n_f32(0.0);
 
-            for blk in 0..k_blocks {
-                let block_offset_base = blk * BITNET_BLOCK_BYTES;
-                let k_start = blk * BITNET_BLOCK_SIZE;
-                let k_end = (k_start + BITNET_BLOCK_SIZE).min(k);
-                let valid_in_block = k_end - k_start;
-                let bytes_to_process = valid_in_block / 4;
+                for blk in 0..k_blocks {
+                    let _block_offset_base = blk * BITNET_BLOCK_BYTES;
+                    let k_start = blk * BITNET_BLOCK_SIZE;
+                    let k_end = (k_start + BITNET_BLOCK_SIZE).min(k);
+                    let valid_in_block = k_end - k_start;
+                    let bytes_to_process = valid_in_block / 4;
 
-                for col in 0..4 {
-                    let block_offset = ((j + col) * k_blocks + blk) * BITNET_BLOCK_BYTES;
-                    let block = &b_packed[block_offset..block_offset + BITNET_BLOCK_BYTES];
-                    let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
-                    let weights = &block[2..34];
-                    let s = vdupq_n_f32(scale);
+                    for col in 0..4 {
+                        let block_offset = ((j + col) * k_blocks + blk) * BITNET_BLOCK_BYTES;
+                        let block = &b_packed[block_offset..block_offset + BITNET_BLOCK_BYTES];
+                        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+                        let weights = &block[2..34];
+                        let s = vdupq_n_f32(scale);
 
-                    let mut acc_ptr = match col {
-                        0 => &mut acc0,
-                        1 => &mut acc1,
-                        2 => &mut acc2,
-                        _ => &mut acc3,
-                    };
+                        let acc_ptr = match col {
+                            0 => &mut acc0,
+                            1 => &mut acc1,
+                            2 => &mut acc2,
+                            _ => &mut acc3,
+                        };
 
-                    for byte_idx in 0..bytes_to_process {
-                        let k_pos = k_start + byte_idx * 4;
-                        let a_vec = vld1q_f32(a.as_ptr().add(i * k + k_pos));
-                        let byte = weights[byte_idx] as usize;
-                        // Load 4 decoded weights from LUT
-                        let w = vld1q_f32(LUT[byte].as_ptr());
-                        *acc_ptr = vfmaq_f32(*acc_ptr, vmulq_f32(w, s), a_vec);
+                        for byte_idx in 0..bytes_to_process {
+                            let k_pos = k_start + byte_idx * 4;
+                            let a_vec = vld1q_f32(a.as_ptr().add(i * k + k_pos));
+                            let byte = weights[byte_idx] as usize;
+                            // Load 4 decoded weights from LUT
+                            let w = vld1q_f32(LUT[byte].as_ptr());
+                            *acc_ptr = vfmaq_f32(*acc_ptr, vmulq_f32(w, s), a_vec);
+                        }
                     }
                 }
+
+                // Sum the 4 lanes and store
+                c[i * n + j]     = vaddvq_f32(acc0);
+                c[i * n + j + 1] = vaddvq_f32(acc1);
+                c[i * n + j + 2] = vaddvq_f32(acc2);
+                c[i * n + j + 3] = vaddvq_f32(acc3);
             }
-
-            // Sum the 4 lanes and store
-            c[i * n + j]     = vaddvq_f32(acc0);
-            c[i * n + j + 1] = vaddvq_f32(acc1);
-            c[i * n + j + 2] = vaddvq_f32(acc2);
-            c[i * n + j + 3] = vaddvq_f32(acc3);
-
             j += 4;
         }
 

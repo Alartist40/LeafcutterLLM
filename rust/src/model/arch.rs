@@ -119,6 +119,9 @@ impl ModelArchitecture {
                 ("attn_k.weight",     "self_attn.k_proj.weight"),
                 ("attn_v.weight",     "self_attn.v_proj.weight"),
                 ("attn_output.weight","self_attn.o_proj.weight"),
+                // Q/K per-head RMSNorm (Qwen3.5-style)
+                ("attn_q_norm.weight", "attn_q_norm.weight"),
+                ("attn_k_norm.weight", "attn_k_norm.weight"),
                 // Fused attention (SSM layers use fused QKV)
                 ("attn_qkv.weight",   "self_attn.qkv_proj.weight"),
                 ("attn_gate.weight",  "self_attn.gate_proj.weight"),

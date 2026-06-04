@@ -289,6 +289,13 @@ impl Tensor {
         Self::from_vec_with_backend(data, self.shape.clone(), self.backend)
     }
 
+    /// RMSNorm with weight offset: x * rsqrt(mean(x^2) + epsilon) * (weight + offset)
+    pub fn rms_norm_with_offset(&self, weight: &Tensor, eps: f32, weight_offset: f32) -> Tensor {
+        let hidden_size = self.shape.last().copied().unwrap_or(1);
+        let data = self.backend.rms_norm_with_offset(&self.data, &weight.data, eps, hidden_size, weight_offset);
+        Self::from_vec_with_backend(data, self.shape.clone(), self.backend)
+    }
+
     /// SiLU activation: x * sigmoid(x)
     pub fn silu(&self) -> Tensor {
         let data = self.backend.silu(&self.data);

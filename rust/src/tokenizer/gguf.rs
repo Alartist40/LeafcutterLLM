@@ -4,6 +4,7 @@
 //! longest-match tokenization. This is a pragmatic fallback when a
 //! full HuggingFace `tokenizer.json` is not available.
 
+use crate::model::gguf::{GGUFile, GGUFValue};
 use std::collections::HashMap;
 
 pub struct GgufTokenizer {
@@ -144,6 +145,197 @@ impl GgufTokenizer {
 
     pub fn bos_id(&self) -> Option<usize> { self.bos_id }
     pub fn eos_id(&self) -> Option<usize> { self.eos_id }
+
+    /// Load tokenizer vocabulary directly from a GGUF file.
+    pub fn from_gguf(path: &str) -> Option<Self> {
+        let file = GGUFile::open(path).ok()?;
+        let vocab: Vec<String> = match file.metadata.get("tokenizer.ggml.tokens") {
+            Some(GGUFValue::Array(arr)) => {
+                arr.iter()
+                    .map(|v| match v {
+                        GGUFValue::String(s) => s.clone(),
+                        _ => String::new(),
+                    })
+                    .collect()
+            }
+            _ => return None,
+        };
+        if vocab.is_empty() {
+            return None;
+        }
+        Some(Self::from_vocab(vocab))
+    }
+}
+
+/// BPE-aware tokenizer using GGUF vocab.
+///
+/// Handles the BPE space convention (Ġ prefix for words after whitespace)
+/// and newline markers (Ċ = U+010A). More accurate than plain greedy
+/// longest-match for Llama, Mistral, and Ministral models.
+pub struct GgufBpeTokenizer {
+    vocab_sorted: Vec<(String, usize)>, // (token_string, token_id), longest first
+    vocab_map: HashMap<String, usize>,
+    bos_token: usize,
+    eos_token: usize,
+    vocab: Vec<String>,
+}
+
+impl GgufBpeTokenizer {
+    pub fn new(vocab: Vec<String>, bos: usize, eos: usize) -> Self {
+        let vocab_map: HashMap<String, usize> = vocab.iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i))
+            .collect();
+
+        let mut vocab_sorted: Vec<(String, usize)> = vocab.clone().into_iter()
+            .enumerate()
+            .map(|(i, s)| (s, i))
+            .collect();
+        vocab_sorted.sort_by(|a, b| {
+            b.0.len().cmp(&a.0.len())
+                .then_with(|| a.1.cmp(&b.1))
+        });
+
+        Self { vocab_sorted, vocab_map, bos_token: bos, eos_token: eos, vocab }
+    }
+
+    /// Load BPE tokenizer directly from a GGUF file.
+    pub fn from_gguf(path: &str) -> Option<Self> {
+        let file = GGUFile::open(path).ok()?;
+        let vocab: Vec<String> = match file.metadata.get("tokenizer.ggml.tokens") {
+            Some(GGUFValue::Array(arr)) => {
+                arr.iter()
+                    .map(|v| match v {
+                        GGUFValue::String(s) => s.clone(),
+                        _ => String::new(),
+                    })
+                    .collect()
+            }
+            _ => return None,
+        };
+        if vocab.is_empty() {
+            return None;
+        }
+        let bos = file.get_metadata_int("tokenizer.ggml.bos_token_id")
+            .map(|v| v as usize)
+            .unwrap_or(1);
+        let eos = file.get_metadata_int("tokenizer.ggml.eos_token_id")
+            .map(|v| v as usize)
+            .unwrap_or(2);
+        Some(Self::new(vocab, bos, eos))
+    }
+
+    pub fn vocab_size(&self) -> usize {
+        self.vocab.len()
+    }
+
+    /// Encode text to token IDs using greedy longest-match with BPE conventions.
+    pub fn encode(&self, text: &str) -> Vec<usize> {
+        let mut tokens = vec![self.bos_token];
+
+        let words: Vec<&str> = text.split_whitespace().collect();
+        if words.is_empty() {
+            return tokens;
+        }
+
+        // First word: try without Ġ prefix first
+        let first = words[0];
+        let first_with_g = format!("\u{0120}{}", first);
+        if self.vocab_map.contains_key(&first_with_g) {
+            self.greedy_encode(&first_with_g, &mut tokens);
+        } else {
+            self.greedy_encode(first, &mut tokens);
+        }
+
+        // Subsequent words: prepend Ġ, then greedy match subpieces
+        for word in &words[1..] {
+            let with_g = format!("\u{0120}{}", word);
+            self.greedy_encode(&with_g, &mut tokens);
+        }
+
+        tokens
+    }
+
+    fn greedy_encode(&self, text: &str, tokens: &mut Vec<usize>) {
+        let mut remaining = text;
+
+        while !remaining.is_empty() {
+            let mut matched = false;
+
+            for (token_str, token_id) in &self.vocab_sorted {
+                if remaining.starts_with(token_str) {
+                    tokens.push(*token_id);
+                    remaining = &remaining[token_str.len()..];
+                    matched = true;
+                    break;
+                }
+            }
+
+            if !matched {
+                if let Some(first_char) = remaining.chars().next() {
+                    let char_str = first_char.to_string();
+                    if let Some(&id) = self.vocab_map.get(&char_str) {
+                        tokens.push(id);
+                    } else {
+                        for byte in char_str.bytes() {
+                            let byte_token = format!("<0x{:02X}>", byte);
+                            if let Some(&id) = self.vocab_map.get(&byte_token) {
+                                tokens.push(id);
+                            }
+                        }
+                    }
+                    remaining = &remaining[first_char.len_utf8()..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Decode token IDs back to text.
+    /// Handles BPE space markers (Ġ → literal space) and newline markers (Ċ → \n).
+    pub fn decode(&self, tokens: &[usize]) -> String {
+        let mut result = String::new();
+        let space_marker = '\u{0120}';
+
+        for &token_id in tokens {
+            // Skip special tokens
+            if token_id == self.bos_token || token_id == self.eos_token {
+                continue;
+            }
+
+            if let Some(token_str) = self.vocab.get(token_id) {
+                // Skip other special tokens
+                if token_str.starts_with('<') && token_str.ends_with('>') {
+                    if token_str == "<0x0A>" {
+                        result.push('\n');
+                        continue;
+                    }
+                    if token_str.starts_with("<0x") {
+                        if let Ok(byte) = u8::from_str_radix(&token_str[3..token_str.len()-1], 16) {
+                            result.push(byte as char);
+                        }
+                        continue;
+                    }
+                    // Skip other special tokens like <|begin_of_text|>, etc.
+                    if token_str.starts_with("<|") {
+                        continue;
+                    }
+                }
+
+                if token_str.starts_with(space_marker) {
+                    // Ġ prefix → add space before
+                    result.push(' ');
+                    result.push_str(&token_str[space_marker.len_utf8()..]);
+                } else {
+                    // Replace BPE newline markers (Ċ = U+010A = byte 0x0A)
+                    let cleaned = token_str.replace('\u{010A}', "\n");
+                    result.push_str(&cleaned);
+                }
+            }
+        }
+        result
+    }
 }
 
 #[cfg(test)]

@@ -86,6 +86,10 @@ impl Backend for OpenBlasBackend {
         CPU_BACKEND.rms_norm(x, weight, eps, hidden_size)
     }
 
+    fn rms_norm_with_offset(&self, x: &[f32], weight: &[f32], eps: f32, hidden_size: usize, weight_offset: f32) -> Vec<f32> {
+        CPU_BACKEND.rms_norm_with_offset(x, weight, eps, hidden_size, weight_offset)
+    }
+
     fn silu(&self, x: &[f32]) -> Vec<f32> {
         CPU_BACKEND.silu(x)
     }

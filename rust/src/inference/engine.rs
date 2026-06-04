@@ -85,21 +85,6 @@ impl Engine {
         let model = GGUFModel::load(path)?;
         let arch = model.architecture;
 
-        // ── Qwen3.5/3.6 ALWAYS need FFI ──────────────────────────────
-        if arch == ModelArchitecture::Qwen35 || arch == ModelArchitecture::Qwen36 {
-            if !crate::llama_ffi::is_available() {
-                return Err(
-                    "Qwen3.5/3.6 models require llama.cpp FFI. \
-                     Build with: cargo build --features llama-ffi".into()
-                );
-            }
-            eprintln!("  Using llama.cpp FFI backend for {}", arch.name());
-            #[cfg(feature = "llama-ffi")]
-            return Self::load_ffi(path);
-            #[cfg(not(feature = "llama-ffi"))]
-            return Err("Qwen3.5/3.6 models require llama.cpp FFI.".into());
-        }
-
         // ── Native path ──────────────────────────────────────────────
         // Run pre-flight capability report
         let report = model.capability_report();
@@ -292,6 +277,7 @@ impl Engine {
                         conv_dim,
                         conv_kernel,
                         state_size: head_v_dim,
+                        norm_eps: config.norm_eps,
                     };
                 }
             }
@@ -335,6 +321,7 @@ impl Engine {
                 head_dim: config.head_dim,
                 kv_head_dim: config.kv_head_dim,
                 rope_theta: config.rope_theta,
+                rope_dim: config.rope_dim,
                 use_fused_qkv: false,
                 use_gate: false,
                 window_size,
@@ -368,6 +355,7 @@ impl Engine {
             head_dim,
             kv_head_dim,
             rope_theta,
+            rope_dim: config.rope_dim,
             use_fused_qkv: false,
             use_gate: false,
             window_size,
@@ -482,7 +470,7 @@ impl Engine {
             let pre_norm_weight = layer_weights.get("input_layernorm.weight")
                 .or_else(|| layer_weights.get("attn_norm.weight"))
                 .expect("Missing pre-norm");
-            let normed = hidden.rms_norm(pre_norm_weight, 1e-5);
+            let normed = hidden.rms_norm(pre_norm_weight, self.config.norm_eps);
 
             if has_standard_attn {
                 let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
@@ -499,7 +487,7 @@ impl Engine {
             let post_norm_weight = layer_weights.get("post_attention_layernorm.weight")
                 .or_else(|| layer_weights.get("ffn_norm.weight"))
                 .expect("Missing post-norm");
-            let normed = hidden.rms_norm(post_norm_weight, 1e-5);
+            let normed = hidden.rms_norm(post_norm_weight, self.config.norm_eps);
             let ffn_out = Self::ffn_forward(&normed, &layer_weights);
             hidden = hidden.add(&ffn_out);
 
@@ -511,7 +499,7 @@ impl Engine {
         // Final norm
         let final_norm = self.special_weights.get("model.norm.weight")
             .expect("Missing final norm");
-        hidden = hidden.rms_norm(final_norm, 1e-5);
+        hidden = hidden.rms_norm(final_norm, self.config.norm_eps);
 
         // LM head — computed via outer-product over rows from mmap (no full matrix in RAM)
         let mut logits = if self.lm_head_tied {
@@ -566,7 +554,7 @@ impl Engine {
             let pre_norm_weight = layer_weights.get("input_layernorm.weight")
                 .or_else(|| layer_weights.get("attn_norm.weight"))
                 .expect("Missing pre-norm");
-            let normed = hidden.rms_norm(pre_norm_weight, 1e-5);
+            let normed = hidden.rms_norm(pre_norm_weight, self.config.norm_eps);
 
             if has_standard_attn {
                 let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
@@ -579,7 +567,7 @@ impl Engine {
             let post_norm_weight = layer_weights.get("post_attention_layernorm.weight")
                 .or_else(|| layer_weights.get("ffn_norm.weight"))
                 .expect("Missing post-norm");
-            let normed = hidden.rms_norm(post_norm_weight, 1e-5);
+            let normed = hidden.rms_norm(post_norm_weight, self.config.norm_eps);
             let ffn_out = Self::ffn_forward(&normed, &layer_weights);
             hidden = hidden.add(&ffn_out);
 
@@ -593,7 +581,7 @@ impl Engine {
 
         let final_norm = self.special_weights.get("model.norm.weight")
             .expect("Missing final norm");
-        hidden = hidden.rms_norm(final_norm, 1e-5);
+        hidden = hidden.rms_norm(final_norm, self.config.norm_eps);
         println!("   [final norm] RSS: {} MB", read_rss_kb() / 1024);
 
         let mut logits = if self.lm_head_tied {

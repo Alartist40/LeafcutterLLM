@@ -49,8 +49,8 @@ fn main() {
     // RoPE
     let mut q_tensor = Tensor::from_vec(q.data.clone(), vec![1, engine.attn_params.num_heads, engine.attn_params.head_dim]);
     let mut k_tensor = Tensor::from_vec(k.data.clone(), vec![1, engine.attn_params.num_kv_heads, engine.attn_params.kv_head_dim]);
-    apply_rotary_emb(&mut q_tensor, 1, engine.attn_params.num_heads, engine.attn_params.head_dim, engine.attn_params.rope_theta, 0);
-    apply_rotary_emb(&mut k_tensor, 1, engine.attn_params.num_kv_heads, engine.attn_params.kv_head_dim, engine.attn_params.rope_theta, 0);
+    apply_rotary_emb(&mut q_tensor, 1, engine.attn_params.num_heads, engine.attn_params.head_dim, engine.attn_params.rope_dim, engine.attn_params.rope_theta, 0);
+    apply_rotary_emb(&mut k_tensor, 1, engine.attn_params.num_kv_heads, engine.attn_params.kv_head_dim, engine.attn_params.rope_dim, engine.attn_params.rope_theta, 0);
     println!("q after rope: min={:.6} max={:.6}", q_tensor.data.iter().cloned().fold(f32::INFINITY, f32::min), q_tensor.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
     println!("k after rope: min={:.6} max={:.6}", k_tensor.data.iter().cloned().fold(f32::INFINITY, f32::min), k_tensor.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max));
 

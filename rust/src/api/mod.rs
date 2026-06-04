@@ -1,16 +1,8 @@
-//! HTTP API server using Axum — Direct llama.cpp FFI backend
+//! HTTP API server using Axum — Direct llama.cpp FFI backend OR Native Streaming
 //!
 //! Only compiled when the `llama-ffi` feature is enabled.
 
 #![cfg(feature = "llama-ffi")]
-//!
-//! Uses the existing `llama_ffi` module (already built and tested).
-//! The server returns decoded text so clients don't need their own tokenizer.
-//!
-//! Endpoints:
-//!   GET  /health                — health check
-//!   POST /generate              — text generation (returns text + tokens for compat)
-//!   POST /v1/chat/completions   — OpenAI-compatible chat API
 
 use axum::{
     routing::{get, post},
@@ -23,9 +15,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::llama_ffi::{backend_init, backend_free, LlamaModel, LlamaContext};
+use crate::inference::engine::Engine as NativeEngine;
+use crate::tokenizer::{Tokenizer, GgufBpeTokenizer};
 
 // ---------------------------------------------------------------------------
-// /generate endpoint — matches old LeafcutterLLM API but NOW returns text
+// Types
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -45,8 +39,6 @@ fn default_max_tokens() -> usize { 256 }
 fn default_temperature() -> f32 { 0.7 }
 fn default_top_p() -> f32 { 0.9 }
 
-/// Response format — NOW includes `text` so clients don't need a tokenizer.
-/// `tokens` kept for backward compatibility but `text` is the primary field.
 #[derive(Serialize, Deserialize)]
 pub struct GenerateResponse {
     pub id: String,
@@ -59,19 +51,12 @@ pub struct GenerateResponse {
     pub error: String,
 }
 
-// ---------------------------------------------------------------------------
-// /health endpoint
-// ---------------------------------------------------------------------------
-
 #[derive(Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
+    pub engine: String,
 }
-
-// ---------------------------------------------------------------------------
-// /v1/chat/completions endpoint (OpenAI-compatible)
-// ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -110,7 +95,16 @@ pub struct Choice {
 }
 
 // ---------------------------------------------------------------------------
-// Engine wrapper — thin state around LlamaModel (context created per request)
+// Unified Engine Trait
+// ---------------------------------------------------------------------------
+
+pub trait LeafcutterEngine: Send + Sync {
+    fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<(String, Vec<usize>), String>;
+    fn name(&self) -> &str;
+}
+
+// ---------------------------------------------------------------------------
+// FFI Engine (Standard llama.cpp behavior)
 // ---------------------------------------------------------------------------
 
 pub struct FfiEngine {
@@ -129,30 +123,64 @@ impl FfiEngine {
             threads: 4,
         })
     }
+}
 
-    pub fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<(String, Vec<usize>), String> {
-        // Fresh context per request — avoids KV cache contamination
+impl LeafcutterEngine for FfiEngine {
+    fn name(&self) -> &str { "llama-ffi" }
+    fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<(String, Vec<usize>), String> {
         let mut ctx = LlamaContext::new(&self.model, self.ctx_size, self.threads)
             .map_err(|e| format!("Failed to create context: {}", e))?;
 
         let prompt_tokens = ctx.tokenize(prompt, true, true);
-        if prompt_tokens.is_empty() {
-            return Err("Empty prompt after tokenization".to_string());
-        }
+        if prompt_tokens.is_empty() { return Err("Empty prompt".to_string()); }
 
         let eos = self.model.eos_token();
         let generated = ctx.generate(&prompt_tokens, max_tokens, temperature, eos);
 
-        let text: String = generated.iter()
-            .map(|&t| ctx.token_to_piece(t))
-            .collect();
-
+        let text: String = generated.iter().map(|&t| ctx.token_to_piece(t)).collect();
         let tokens: Vec<usize> = generated.iter().map(|&t| t as usize).collect();
         Ok((text, tokens))
     }
 }
 
-pub type SharedEngine = Arc<FfiEngine>;
+// ---------------------------------------------------------------------------
+// Native Streaming Engine (The "Leafcutter" Magic)
+// ---------------------------------------------------------------------------
+
+pub struct NativeStreamingEngine {
+    engine: std::sync::Mutex<NativeEngine>,
+    tokenizer: Arc<dyn crate::tokenizer::BaseTokenizer + Send + Sync>,
+}
+
+impl NativeStreamingEngine {
+    pub fn load(path: &str) -> Result<Self, String> {
+        let engine = NativeEngine::load(path).map_err(|e| e.to_string())?;
+        
+        // Use GGUF-native tokenizer
+        let tokenizer = GgufBpeTokenizer::from_gguf(path)
+            .ok_or_else(|| "No tokenizer found in GGUF".to_string())?;
+
+        Ok(Self {
+            engine: std::sync::Mutex::new(engine),
+            tokenizer: Arc::new(tokenizer),
+        })
+    }
+}
+
+impl LeafcutterEngine for NativeStreamingEngine {
+    fn name(&self) -> &str { "native-streaming" }
+    fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<(String, Vec<usize>), String> {
+        let mut engine = self.engine.lock().map_err(|_| "Engine lock poisoned")?;
+        let tokens = self.tokenizer.encode(prompt);
+        
+        let generated = engine.generate(&tokens, max_tokens, temperature, 0.9);
+        let text = self.tokenizer.decode(&generated);
+        
+        Ok((text, generated))
+    }
+}
+
+pub type SharedEngine = Arc<dyn LeafcutterEngine>;
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -181,10 +209,11 @@ pub async fn generate_handler(
     }))
 }
 
-pub async fn health_handler(_state: State<SharedEngine>) -> Json<HealthResponse> {
+pub async fn health_handler(State(engine): State<SharedEngine>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
-        version: "leafcutter-ffi v0.9.0".to_string(),
+        version: "v0.9.5-production".to_string(),
+        engine: engine.name().to_string(),
     })
 }
 
@@ -236,10 +265,7 @@ pub fn create_app(engine: SharedEngine) -> Router {
 pub async fn run_server(engine: SharedEngine, port: u16) {
     let app = create_app(engine);
     let addr = format!("0.0.0.0:{}", port);
-    println!("🚀 Leafcutter FFI server listening on http://{}", addr);
-    println!("   GET  /health");
-    println!("   POST /generate");
-    println!("   POST /v1/chat/completions");
+    println!("🚀 Leafcutter server listening on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();

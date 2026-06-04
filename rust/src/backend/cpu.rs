@@ -72,6 +72,21 @@ impl Backend for CpuBackend {
         result
     }
 
+    fn rms_norm_with_offset(&self, x: &[f32], weight: &[f32], eps: f32, hidden_size: usize, weight_offset: f32) -> Vec<f32> {
+        let rows = x.len() / hidden_size;
+        let mut result = vec![0.0f32; x.len()];
+        for r in 0..rows {
+            let start = r * hidden_size;
+            let slice = &x[start..start + hidden_size];
+            let mean_sq = simd::simd_sum_sq(slice) / hidden_size as f32;
+            let scale = 1.0 / (mean_sq + eps).sqrt();
+            for i in 0..hidden_size {
+                result[start + i] = slice[i] * scale * (weight[i] + weight_offset);
+            }
+        }
+        result
+    }
+
     fn silu(&self, x: &[f32]) -> Vec<f32> {
         x.iter().map(|&v| v * (1.0 / (1.0 + (-v).exp()))).collect()
     }
