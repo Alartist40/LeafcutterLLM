@@ -20,6 +20,12 @@ pub enum ModelArchitecture {
     Yi,
     Nemotron,
     Falcon,
+    /// DeepSeek-2/V3 family (Kimi K2.6, DeepSeek-V3, etc.).
+    /// MLA attention + routed MoE + optional shared expert.
+    DeepSeek2,
+    /// GLM-DSA / Z.AI DeepSeek-Sparse-Attention models.
+    /// Extends DeepSeek-2 with a sparse-attention indexer + MTP heads.
+    GlmDsa,
     Unknown,
 }
 
@@ -36,10 +42,12 @@ impl ModelArchitecture {
                 "mistral3" => ModelArchitecture::Mistral,
                 "phi" | "phi3" | "phi4" => ModelArchitecture::Phi,
                 "gemma" | "gemma2" | "gemma3" => ModelArchitecture::Gemma,
-                "yi"       => ModelArchitecture::Yi,
+                "yi" => ModelArchitecture::Yi,
                 "nemotron" | "nvidia_nemotron" => ModelArchitecture::Nemotron,
                 "falcon" | "falcon3" | "falcon2" => ModelArchitecture::Falcon,
-                _          => ModelArchitecture::Unknown,
+                "deepseek2" | "deepseek" => ModelArchitecture::DeepSeek2,
+                "glm-dsa" => ModelArchitecture::GlmDsa,
+                _ => ModelArchitecture::Unknown,
             }
         } else {
             ModelArchitecture::Unknown
@@ -58,7 +66,9 @@ impl ModelArchitecture {
             ModelArchitecture::Gemma   => "Gemma",
             ModelArchitecture::Yi      => "Yi",
             ModelArchitecture::Nemotron => "Nemotron",
-            ModelArchitecture::Falcon  => "Falcon",
+            ModelArchitecture::Falcon => "Falcon",
+            ModelArchitecture::DeepSeek2 => "DeepSeek-2",
+            ModelArchitecture::GlmDsa => "GLM-DSA",
             ModelArchitecture::Unknown => "Unknown",
         }
     }
@@ -75,8 +85,10 @@ impl ModelArchitecture {
             ModelArchitecture::Gemma   => "gemma",
             ModelArchitecture::Yi       => "llama", // Yi uses llama.* keys in GGUF
             ModelArchitecture::Nemotron => "llama", // Nemotron uses llama.* keys
-            ModelArchitecture::Falcon   => "falcon", // Falcon uses falcon.* keys
-            ModelArchitecture::Unknown  => "llama", // best-effort fallback
+            ModelArchitecture::Falcon => "falcon", // Falcon uses falcon.* keys
+            ModelArchitecture::DeepSeek2 => "deepseek2",
+            ModelArchitecture::GlmDsa => "glm-dsa",
+            ModelArchitecture::Unknown => "llama", // best-effort fallback
         }
     }
 
@@ -211,6 +223,15 @@ impl ModelArchitecture {
                 "moe_gate.weight",
                 "moe_norm.weight",
                 "expert_gate.weight",
+                // Shared MoE experts (Qwen3.6 architecture)
+                "ffn_gate_shexp.weight",
+                "ffn_up_shexp.weight",
+                "ffn_down_shexp.weight",
+                // NextN / MTP layer projections
+                "nextn.embed_tokens.weight",
+                "nextn.shared_head.weight",
+                "nextn.enorm.weight",
+                "nextn.hnorm.weight",
             ],
             ModelArchitecture::Llama => &[
                 "attn_norm.bias",
@@ -373,5 +394,25 @@ mod tests {
     #[test]
     fn test_falcon_not_supported() {
         assert!(!ModelArchitecture::Falcon.is_supported());
+    }
+
+    #[test]
+    fn test_detect_deepseek2() {
+        let f = mock_gguf_with_arch("deepseek2");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::DeepSeek2);
+    }
+
+    #[test]
+    fn test_detect_glm_dsa() {
+        let f = mock_gguf_with_arch("glm-dsa");
+        assert_eq!(ModelArchitecture::detect(&f), ModelArchitecture::GlmDsa);
+    }
+
+    #[test]
+    fn test_deepseek2_meta_prefix_and_name() {
+        assert_eq!(ModelArchitecture::DeepSeek2.metadata_prefix(), "deepseek2");
+        assert_eq!(ModelArchitecture::DeepSeek2.name(), "DeepSeek-2");
+        assert_eq!(ModelArchitecture::GlmDsa.metadata_prefix(), "glm-dsa");
+        assert_eq!(ModelArchitecture::GlmDsa.name(), "GLM-DSA");
     }
 }

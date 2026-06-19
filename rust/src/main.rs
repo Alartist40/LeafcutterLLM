@@ -41,7 +41,7 @@ enum Commands {
     /// Start the HTTP API server (OpenAI-compatible)
     Server {
         /// Path to GGUF model file
-        #[arg(short, long, default_value = "/home/xander/Documents/portfolio/AI Models/Qwen3.5-9B-IQ4_NL.gguf")]
+        #[arg(short, long, default_value = "")]
         model: String,
         /// HTTP port to listen on
         #[arg(short, long, default_value_t = 8081)]
@@ -425,7 +425,7 @@ fn cmd_generate_native(
     max_tokens: usize,
     temperature: f32,
 ) {
-    use leafcutter::tokenizer::{Tokenizer, GgufBpeTokenizer};
+    use leafcutter::tokenizer::{Tokenizer, GgufBpeTokenizer, BaseTokenizer};
     use leafcutter::inference::engine::Engine;
 
     eprintln!("🌿 LeafcutterLLM Native Engine (no llama.cpp FFI)");
@@ -518,7 +518,7 @@ fn cmd_generate_native(
 
     let generated = engine.generate(&tokens, max_tokens, temperature, 0.9);
     let text = if use_hf {
-        hf_tok.as_ref().unwrap().decode(&generated, false)
+        hf_tok.as_ref().unwrap().decode(&generated)
     } else {
         gguf_tok.as_ref().unwrap().decode(&generated)
     };

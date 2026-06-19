@@ -18,6 +18,11 @@ pub trait BaseTokenizer: Send + Sync {
     fn vocab_size(&self) -> usize;
 }
 
+// Re-export the trait under its short name so callers can write
+// `use leafcutter::tokenizer::BaseTokenizer;` and use the methods
+// directly on `Tokenizer` / `GgufBpeTokenizer` (or their `dyn`s).
+pub use BaseTokenizer as _;
+
 pub struct Tokenizer {
     inner: HFTokenizer,
 }
@@ -52,6 +57,15 @@ impl BaseTokenizer for Tokenizer {
     }
 }
 
+// Inherent method aliases so callers can write `tok.vocab_size()` without
+// importing the `BaseTokenizer` trait.  These forward to the trait impls.
+#[allow(dead_code)]
+impl Tokenizer {
+    pub fn encode_into(&self, text: &str) -> Vec<usize> { <Self as BaseTokenizer>::encode(self, text) }
+    pub fn decode_into(&self, tokens: &[usize]) -> String { <Self as BaseTokenizer>::decode(self, tokens) }
+    pub fn vocab_size_inherent(&self) -> usize { <Self as BaseTokenizer>::vocab_size(self) }
+}
+
 impl BaseTokenizer for GgufBpeTokenizer {
     fn encode(&self, text: &str) -> Vec<usize> {
         self.encode(text)
@@ -62,4 +76,11 @@ impl BaseTokenizer for GgufBpeTokenizer {
     fn vocab_size(&self) -> usize {
         self.vocab_size()
     }
+}
+
+#[allow(dead_code)]
+impl GgufBpeTokenizer {
+    pub fn encode_into(&self, text: &str) -> Vec<usize> { <Self as BaseTokenizer>::encode(self, text) }
+    pub fn decode_into(&self, tokens: &[usize]) -> String { <Self as BaseTokenizer>::decode(self, tokens) }
+    pub fn vocab_size_inherent(&self) -> usize { <Self as BaseTokenizer>::vocab_size(self) }
 }

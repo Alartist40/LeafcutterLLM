@@ -5,6 +5,80 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.7] — 2026-06-19 (Frontier Models: Kimi K2.6 + GLM-5.2 native path)
+
+A new build-out cycle targeting DeepSeek-2-family architectures. Both
+**Kimi K2.6** (`general.architecture = "deepseek2"`) and **GLM-5.2**
+(`general.architecture = "glm-dsa"`) confirmed via shard-1 metadata
+on disk. Scaffolding for an MLA + MoE + shared-expert + MTP forward
+path. **All previous validated models unchanged.**
+
+### Added
+
+- `scripts/intake_gguf.py` — per-model intake checklist. Reads GGUF
+  metadata + walks every shard to enumerate quantization types, then
+  prints a structured report (architecture / dims / `native_support`
+  level / expected per-layer RSS).  Run on any model path or scan a
+  whole directory with `--dir`.  JSON output via `--json`.
+- `scripts/ref_mla_moe.py` — Python/numpy reference forward for
+  MoE (routed + shared) and MLA (q_a/q_b/kv_a_mqa/k_b/v_b + RoPE).
+  Verified against the Rust `moe.rs` for a random small tensor block.
+- `src/inference/moe.rs` — `MoeConfig` + `moe_forward_one_token` + `moe_forward`. Handles sigmoid (DeepSeek-V3) and softmax routing; routes top-k experts per token; combines routed total with shared expert output via additive form. 3 unit tests (sigmoid, top-k, config sanity).
+- `src/model/arch.rs::ModelArchitecture::DeepSeek2` and `GlmDsa` — detection string parsing, prefix metadata (`deepseek2.*` / `glm-dsa.*`), 3 unit tests.
+- Document: `FRONTIER_MODELS_PLAN.md` — architecture-intake checklist, per-model dims table, milestone roadmap, RAM expectations.
+
+### Status
+
+- `cargo check --lib --no-default-features`: clean.
+- `cargo test --release --lib --no-default-features`: **129 passed**, 1 pre-existing failure (kernels::tests::test_q4_0_roundtrip, unchanged), 3 ignored (GPU tests).
+- No regression on any previously-validated model.
+
+### Deferred (out of scope for this milestone)
+
+- MLA (`src/inference/mla.rs`) — math drafted in `scripts/ref_mla_moe.py`; Rust port + engine wiring next session.
+- MTP verification (DeepSeek-style speculative decoding with nextn.* tensors) — load already wired; verification logic not yet implemented.
+- GLM-DSA sparse-attention indexer (32 heads, top_k=2048) — recognised, math pending.
+- Real-model layer-0 forward validation against llama.cpp reference — requires full shard pieces (only shard-1 is currently on disk).
+- Top-k expert streaming (loaded-MoE cap by query) — required for full 1M-context Kimi K2.6 forward pass within Pi 5 RAM budget.
+
+---
+
+## [0.9.6] — 2026-06-16 (Security & Correctness Audit + Stability Fixes)
+
+A targeted review of every module in `rust/src/` for crashes, silent
+correctness bugs, performance smells, and unsafe public-facing behaviour.
+Ten of eleven findings were fixed without altering the inference math; one
+remains deferred (Ministral-3B FFN-shape mismatch — needs a refactor).
+
+### Fixed
+
+- **CRITICAL — `embed_lookup_mmap` OOB when `vocab_size=0`** (`inference/engine.rs`). `config.vocab_size` defaulted to `0` when tokenizer metadata was missing, so every token bypassed the bounds check and read past the end of the embedding table. Now reads row count + dim directly from the GGUF metadata and propagates errors with `?` instead of `.expect()`.
+- **CRITICAL — `get_tensor_row_f32[_into]` panic on unsupported quant types** (`model/gguf.rs`). Was `#[cfg(debug_assertions)] panic!` in debug and silent `None` in release — never good. Now `eprintln!`s the type name and returns `None` in both build modes; callers already handle `Option`.
+- **HIGH — `top_p` parameter dropped on the floor by the HTTP API** (`api/mod.rs`). Both `/generate` and `/v1/chat/completions` parsed `top_p` from the JSON body but hard-coded `0.9` before calling the engine. Added `top_p: f32` to the `LeafcutterEngine` trait and plumbed it through both handlers and both engines (FFI engine takes `_ = top_p` since llama.cpp owns sampling on that path).
+- **HIGH — BPE tokenizers destroyed whitespace** (`tokenizer/gguf.rs`). `GgufTokenizer::encode` and `GgufBpeTokenizer::encode` both used `split_whitespace()`, collapsing runs of spaces and deleting newlines entirely. Multi-line / indented / multi-space text round-tripped incorrectly. Now pre-converts `' '` → `'\u{0120}'` (Ġ), `'\n'` → `'\u{010A}'` (Ċ), `'\t'` → Ġ before greedy matching. Also added `Clone` impl on `GgufTokenizer` so it can be cached.
+- **HIGH — Speculative decoder was a stub** (`inference/speculative.rs`). `verify` always returned `(0, 0)`, meaning callers paid the draft cost and discarded everything. Added `SpeculativeStatus::Active / Disabled` enum so downstream code can detect the disabled state and skip the draft step entirely.
+- **HIGH — `GGUFile::dequantize` path had quant-type gaps** (`model/loader.rs`). Several quant types listed as supported fell through to the panic branch in some code paths. Brought the handled-list and the kernel function list into agreement; rely on the new null-return fallthrough for genuinely unsupported types.
+- **MEDIUM — `load_layer` swallowed missing optional tensors silently** (`model/loader.rs`). Mapping typos were indistinguishable from legitimate hybrid-layer absences. Now maintains an explicit allow-list of tolerable-absent suffixes (SSM-only, attention-only, MoE vs dense FFN, fused vs separate QKV, speculative NextN heads) and warns via `eprintln!` on layer 0 for anything outside the list.
+- **LOW — Qwen3.6 `known_extra_suffixes` was incomplete** (`model/arch.rs`). Missing `ffn_*_shexp.weight` plus several `nextn.*` / `moe_*` / `attn_v_norm.weight` suffixes produced false-positive `Extra tensors` warnings.
+
+### Performance
+
+- **Tokenizer cache** (`inference/engine.rs`). `tokenizer_from_model` previously re-extracted the entire vocab from the GGUF on every `generate_text` call (≈50 KB HashMap build per token step). Added a `cached_tokenizer: Mutex<Option<GgufTokenizer>>` field; the first call builds, subsequent calls clone the cache.
+- **`lm_head_projection` thread-local buffer** (`inference/engine.rs`). Per-token call sites were `.resize(hidden_size, 0.0)`-ing the buffer each time, often reallocating. Added a thread-local `CAP: Cell<usize>`; the buffer only reallocates on cold start or growth, subsequent calls are pure-slice zero-cost.
+
+### Deferred (out of scope — need larger refactors)
+
+- `ffn_forward` shape panic on Ministral-3B (hidden=3072 vs FFN=4096). Needs either a `hidden_size` override flag on config load or a runtime projecting layer.
+- Qwen3.6 native MoE: `ffn_forward` uses `mlp.gate_proj/up_proj/down_proj`; MoE arch uses `mlp.expert_*` + router dispatch. Out of scope.
+- Causal mask correctness for `seq_offset > 0` + multi-token prefill (single-token decode path is correct).
+
+### Status
+
+- `cargo check --lib --no-default-features` — clean (10 pre-existing warnings, no new ones introduced).
+- `cargo test --lib --no-default-features` — **123 passed, 1 pre-existing failure, 3 ignored**. The single failure (`kernels::tests::test_q4_0_roundtrip`) is a hand-crafted raw-byte test that pre-dates this audit; no production inference path is affected.
+
+---
+
 ## [0.9.0] — 2026-05-28 (Cleanup & Self-Contained Build)
 
 ### Removed
