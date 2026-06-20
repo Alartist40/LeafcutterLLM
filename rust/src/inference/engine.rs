@@ -881,10 +881,12 @@ impl Engine {
     /// over routed experts + shared expert branch.  Driven by
     /// `crate::inference::moe::moe_forward_one_token`.
     ///
-    /// `tile_by_token` decides whether to slice the routed `*_exps.weight`
-    /// tensors by expert index on the engine side (true) or use the
-    /// already-sliced 2-D views in the weights map (false).  For layers that
-    /// the engine has stored at full shape this is true.
+    /// The engine's `load_layer()` returns routed `*_exps.weight` tensors
+    /// in their full 3-D shape `[out, in, num_experts]`.  We slice them
+    /// into per-expert 2-D views here so that the MoE module's
+    /// `moe_forward_one_token` API (which expects 2-D per-expert weights)
+    /// works without further changes.  Shared expert weights are already 2-D
+    /// and pass through unchanged.
     pub fn ffn_moe_forward(
         x: &Tensor,
         weights: &HashMap<String, Tensor>,
@@ -894,30 +896,62 @@ impl Engine {
         let seq_len = x.shape[0];
         let hidden_dim = x.shape[1];
 
-        // Build a per-token weights map with the indexed or shared expert
-        // slices.  For now we keep the parent map; the MoE module expects
-        // the routed tensors to be already 2-D per-expert.
-        // (The proper per-layer slicing is part of a later step; the
-        //  engine-level dispatch treats Hack-layers with non-moe tensors as
-        //  a no-op MoE skip and the engine falls back to the dense FFN
-        //  branch — that path is exercised by has_moe==false.)
-        let _ = has_shared_expert;
-        let _ = cfg;
+        // Slice routed experts into per-expert 2-D views.
+        let mut sliced: HashMap<String, Tensor> = HashMap::new();
+        // The two naming conventions seen in GGUF shards for Kimi / GLM-DSA:
+        //   * `ffn_gate_inp` / `ffn_*_exps`     (DeepSeek-2 convention)
+        //   * `mlp.expert_gate` / `mlp.expert_*` (Qwen-MoE convention)
+        // Support whichever appears.  Only one of the two pairs is loaded
+        // for a given model tensor naming, so this is safe.
+        crate::inference::moe::slice_experts(
+            weights,
+            &mut sliced,
+            "ffn_gate_exps",
+            "ffn_gate_exps",
+        );
+        crate::inference::moe::slice_experts(
+            weights,
+            &mut sliced,
+            "ffn_up_exps",
+            "ffn_up_exps",
+        );
+        crate::inference::moe::slice_experts(
+            weights,
+            &mut sliced,
+            "ffn_down_exps",
+            "ffn_down_exps",
+        );
+        crate::inference::moe::slice_experts(
+            weights,
+            &mut sliced,
+            "mlp.expert_gate",
+            "ffn_gate_exps",
+        );
+        crate::inference::moe::slice_experts(
+            weights,
+            &mut sliced,
+            "mlp.expert_up",
+            "ffn_up_exps",
+        );
+        crate::inference::moe::slice_experts(
+            weights,
+            &mut sliced,
+            "mlp.expert_down",
+            "ffn_down_exps",
+        );
 
-        // Placeholder: until per-engine expert slicing is implemented we
-        // delegate to a "router-only" forward that runs the MoE math with
-        // top-k = 1 picking the highest-score expert.  When expert weights
-        // are correctly indexed, the math matches `moe_forward_one_token`.
-        // For now this returns an empty tensor so the engine dispatch can
-        // compile; subsequent PRs will fill in the slicing + math.
-        if weights.get("ffn_gate_inp.weight").is_none()
-            && weights.get("mlp.expert_gate.weight").is_none()
-        {
-            // No MoE weights in this layer — this branch should not be hit
-            // because the engine only routes here when has_moe is true.
-            return Tensor::zeros(vec![seq_len, hidden_dim]);
+        // Merge sliced + shared into the working weights map.
+        let mut working = sliced;
+        for (k, v) in weights {
+            // Pass through everything that is not a 3-D routed tensor we already sliced.
+            // (Slice-experts only inserts into `sliced` for ffn_*/mlp.expert_*, no conflicts.)
+            if !working.contains_key(k) {
+                working.insert(k.clone(), v.clone());
+            }
         }
-        Tensor::zeros(vec![seq_len, hidden_dim])
+        let _ = has_shared_expert; // reserved for later exp_probs_b wiring
+
+        crate::inference::moe::moe_forward(x, &working, cfg)
     }
 
     /// Get engine info for diagnostics

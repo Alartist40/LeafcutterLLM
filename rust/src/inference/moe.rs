@@ -237,6 +237,58 @@ pub fn moe_forward(hidden: &Tensor, weights: &HashMap<String, Tensor>, cfg: &Moe
     Tensor::from_vec(out_data, vec![seq_len, hidden_dim])
 }
 
+/// Slice a 3-D expert tensor into per-expert 2-D views and insert them into
+/// `weights_out` under keyed names like `ffn_gate_exps.3`.
+///
+/// GGUF stores 3-D expert tensors with shape `[expert_dim_out, expert_dim_in, num_experts]`
+/// (DeepSeek-2 / GLM-DSA convention).  Each "slice" is a `[expert_dim_out, expert_dim_in]` view
+/// that the MoE module multiplies as `hidden @ slice.T`.
+///
+/// `src_engine_name` is what the source tensor is called in the engine weights map
+/// (e.g. `ffn_gate_exps` or `mlp.expert_gate`).
+pub fn slice_experts(
+    weights_in: &HashMap<String, Tensor>,
+    weights_out: &mut HashMap<String, Tensor>,
+    src_engine_name: &str,
+    moe_q_name: &str,
+) {
+    // `weights_in` may carry either:
+    //   (1) a single 3-D tensor under `src_engine_name`; slice it into N 2-D tensors, OR
+    //   (2) already per-expert 2-D tensors under `moe_q_name.<i>` (when the
+    //       loader or engine pre-sliced).  Pass through unchanged.
+    if let Some(parent) = weights_in.get(src_engine_name) {
+        if parent.shape.len() == 3 {
+            // [out_dim, in_dim, num_experts]
+            let num_experts = parent.shape[2];
+            let out_dim = parent.shape[0];
+            let in_dim = parent.shape[1];
+            // Cache the flat data inside one tall linear access — the
+            // underlying data is f32 (post-dequant) for plain-decoder
+            // tensors, so this is a simple Vec copy.
+            for e in 0..num_experts {
+                let mut sub = Vec::with_capacity(out_dim * in_dim);
+                for o in 0..out_dim {
+                    for i in 0..in_dim {
+                        let idx = o * (in_dim * num_experts) + i * num_experts + e;
+                        sub.push(parent.data[idx]);
+                    }
+                }
+                let key = format!("{}.{}", moe_q_name, e);
+                weights_out.insert(
+                    key,
+                    Tensor::from_vec(sub, vec![out_dim, in_dim]),
+                );
+            }
+        } else if parent.shape.len() == 2 {
+            // Treat the 2-D tensor as a single-expert "wrap".
+            let key = format!("{}.0", moe_q_name);
+            weights_out.insert(key, parent.clone());
+        }
+    }
+    // Already-sliced shapes (per-expert 2-D views) pass through naturally —
+    // they're not touched here.
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,5 +320,41 @@ mod tests {
         assert_eq!(cfg.num_experts_used, 8);
         assert_eq!(cfg.gating_func, 2);
         assert!(cfg.norm_topk_prob);
+    }
+
+    #[test]
+    fn slice_experts_splits_3d_into_per_expert() {
+        // 3-D parent: [out=2, in=3, num_experts=2] — 12 elements.
+        // e0 slice should be: parent[:,:,0] flattened to [2,3].
+        // e1 slice should be: parent[:,:,1] flattened to [2,3].
+        let mut data: Vec<f32> = Vec::new();
+        for o in 0..2 {
+            for i in 0..3 {
+                for e in 0..2 {
+                    let v = (o * 30 + i * 10 + e) as f32;
+                    data.push(v);
+                }
+            }
+        }
+        let parent = Tensor::from_vec(data, vec![2, 3, 2]);
+
+        let mut out: std::collections::HashMap<String, Tensor> = std::collections::HashMap::new();
+        let mut weights = std::collections::HashMap::new();
+        weights.insert("ffn_gate_exps".to_string(), parent);
+        slice_experts(&weights, &mut out, "ffn_gate_exps", "ffn_gate_exps");
+
+        let e0 = out.get("ffn_gate_exps.0").expect("missing e0");
+        let e1 = out.get("ffn_gate_exps.1").expect("missing e1");
+        assert_eq!(e0.shape, vec![2, 3]);
+        assert_eq!(e1.shape, vec![2, 3]);
+        // Check element-wise correctness.
+        for o in 0..2 {
+            for i in 0..3 {
+                let want_e0 = (o * 30 + i * 10 + 0) as f32;
+                let want_e1 = (o * 30 + i * 10 + 1) as f32;
+                assert_eq!(e0.data[o * 3 + i], want_e0);
+                assert_eq!(e1.data[o * 3 + i], want_e1);
+            }
+        }
     }
 }

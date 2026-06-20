@@ -623,3 +623,49 @@ Outstanding work (next session or two):
 
 Constraint preserved: every existing validated model (Llama-3.2-3B,
 Meta-70B, Ministral-3B/8B, Qwen3.5) keeps working unchanged.
+
+## Frontier Models build-out, part 2: 2026-06-19, m3 / Nvidia
+
+Follow-up to the same-day milestone above. The scaffolding from
+v0.9.7 was promoted into a runnable (but not-yet-validated) engine
+path:
+
+- `src/inference/mla.rs` — full MLA forward module:
+  - Q path: q_a (down) → rms_norm → q_b (up) → split into qk_nope +
+    qk_rope halves.
+  - KV path: kv_a_mqa (down) splits into kv_lat (k_lora_rank dims) +
+    absorbed-rope chunk; kv_lat → rms_norm → k_b (up) + v_b (up).
+  - Build per-head K and V on the fly; apply RoPE on the qk_rope half;
+    standard scaled dot-product attention with causal mask.
+  - KV cache stores the *compressed latent*, not per-head K/V.
+- `src/inference/moe.rs::slice_experts()` and a unit test.
+- `Engine::ffn_moe_forward()` now actually routes by:
+  1. slicing 3-D `*_exps.weight` → per-expert 2-D views;
+  2. calling `moe::moe_forward()` (sigmoid routing + top-k dispatch +
+     additive shared expert).
+- `Engine::forward_native()` gains `has_mla` and `has_moe` branches.
+
+The pre-existing breakage in `src/main.rs` (trait/arg issues) was
+fixed alongside, so `cargo build --release --bin leafcutter` now
+succeeds.
+
+Test count is now **133 passed** (was 132 before this round), 1
+pre-existing kernel failure unchanged, 3 ignored. No regressions on
+any previously-validated model.
+
+What's still missing for "actually generation a real token on
+Kimi K2.6 or GLM-5.2":
+
+1. Full shard pieces on disk (currently only shard 1 is present).
+2. MTP nextn.* draft-verification logic — currently loaded but not
+   exercised.
+3. GLM-DSA sparse-attention indexer — recognised in metadata; math
+   not implemented yet.
+4. A "factual" logit cosine-similarity test against llama.cpp's
+   reference forward for layer 0 of the real model. Cosine > 0.95
+   ⇒ the math is right; lower ⇒ look for a transposed-quant issue or
+   a RoPE convention mismatch.
+
+Once (1) is met, the engine should run end-to-end on Kimi K2.6 with
+~6 GB peak resident RAM and produce token-level decisions that
+match llama.cpp's reference within numerical noise.

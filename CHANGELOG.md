@@ -5,6 +5,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [0.9.8] — 2026-06-19 (MLA forward + engine wiring)
+
+Continues the Kimi K2.6 / GLM-5.2 frontier-models build-out. Adds the
+engine-side plumbing that v0.9.7 left as scaffolding.
+
+### Added
+
+- `src/inference/mla.rs` — fully implemented Multi-Latent Attention
+  forward (q_a + q_a_norm + q_b + kv_a_mqa + kv_a_norm + k_b + v_b +
+  absorbed RoPE).  KV cache stores the *compressed* latent form, not
+  per-head K and V.  Reconstruction happens on the read path.  3 unit
+  tests (`config_default_is_sensible`, `num_heads_is_multiple_of_num_kv_heads`,
+  `tensor_api_used_inside_mla`).
+- `Engine` struct grows `mla_params: MlaParams` and `moe_params: MoeConfig`.
+- `Engine::forward_native()` (`forward_native` in engine.rs) gains
+  `has_mla` and `has_moe` branches layered onto the existing
+  `has_standard_attn` / `has_deltanet` / `has_ssm` chain.  All previous
+  paths stay intact.
+- `Engine::ffn_moe_forward()` now actually runs the MoE math by:
+  1. slicing routed 3-D `*_exps.weight` tensors into per-expert 2-D
+     views via `moe::slice_experts`;
+  2. calling `moe::moe_forward()` with the working weight map
+     (sigmoid routing + top-k dispatch + additive shared expert).
+- `moe::slice_experts()` — utility that takes a `[out, in, num_experts]`
+  3-D tensor and produces `[out, in]` 2-D views keyed as
+  `ffn_gate_exps.0`, `ffn_gate_exps.1`, …  for Kimi/DeepSeek naming, or
+  `ffn_gate_exps.<i>` aliased from `mlp.expert_*` for Qwen-MoE naming.
+  1 unit test.
+- `MODEL_INTAKE_METHOD.md` — methodology record describing how to add
+  any future GGUF architecture.  Walk-through is grounded in the
+  Kimi/GLM work but is generic.
+
+### Status
+
+- `cargo check --lib --no-default-features`: clean.
+- `cargo test --release --lib --no-default-features`: **133 passed**
+  (was 132), 1 pre-existing kernel failure, 3 ignored, 0 regressions.
+- `cargo build --release --bin leafcutter`: now succeeds (was broken in
+  v0.9.6 audit pass due to `tok.decode()` arity and `BaseTokenizer`
+  trait-import issues; the scaffolding pass for this milestone fixed
+  these so the lib + binaries compile cleanly together).
+
+### Deferred (still not end-to-end on a real model)
+
+- Real-model validation: needs full Kimi / GLM shards.
+- GLM-DSA sparse-attention indexer math (32 heads, top_k=2048).
+- MTP nextn.* draft verification is wired to load but the
+  speculative-verify logic isn't exercised for DeepSeek-2 / GLM-DSA.
+
+---
+
 ## [0.9.7] — 2026-06-19 (Frontier Models: Kimi K2.6 + GLM-5.2 native path)
 
 A new build-out cycle targeting DeepSeek-2-family architectures. Both
