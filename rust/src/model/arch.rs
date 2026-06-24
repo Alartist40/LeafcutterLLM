@@ -41,7 +41,7 @@ impl ModelArchitecture {
                 "mistral"  => ModelArchitecture::Mistral,
                 "mistral3" => ModelArchitecture::Mistral,
                 "phi" | "phi3" | "phi4" => ModelArchitecture::Phi,
-                "gemma" | "gemma2" | "gemma3" => ModelArchitecture::Gemma,
+                "gemma" | "gemma2" | "gemma3" | "gemma4" => ModelArchitecture::Gemma,
                 "yi" => ModelArchitecture::Yi,
                 "nemotron" | "nvidia_nemotron" => ModelArchitecture::Nemotron,
                 "falcon" | "falcon3" | "falcon2" => ModelArchitecture::Falcon,
@@ -186,16 +186,44 @@ impl ModelArchitecture {
                 ("ssm_state.weight",       "ssm_state.weight"),
                 ("ssm_gate.weight",        "ssm_gate.weight"),
             ],
+            ModelArchitecture::Gemma => &[
+                // Attention — Gemma's G layers use separate Q/K/V; S layers fuse Q+V
+                ("attn_q.weight", "self_attn.q_proj.weight"),
+                ("attn_k.weight", "self_attn.k_proj.weight"),
+                ("attn_v.weight", "self_attn.v_proj.weight"),
+                ("attn_output.weight", "self_attn.o_proj.weight"),
+                // Per-head RMSNorm on Q and K (Gemma 3+)
+                ("attn_q_norm.weight", "attn_q_norm.weight"),
+                ("attn_k_norm.weight", "attn_k_norm.weight"),
+                // FFN — Gemma uses GeGLU with separate gate and up projections
+                ("ffn_gate.weight", "mlp.gate_proj.weight"),
+                ("ffn_up.weight", "mlp.up_proj.weight"),
+                ("ffn_down.weight", "mlp.down_proj.weight"),
+                // Norms
+                //   Gemma has 4 RMSNorm tensors per layer:
+                //   * attn_norm         — applied before attention
+                //   * post_attention_norm — applied to attention output (pre-residual-add)
+                //   * ffn_norm          — applied before FFN
+                //   * post_ffw_norm     — applied to FFN output (pre-residual-add)
+                // We map the *input* norms to the engine's input_layernorm /
+                // post_attention_layernorm slots so existing engine dispatch
+                // works; per-layer post_norms are read directly via the
+                // Gemma-specific forward path.
+                ("attn_norm.weight", "input_layernorm.weight"),
+                ("ffn_norm.weight", "post_attention_layernorm.weight"),
+                // Layer-output scale (scalar, Gemma 3+)
+                ("layer_output_scale.weight", "layer_output_scale.weight"),
+            ],
             _ => &[
-                ("attn_q.weight",     "self_attn.q_proj.weight"),
-                ("attn_k.weight",     "self_attn.k_proj.weight"),
-                ("attn_v.weight",     "self_attn.v_proj.weight"),
-                ("attn_output.weight","self_attn.o_proj.weight"),
-                ("ffn_gate.weight",   "mlp.gate_proj.weight"),
-                ("ffn_up.weight",     "mlp.up_proj.weight"),
-                ("ffn_down.weight",   "mlp.down_proj.weight"),
-                ("attn_norm.weight",  "input_layernorm.weight"),
-                ("ffn_norm.weight",   "post_attention_layernorm.weight"),
+                ("attn_q.weight", "self_attn.q_proj.weight"),
+                ("attn_k.weight", "self_attn.k_proj.weight"),
+                ("attn_v.weight", "self_attn.v_proj.weight"),
+                ("attn_output.weight", "self_attn.o_proj.weight"),
+                ("ffn_gate.weight", "mlp.gate_proj.weight"),
+                ("ffn_up.weight", "mlp.up_proj.weight"),
+                ("ffn_down.weight", "mlp.down_proj.weight"),
+                ("attn_norm.weight", "input_layernorm.weight"),
+                ("ffn_norm.weight", "post_attention_layernorm.weight"),
             ],
         }
     }

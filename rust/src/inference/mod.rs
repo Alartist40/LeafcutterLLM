@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod deltanet;
 pub mod engine;
+pub mod gemma;
 pub mod mla;
 pub mod moe;
 pub mod sampler;
