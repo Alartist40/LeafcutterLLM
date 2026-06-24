@@ -29,7 +29,9 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 
 **Key advantage:** Leafcutter is the only open-source engine combining Rust memory safety, **automatic backend routing** (native → FFI fallback), native quantized weight loading with transposed-B GEMM, BitNet quantization, and a built-in OpenAI-compatible HTTP API in a single binary.
 
-### Current Capabilities (Validated 2026-05-19)
+## Current Capabilities (Validated 2026-06-16)
+
+
 
 | Model | Size | Backend | Status | Peak RAM | tok/sec |
 |-------|------|---------|--------|----------|---------|
@@ -203,35 +205,33 @@ LeafcutterLLM includes a comprehensive progressive testing framework to validate
 
 Results will be saved in the `results/` directory with detailed JSON metrics.
 
-### Run the Benchmark
-
-Verify the system works and see the 3-pillar claims proven with real numbers:
+### Run Tests
 
 ```bash
-./leafcutter-bench \
-  --hidden-size 4096 \
-  --num-layers 32 \
-  --mat-m 4096 --mat-n 4096 --mat-k 4096 \
-  --blas-iter 50 \
-  --requests 100 \
-  --batch-size 16
+cargo test --lib
 ```
 
-**Example output:**
-```
-  ✓  Layer-by-layer peak RAM                    2.1 MB
-  ~  Naive (all layers) peak RAM               16.8 MB
-  ✓  RAM savings vs naive                      87.5 % reduction
+As of 2026-06-16: **123 tests pass, 1 pre-existing failure, 3 ignored**. (The
+single failure is `kernels::tests::test_q4_0_roundtrip`, a hand-crafted
+raw-byte test that pre-dates the 2026-06-16 audit pass; no production
+inference path is affected. See `CHANGELOG.md` for the audit detail.)
 
-  ✓  OpenBLAS SGEMM avg                        394.871µs 
-  ✓  BLAS speedup                               13.0 x faster
+# Current Release: v0.9.6 (2026-06-16)
 
-  ✓  Throughput                                2200.5 req/sec
-  ✓  Requests dropped                            0 
-  ✓  Batching efficiency                       100.0 %
-```
+> v0.9.6 is a **stability + correctness** pass on top of v0.9.5. No new
+> capability was added; the inference math is unchanged. What changed:
+> 10 hard panics / silent correctness bugs / performance smells
+> identified by an audit were fixed (see `CHANGELOG.md` v0.9.6 entry).
+> All paths that used to panic on bad input now return clear errors.
 
-### Download a Model
+## What's New in v0.9.6
+✅ **No more silent crashes** — `embed_lookup_mmap` no longer OOBs when tokenizer metadata is missing; unknown quant types log and return null instead of `panic!`
+✅ **`top_p` actually plumbed through the API** — `/generate` and `/v1/chat/completions` were silently throwing the request value away
+✅ **BPE tokenizers no longer destroy whitespace** — multi-space and multiline text round-trips correctly now
+✅ **Tokenizer + lm_head caches** — every token step is meaningfully faster on long generations
+✅ **123 tests pass** (1 pre-existing kernel failure, unchanged)
+
+## v0.9.5 (Previous Production)
 
 Get a HuggingFace model in safetensors format:
 

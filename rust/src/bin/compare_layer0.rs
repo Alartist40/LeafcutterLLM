@@ -16,7 +16,7 @@ fn main() {
     let mut engine = Engine::load(&path).expect("Failed to load engine");
     let tokens = vec![9906usize];
 
-    let mut hidden = engine.embed_lookup_mmap(&tokens);
+    let mut hidden = engine.embed_lookup_mmap(&tokens).expect("embed_lookup_mmap failed");
     println!("rope_theta = {}", engine.attn_params.rope_theta); print_stats("embed", &hidden.data);
 
     let layer_idx = 0;

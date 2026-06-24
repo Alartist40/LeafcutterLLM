@@ -10,7 +10,7 @@ fn main() {
     let mut engine = Engine::load(path).unwrap();
     let tokens = vec![9906usize];
     
-    let mut hidden = engine.embed_lookup_mmap(&tokens);
+    let mut hidden = engine.embed_lookup_mmap(&tokens).expect("embed_lookup_mmap failed");
     println!("embed RMS: {:.4}", rms(&hidden.data));
     
     for layer_idx in 0..engine.config.num_hidden_layers {

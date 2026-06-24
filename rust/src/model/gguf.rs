@@ -186,9 +186,12 @@ impl GGUFile {
             QuantType::IQ4_NL => crate::kernels::dequantize_iq4_nl(raw, &mut out),
             QuantType::IQ4_XS => crate::kernels::dequantize_iq4_xs(raw, &mut out),
             _ => {
-                #[cfg(debug_assertions)]
-                panic!("get_tensor_row_f32: unsupported quant type {:?} for tensor {}", qtype, name);
-                #[cfg(not(debug_assertions))]
+                // Unsupported quant type — log once and return None rather than
+                // crashing the whole run.  Callers propagate this as an error.
+                eprintln!(
+                    "Leafcutter: unsupported quant type {:?} for tensor '{}'; skipping",
+                    qtype, name
+                );
                 return None;
             }
         }
@@ -245,9 +248,10 @@ impl GGUFile {
             QuantType::IQ4_NL => crate::kernels::dequantize_iq4_nl(raw, &mut out[..cols]),
             QuantType::IQ4_XS => crate::kernels::dequantize_iq4_xs(raw, &mut out[..cols]),
             _ => {
-                #[cfg(debug_assertions)]
-                panic!("get_tensor_row_f32_into: unsupported quant type {:?} for tensor {}", qtype, name);
-                #[cfg(not(debug_assertions))]
+                eprintln!(
+                    "Leafcutter: unsupported quant type {:?} for tensor '{}'; skipping",
+                    qtype, name
+                );
                 return None;
             }
         }
@@ -262,16 +266,26 @@ impl GGUFile {
         let ptr = self.mmap.as_ptr();
         let len = self.mmap.len();
         unsafe {
-            // MADV_DONTNEED: Linux will free these pages on next access
-            // they will be re-faulted from disk. Clean pages only — safe
-            // because we never write to the mmap.
+            // MADV_DONTNEED: Linux frees pages immediately;
+            // they will be re-faulted from disk on next access.
             libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_DONTNEED);
         }
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     pub fn drop_pages_from_cache(&self) {
-        // No-op on non-Linux platforms
+        let ptr = self.mmap.as_ptr();
+        let len = self.mmap.len();
+        unsafe {
+            // MADV_FREE: macOS marks pages as eligible for reuse immediately,
+            // but keeps their content until the kernel needs the memory.
+            libc::madvise(ptr as *mut libc::c_void, len, libc::MADV_FREE);
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn drop_pages_from_cache(&self) {
+        // No-op on unsupported platforms
     }
 
     pub fn get_metadata_int(&self, key: &str) -> Option<i64> {

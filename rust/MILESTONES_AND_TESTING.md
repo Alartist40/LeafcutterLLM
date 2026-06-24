@@ -1,8 +1,31 @@
 # LeafcutterLLM — Milestones & Testing Record
 
-**Last updated:** 2026-05-29  
-**Git commit:** To be pushed  
-**Total tests:** 124 passed, 0 failed, 3 ignored (GPU tests)  
+**Last updated:** 2026-06-16 (audit-pass refresh)
+**Git commit:** To be pushed
+**Total tests:** **123 passed**, **1 pre-existing failure** (`kernels::tests::test_q4_0_roundtrip` — hand-crafted raw-byte test, predates 2026-06-16 audit; no production path affected), **3 ignored** (GPU tests)
+
+---
+
+## Phase 6: Stability & Correctness Audit — 2026-06-16
+
+A targeted review of every module in `rust/src/` for crashes, silent
+correctness bugs, performance smells, and unsafe public-facing behaviour.
+Ten of eleven findings were fixed without altering the inference math.
+Detailed finding/fix table lives in `CHANGELOG.md` v0.9.6 — summary:
+
+| # | Severity | Component | Status |
+|---|----------|-----------|--------|
+| 1 | CRITICAL | `embed_lookup_mmap` OOB when `vocab_size=0` | ✅ Fixed |
+| 2 | CRITICAL | `get_tensor_row_f32[_into]` panic on unsupported quants | ✅ Fixed |
+| 3 | HIGH     | API handlers drop `top_p` on the floor | ✅ Fixed |
+| 4 | HIGH     | BPE tokenizers destroy whitespace via `split_whitespace` | ✅ Fixed |
+| 5 | HIGH     | Speculative decoder stub returns `(0, 0)` and pays draft cost anyway | ✅ Fixed (`SpeculativeStatus::Disabled` enum) |
+| 6 | LOW      | Qwen36 `known_extra_suffixes` incomplete | ✅ Fixed |
+| 7 | HIGH     | `GGUFile::dequantize` quant-type gap | ✅ Fixed |
+| 8 | MEDIUM   | `load_layer` silently skips missing optional tensors | ✅ Fixed |
+| 9 | MEDIUM   | `tokenizer_from_model` rebuilt per call | ✅ Fixed (cached) |
+| 10 | MEDIUM  | `lm_head_projection` thread-local buffer resized per call | ✅ Fixed (cached capacity) |
+| 11 | HIGH    | Ministral-3B `ffn_forward` shape panic | ⏸ Deferred — needs refactor |
 
 ---
 

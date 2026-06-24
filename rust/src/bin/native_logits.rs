@@ -1,4 +1,5 @@
 use leafcutter::inference::engine::Engine;
+use leafcutter::tokenizer::{BaseTokenizer, GgufTokenizer};
 
 fn main() {
     let model_path = "../models/Qwen3.5-0.8B-Q4_0.gguf";

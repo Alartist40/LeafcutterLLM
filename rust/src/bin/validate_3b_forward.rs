@@ -1,7 +1,7 @@
 //! Quick 3B forward validation — 1 token, reports time and correctness check.
 
 use leafcutter::inference::engine::Engine;
-use leafcutter::tokenizer::Tokenizer;
+use leafcutter::tokenizer::{BaseTokenizer, Tokenizer};
 
 fn main() {
     let model = "/home/xander/Documents/portfolio/AI Models/Llama-3.2-3B-Instruct-UD-Q4_K_XL.gguf";

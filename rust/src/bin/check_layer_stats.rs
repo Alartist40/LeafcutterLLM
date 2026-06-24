@@ -18,7 +18,7 @@ fn main() {
     // Use same tokens as HF ground truth for Qwen3.5
     let tokens = vec![17usize, 10, 17, 28];
     
-    let mut hidden = engine.embed_lookup_mmap(&tokens);
+    let mut hidden = engine.embed_lookup_mmap(&tokens).expect("embed_lookup_mmap failed");
     print_stats(0, &hidden.data);
     // Save embedding output
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(hidden.data.as_ptr() as *const u8, hidden.data.len() * 4) };

@@ -81,10 +81,24 @@ impl SpeculativeHead {
         _temperature: f32,
     ) -> (usize, usize) {
         // Full verification requires running the main model forward for each
-        // draft position and comparing distributions. This is a placeholder
-        // that accepts all drafts (simplified for the native engine stub).
+        // draft position and comparing distributions.  That's not wired up
+        // here yet, so rather than pretend to verify (the previous stub
+        // always accepted 0 drafts while still cost a draft pass), we now
+        // report a disabled status — the caller should fall back to plain
+        // greedy/contrastive sampling.
         (0, 0)
     }
+}
+
+/// Hint returned by `SpeculativeDecoder::try_accept` so callers can detect
+/// the "speculative decoding is currently a no-op" case and skip the draft
+/// step entirely on subsequent tokens.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeculativeStatus {
+    /// Speculative decoding is fully implemented and returned a verdict.
+    Active,
+    /// Underlying `verify` returned a no-op; treat drafts as always-rejected.
+    Disabled,
 }
 
 /// Speculative decoder that manages draft generation and verification.

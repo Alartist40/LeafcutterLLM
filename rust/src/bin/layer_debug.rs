@@ -14,7 +14,7 @@ fn main() {
     let mut engine = Engine::load(&path).expect("Failed to load engine");
     let tokens = vec![17usize, 10, 17, 28];
     
-    let mut hidden = engine.embed_lookup_mmap(&tokens);
+    let mut hidden = engine.embed_lookup_mmap(&tokens).expect("embed_lookup_mmap failed");
     println!("embed    | max={:.4} | mean_abs={:.4}", max_abs(&hidden.data), mean_abs(&hidden.data));
     
     for layer_idx in 0..engine.config.num_hidden_layers {

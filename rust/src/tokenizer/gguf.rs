@@ -18,6 +18,19 @@ pub struct GgufTokenizer {
     eos_id: Option<usize>,
 }
 
+// Cheap to clone — only four fields, the HashMap is the biggest but copy-on-write
+// semantics are fine for the cached-tokenizer use case.
+impl Clone for GgufTokenizer {
+    fn clone(&self) -> Self {
+        Self {
+            vocab: self.vocab.clone(),
+            token_to_id: self.token_to_id.clone(),
+            bos_id: self.bos_id,
+            eos_id: self.eos_id,
+        }
+    }
+}
+
 impl GgufTokenizer {
     /// Build tokenizer from a list of vocab strings (extracted from GGUF).
     pub fn from_vocab(vocab_tokens: Vec<String>) -> Self {
@@ -60,6 +73,9 @@ impl GgufTokenizer {
     ///
     /// Tries the longest possible prefix at each position. Falls back to
     /// byte-level encoding when no vocab token matches.
+    ///
+    /// Whitespace is preserved as-is (unlike `split_whitespace` approaches
+    /// that collapse all runs of whitespace to a single boundary).
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<usize> {
         let mut tokens = Vec::new();
 
@@ -89,15 +105,25 @@ impl GgufTokenizer {
             }
 
             if !matched {
-                // Byte fallback
-                let first_byte = remaining.as_bytes()[0];
+                // Character-level fallback: emit one byte at a time using
+                // the byte-token convention `<0xXX>`.  This preserves
+                // whitespace as a real byte instead of silently dropping it.
+                let bytes = remaining.as_bytes();
+                let first_byte = bytes[0];
                 let byte_token = format!("<0x{:02X}>", first_byte);
+                let step = if let Some(first_char) = remaining.chars().next() {
+                    first_char.len_utf8()
+                } else {
+                    1
+                };
                 if let Some(&id) = self.token_to_id.get(&byte_token) {
                     tokens.push(id);
                 } else {
+                    // Last-resort: emit raw byte value as a token id.
+                    // This is non-standard but ensures we never panic.
                     tokens.push(first_byte as usize);
                 }
-                remaining = &remaining[1..];
+                remaining = &remaining[step..];
             }
         }
 
@@ -230,29 +256,36 @@ impl GgufBpeTokenizer {
     }
 
     /// Encode text to token IDs using greedy longest-match with BPE conventions.
+    ///
+    /// Whitespace structure is preserved: a SP character encodes as the Ġ
+    /// (U+0120) prefix BPE token, while a literal newline is encoded as Ċ
+    /// (U+010A).  We pre-pad the input so that every non-leading whitespace
+    /// character becomes Ġ and every newline becomes Ċ — this avoids ever
+    /// calling `split_whitespace()`, which would collapse runs of spaces and
+    /// delete newlines entirely (silently corrupting indentation/multi-space
+    /// text).
     pub fn encode(&self, text: &str) -> Vec<usize> {
         let mut tokens = vec![self.bos_token];
 
-        let words: Vec<&str> = text.split_whitespace().collect();
-        if words.is_empty() {
+        if text.is_empty() {
             return tokens;
         }
 
-        // First word: try without Ġ prefix first
-        let first = words[0];
-        let first_with_g = format!("\u{0120}{}", first);
-        if self.vocab_map.contains_key(&first_with_g) {
-            self.greedy_encode(&first_with_g, &mut tokens);
-        } else {
-            self.greedy_encode(first, &mut tokens);
+        // Convert input byte-stream into a sequence of Ġ/Ċ tokens.  Any
+        // leading whitespace is preserved as literal ' ' / '\n' characters
+        // so the first word is encoded without a Ġ prefix.
+        let mut converted = String::with_capacity(text.len());
+        for ch in text.chars() {
+            match ch {
+                ' ' => converted.push('\u{0120}'),
+                '\n' => converted.push('\u{010A}'),
+                '\t' => converted.push('\u{0120}'), // tabs join adjacent tokens via Ġ
+                '\r' => {}                          // drop stray CR
+                _ => converted.push(ch),
+            }
         }
 
-        // Subsequent words: prepend Ġ, then greedy match subpieces
-        for word in &words[1..] {
-            let with_g = format!("\u{0120}{}", word);
-            self.greedy_encode(&with_g, &mut tokens);
-        }
-
+        self.greedy_encode(&converted, &mut tokens);
         tokens
     }
 

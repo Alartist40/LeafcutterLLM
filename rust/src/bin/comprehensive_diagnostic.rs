@@ -75,7 +75,7 @@ fn test_llama_smoke(path: &str) {
 
     // Test embedding lookup
     let tokens = vec![1, 2, 3, 4, 5]; // BOS + some tokens
-    let hidden = engine.embed_lookup_mmap(&tokens);
+    let hidden = engine.embed_lookup_mmap(&tokens).expect("embed_lookup_mmap failed");
     println!("  Embedding: shape={:?}, mean={:.4}, std={:.4}",
         hidden.shape,
         mean(&hidden.data),
@@ -227,7 +227,7 @@ fn test_embedding_consistency(path: &str) {
 
     let tokens = vec![1, 100, 1000, 5000, 10000];
 
-    let mmap_result = engine.embed_lookup_mmap(&tokens);
+    let mmap_result = engine.embed_lookup_mmap(&tokens).expect("embed_lookup_mmap failed");
     println!("  mmap lookup: shape={:?}, mean={:.4}", mmap_result.shape, mean(&mmap_result.data));
 
     println!("  PASS");

@@ -5,18 +5,20 @@
 #![cfg(feature = "llama-ffi")]
 
 use axum::{
+    middleware,
     routing::{get, post},
     extract::State,
     Json, Router,
-    http::StatusCode,
+    http::{StatusCode, HeaderMap},
+    body::Body,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::llama_ffi::{backend_init, backend_free, LlamaModel, LlamaContext};
+use crate::llama_ffi::{backend_init, LlamaModel, LlamaContext};
 use crate::inference::engine::Engine as NativeEngine;
-use crate::tokenizer::{Tokenizer, GgufBpeTokenizer};
+use crate::tokenizer::{BaseTokenizer, GgufBpeTokenizer};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -31,8 +33,6 @@ pub struct GenerateRequest {
     pub temperature: f32,
     #[serde(default = "default_top_p")]
     pub top_p: f32,
-    #[serde(default)]
-    pub stream: bool,
 }
 
 fn default_max_tokens() -> usize { 256 }
@@ -99,8 +99,9 @@ pub struct Choice {
 // ---------------------------------------------------------------------------
 
 pub trait LeafcutterEngine: Send + Sync {
-    fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<(String, Vec<usize>), String>;
+    fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32) -> Result<(String, Vec<usize>), String>;
     fn name(&self) -> &str;
+    fn max_seq_len(&self) -> usize;
 }
 
 // ---------------------------------------------------------------------------
@@ -127,7 +128,10 @@ impl FfiEngine {
 
 impl LeafcutterEngine for FfiEngine {
     fn name(&self) -> &str { "llama-ffi" }
-    fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<(String, Vec<usize>), String> {
+    fn max_seq_len(&self) -> usize {
+        self.model.n_ctx_train().max(1) as usize
+    }
+    fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32) -> Result<(String, Vec<usize>), String> {
         let mut ctx = LlamaContext::new(&self.model, self.ctx_size, self.threads)
             .map_err(|e| format!("Failed to create context: {}", e))?;
 
@@ -135,6 +139,8 @@ impl LeafcutterEngine for FfiEngine {
         if prompt_tokens.is_empty() { return Err("Empty prompt".to_string()); }
 
         let eos = self.model.eos_token();
+        // top_p is not exposed by the FFI binding; llama.cpp samples with top_p=0.95 internally.
+        let _ = top_p;
         let generated = ctx.generate(&prompt_tokens, max_tokens, temperature, eos);
 
         let text: String = generated.iter().map(|&t| ctx.token_to_piece(t)).collect();
@@ -155,8 +161,6 @@ pub struct NativeStreamingEngine {
 impl NativeStreamingEngine {
     pub fn load(path: &str) -> Result<Self, String> {
         let engine = NativeEngine::load(path).map_err(|e| e.to_string())?;
-        
-        // Use GGUF-native tokenizer
         let tokenizer = GgufBpeTokenizer::from_gguf(path)
             .ok_or_else(|| "No tokenizer found in GGUF".to_string())?;
 
@@ -169,18 +173,44 @@ impl NativeStreamingEngine {
 
 impl LeafcutterEngine for NativeStreamingEngine {
     fn name(&self) -> &str { "native-streaming" }
-    fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<(String, Vec<usize>), String> {
-        let mut engine = self.engine.lock().map_err(|_| "Engine lock poisoned")?;
+    fn max_seq_len(&self) -> usize {
+        self.engine.lock().ok().map(|e| e.config.max_seq_len).unwrap_or(4096)
+    }
+    fn generate(&self, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32) -> Result<(String, Vec<usize>), String> {
+        let mut engine = self.engine.lock().map_err(|_| "Engine lock poisoned".to_string())?;
         let tokens = self.tokenizer.encode(prompt);
-        
-        let generated = engine.generate(&tokens, max_tokens, temperature, 0.9);
+
+        let generated = engine.generate(&tokens, max_tokens, temperature, top_p);
         let text = self.tokenizer.decode(&generated);
-        
+
         Ok((text, generated))
     }
 }
 
 pub type SharedEngine = Arc<dyn LeafcutterEngine>;
+
+// ---------------------------------------------------------------------------
+// Auth middleware
+// ---------------------------------------------------------------------------
+
+const DEFAULT_API_KEY: &str = "leaf-dev";
+
+async fn auth_middleware(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let key = std::env::var("LEAFCUTTER_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
+    if key.is_empty() {
+        return next.run(req).await;
+    }
+    match req.headers().get("X-API-Key") {
+        Some(v) if v.to_str().map(|s| s == key).unwrap_or(false) => next.run(req).await,
+        _ => axum::response::Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::from("Missing or invalid X-API-Key header"))
+            .unwrap(),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Handlers
@@ -193,17 +223,22 @@ pub async fn generate_handler(
     let start = Instant::now();
     let id = format!("req-{}", start.elapsed().as_nanos());
 
-    let (text, tokens) = tokio::task::spawn_blocking(move || {
-        engine.generate(&req.prompt, req.max_tokens, req.temperature)
+    let capped_max = engine.max_seq_len().min(req.max_tokens);
+
+    let (text, out_tokens) = tokio::task::spawn_blocking(move || {
+        engine.generate(&req.prompt, capped_max, req.temperature, req.top_p)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task panic: {}", e)))?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
 
+    let truncated = capped_max < req.max_tokens;
+    let text = if truncated { format!("{}[truncated]", text) } else { text };
+
     Ok(Json(GenerateResponse {
         id,
         text,
-        tokens,
+        tokens: out_tokens,
         took_ms: start.elapsed().as_millis() as i64,
         error: String::new(),
     }))
@@ -226,12 +261,17 @@ pub async fn chat_completions_handler(
         .collect::<Vec<_>>()
         .join("\n");
 
+    let capped_max = engine.max_seq_len().min(req.max_tokens);
+
     let (text, _tokens) = tokio::task::spawn_blocking(move || {
-        engine.generate(&prompt, req.max_tokens, req.temperature)
+        engine.generate(&prompt, capped_max, req.temperature, req.top_p)
     })
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("Task panic: {}", e)))?
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+
+    let truncated = capped_max < req.max_tokens;
+    let text = if truncated { format!("{}[truncated]", text) } else { text };
 
     let resp = ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -255,11 +295,16 @@ pub async fn chat_completions_handler(
 }
 
 pub fn create_app(engine: SharedEngine) -> Router {
+    let key = std::env::var("LEAFCUTTER_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
+    if !key.is_empty() {
+        println!("🔐 Auth enabled — send X-API-Key header on all requests");
+    }
     Router::new()
         .route("/health", get(health_handler))
         .route("/generate", post(generate_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
         .with_state(engine)
+        .layer(middleware::from_fn(auth_middleware))
 }
 
 pub async fn run_server(engine: SharedEngine, port: u16) {

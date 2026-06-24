@@ -2,7 +2,7 @@
 //! Reports RSS before/after to validate inference memory.
 
 use leafcutter::inference::engine::Engine;
-use leafcutter::tokenizer::Tokenizer;
+use leafcutter::tokenizer::{BaseTokenizer, Tokenizer};
 
 fn read_rss_mb() -> Option<usize> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;

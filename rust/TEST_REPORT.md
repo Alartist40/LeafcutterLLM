@@ -1,6 +1,13 @@
 # LeafcutterLLM Rust Rewrite — Test Report
 
-## Date: 2026-05-19
+## Date: 2026-05-19 (initial) | refreshed 2026-06-16 (stability audit pass)
+
+> **Audit pass 2026-06-16:** 10 of 11 stability findings fixed (see
+> CHANGELOG.md v0.9.6). 123 tests pass, 1 pre-existing kernel test
+> failure (`kernels::tests::test_q4_0_roundtrip`) unchanged.
+>
+> Below is the historical **2026-05-19** NaN investigation report,
+> preserved unchanged as the original narrative.
 
 ---
 
