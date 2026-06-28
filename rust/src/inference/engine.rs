@@ -38,6 +38,15 @@ pub struct Engine {
     pub mla_params: crate::inference::mla::MlaParams,
     /// MoE FFN params (DeepSeek-2 / Qwen-MoE / future).
     pub moe_params: crate::inference::moe::MoeConfig,
+    /// Per-layer Gemma-3/4 routing (alternating G/S, per-layer head_count_kv).
+    /// Empty for non-Gemma architectures.
+    pub gemma_layouts: Vec<crate::inference::gemma::GemmaLayerParams>,
+    /// Gemma (1+w) RMSNorm epsilon; 1e-6 by default, models override it.
+    pub gemma_norm_eps: f32,
+    /// Gemma logit soft-cap (final projection limiter). 0 = disabled.
+    /// Negative = use Gemma 4 default (-30.0 → soft-cap at 30).
+    /// Field on ModelConfig already exists; this is a per-engine cache.
+    pub gemma_logit_softcap: f32,
     pub speculative_head: Option<SpeculativeHead>,
     /// Whether lm_head is tied to token embeddings (no separate output.weight tensor).
     lm_head_tied: bool,
@@ -228,6 +237,26 @@ impl Engine {
         // Embedding lookup is done on-demand via mmap per-row dequantization.
         // Never pre-dequantize the full embedding table — it would use 1-4 GB of RAM.
 
+        // ── Gemma-specific metadata, captured before `model` is moved. ──
+        let is_gemma = matches!(report.architecture, ModelArchitecture::Gemma);
+        let gemma_norm_eps = if is_gemma {
+            let v = model
+                .file
+                .get_metadata_f32("gemma4.attention.layer_norm_rms_epsilon")
+                .unwrap_or(0.0);
+            if v != 0.0 { v } else { 1e-6 }
+        } else { 1e-6 };
+        let gemma_logit_softcap = if is_gemma {
+            model
+                .file
+                .get_metadata_f32("gemma4.final_logit_softcapping")
+                .filter(|&v| v > 0.0)
+                .unwrap_or(0.0)
+        } else { 0.0 };
+        let gemma_layouts = if is_gemma {
+            infer_gemma_layouts(&model, &report.architecture)
+        } else { Vec::new() };
+
         Ok(Self {
             model,
             config,
@@ -238,6 +267,9 @@ impl Engine {
             deltanet_params,
             mla_params: crate::inference::mla::MlaParams::default(),
             moe_params: crate::inference::moe::MoeConfig::default(),
+            gemma_layouts,
+            gemma_norm_eps,
+            gemma_logit_softcap,
             speculative_head,
             lm_head_tied,
 
@@ -372,9 +404,6 @@ impl Engine {
             .map(|v| v as f32)
             .unwrap_or(config.rope_theta);
 
-        eprintln!("  Attention: heads={}, kv_h={}, hd={}, kv_hd={}, rope={}, o_in={}",
-            num_heads, num_kv_heads, head_dim, kv_head_dim, rope_theta, o_in_dim);
-
         AttentionParams {
             num_heads,
             num_kv_heads,
@@ -494,10 +523,43 @@ impl Engine {
         let mut hidden = self.embed_lookup_mmap(tokens)?;
 
         // Transformer / hybrid layers — stream one layer at a time
+        let is_gemma = self.gemma_layouts.len() == self.config.num_hidden_layers;
+
+        // Gemma 3/4: scale token embeddings by sqrt(hidden_size) before the
+        // first layer (matches llama.cpp's `inpL = ggml_scale(ctx0, inpL, sqrtf(n_embd))`
+        // in models/gemma4.cpp:14 and HuggingFace's Gemma3ForCausalLM).
+        if is_gemma {
+            let scale = (self.config.hidden_size as f32).sqrt();
+            for v in hidden.data.iter_mut() {
+                *v *= scale;
+            }
+        }
         for layer_idx in 0..self.config.num_hidden_layers {
             // Load current layer (dequantizes on demand, drops after use)
-            let layer_weights = self.model.load_layer(layer_idx)
+            let mut layer_weights = self
+                .model
+                .load_layer(layer_idx)
                 .expect("Failed to load layer");
+
+            // ── Gemma 3/4 fast path ── every layer is 4 RMSNorms + attention +
+            // GeGLU + per-layer residual scale.  Skip all per-layer type routing.
+            if is_gemma {
+                let cfg = &self.gemma_layouts[layer_idx];
+                let new_hidden = crate::inference::gemma::gemma_layer_forward(
+                    &hidden,
+                    &mut layer_weights,
+                    cfg,
+                    &self.attn_params,
+                    &mut self.kv_cache,
+                    layer_idx,
+                    self.seq_offset,
+                    self.gemma_norm_eps,
+                );
+                hidden = new_hidden;
+                // Drop mmap pages — keep RSS bounded
+                self.model.file.drop_pages_from_cache();
+                continue;
+            }
 
             // Detect layer type from actual tensor contents (most robust)
             let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight")
@@ -981,4 +1043,142 @@ pub struct EngineInfo {
     pub use_fused_qkv: bool,
     pub use_compressed_kv: bool,
     pub use_speculative: bool,
+}
+
+// -------------------------------------------------------------------------
+// Gemma per-layer layouts (Gemma 3/4 family only)
+// -------------------------------------------------------------------------
+fn infer_gemma_layouts(
+    model: &GGUFModel,
+    arch: &ModelArchitecture,
+) -> Vec<crate::inference::gemma::GemmaLayerParams> {
+    use crate::inference::gemma::GemmaLayerParams;
+    use crate::model::gguf::GGUFValue;
+    if !matches!(arch, ModelArchitecture::Gemma) {
+        return Vec::new();
+    }
+    let num_layers = match arch.metadata_prefix() {
+        p => model
+            .file
+            .get_metadata_int(&format!("{}.block_count", p))
+            .or_else(|| model.file.get_metadata_int(&format!("{}.block_count", p.replace("gemma", "gemma4"))))
+            .or_else(|| model.file.get_metadata_int(&format!("{}.block_count", p.replace("gemma", "gemma3"))))
+            .or_else(|| model.file.get_metadata_int(&format!("{}.block_count", p.replace("gemma", "gemma2"))))
+            .or_else(|| model.file.get_metadata_int("num_hidden_layers"))
+            .unwrap_or(0) as usize,
+    };
+    if num_layers == 0 {
+        return Vec::new();
+    }
+    // Default head_dims.  Gemma 4 sets both, with sliding layers using the
+    // smaller of the two.
+    let key_length = model
+        .file
+        .get_metadata_int("gemma4.attention.key_length")
+        .unwrap_or(256) as usize;
+    let value_length = model
+        .file
+        .get_metadata_int("gemma4.attention.value_length")
+        .unwrap_or(256) as usize;
+    let key_length_swa = model
+        .file
+        .get_metadata_int("gemma4.attention.key_length_swa")
+        .unwrap_or(key_length as i64) as usize;
+    let value_length_swa = model
+        .file
+        .get_metadata_int("gemma4.attention.value_length_swa")
+        .unwrap_or(value_length as i64) as usize;
+    let rope_theta_global = model
+        .file
+        .get_metadata_f32("gemma4.rope.freq_base")
+        .unwrap_or(1_000_000.0);
+    let rope_theta_swa = model
+        .file
+        .get_metadata_f32("gemma4.rope.freq_base_swa")
+        .unwrap_or(10_000.0);
+    // Per-layer head_count_kv (i32 array).
+    let head_count_kv: Vec<i64> = match model.file.metadata.get("gemma4.attention.head_count_kv") {
+        Some(GGUFValue::Array(arr)) => arr
+            .iter()
+            .map(|v| match v {
+                GGUFValue::I32(i) => *i as i64,
+                GGUFValue::I64(i) => *i,
+                _ => 0,
+            })
+            .collect(),
+        _ => vec![8_i64; num_layers],
+    };
+    // Per-layer sliding-window pattern (bool array).
+    // Gemma 3/4 default: 5 global then 1 sliding, repeating.
+    let mut default_pattern: Vec<bool> = (0..num_layers).map(|i| i % 6 == 5).collect();
+    let swa_pattern: Vec<bool> = match model
+        .file
+        .metadata
+        .get("gemma4.attention.sliding_window_pattern")
+    {
+        Some(GGUFValue::Array(arr)) => arr
+            .iter()
+            .map(|v| match v {
+                GGUFValue::Bool(b) => *b,
+                _ => false,
+            })
+            .collect(),
+        _ => default_pattern.clone(),
+    };
+    let _ = default_pattern;
+    let head_count_kv = head_count_kv;
+
+    // Per-layer Q/K projection output dimensions, derived from actual tensor
+    // shapes.  Gemma 4 metadata `gemma4.attention.key_length{,swa}` is wrong
+    // (it reports the RoPE dim, not the head_dim of K/V projections), so we
+    // build the per-layer params by introspecting the GGUF tensors instead.
+    let mut q_proj_out: Vec<usize> = vec![4096; num_layers];
+    let mut k_proj_out: Vec<usize> = vec![2048; num_layers];
+    for i in 0..num_layers {
+        if let Some(info) = model
+            .file
+            .get_tensor_info(&format!("blk.{}.attn_q.weight", i))
+        {
+            q_proj_out[i] = info.dimensions[1] as usize;
+        }
+        if let Some(info) = model
+            .file
+            .get_tensor_info(&format!("blk.{}.attn_k.weight", i))
+        {
+            k_proj_out[i] = info.dimensions[1] as usize;
+        }
+    }
+
+    (0..num_layers)
+        .map(|i| {
+            let kv = head_count_kv.get(i).copied().unwrap_or(8) as usize;
+            let is_swa = swa_pattern.get(i).copied().unwrap_or(false);
+            // Gemma 4 has 16 Q-heads always.  Each Q-head contains a Q
+            // vector; sliding layers also fold V into the *second half*
+            // of the same Q-head, so the total Q_proj_out = num_heads * head_dim
+            // for global layers and  num_heads * 2 * head_dim for sliding.
+            let num_heads: usize = 16;
+            let q_per_head = (if is_swa { 2 } else { 1 }) * num_heads;
+            let q_total = *q_proj_out.get(i).unwrap_or(&4096);
+            let k_total = *k_proj_out.get(i).unwrap_or(&2048);
+            let q_head_dim = if q_per_head > 0 {
+                q_total / q_per_head
+            } else {
+                256
+            };
+            let k_head_dim = if kv > 0 { k_total / kv } else { q_head_dim };
+            GemmaLayerParams {
+                num_kv_heads: kv,
+                q_head_dim,
+                k_head_dim,
+                v_head_dim: q_head_dim,
+                is_global: !is_swa,
+                rope_theta: if is_swa {
+                    rope_theta_swa
+                } else {
+                    rope_theta_global
+                },
+            }
+        })
+        .collect()
 }

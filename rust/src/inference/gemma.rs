@@ -4,54 +4,43 @@
 //! that matter here:
 //!
 //! 1. **RMSNorm scaling**: Gemma RMSNorm applies `(1 + weight)` instead of
-//!    just `weight`.  This is the conv:
-//!       y = x / sqrt(mean(x²) + eps) * (1 + w)
-//!    whereas the rest of the world (Llama, Qwen, Mistral, Phi, DeepSeek)
-//!    does:
-//!       y = x / sqrt(mean(x²) + eps) * w
+//!    just `weight`.  
+//! 2. **Per-head RMSNorm on Q and K**: from Gemma 2 onward, codified in
+//!    Gemma 3/4. Handled inside `attention::attention_forward`.
+//! 3. **Alternating attention layers**: from Gemma 3 onward, alternating
+//!    global vs sliding-window layers per metadata pattern. Read from
+//!    `gemma4.attention.sliding_window_pattern` etc.
 //!
-//! 2. **Per-head RMSNorm on Q and K**: starts from Gemma 2, codified in
-//!    Gemma 3/4.  `attn_q_norm.weight` / `attn_k_norm.weight` are tensors
-//!    of length `head_dim`, applied per-head before RoPE.  This is already
-//!    implemented in `attention::attention_forward` (it reads those names
-//!    directly from the layer weights map).
-//!
-//! 3. **Alternating attention layers**: from Gemma 3 onwards, an attention
-//!    layer is either "global" (full causal) or "sliding-window" (causal +
-//!    window mask + 1 KV head with broadcast).  The dataset/group/range
-//!    comes from metadata:
-//!       * `gemma4.attention.head_count_kv[]` — per-layer KV head count
-//!       * `gemma4.attention.sliding_window_pattern[]` — bool per layer
-//!       * `gemma4.attention.key_length` / `value_length` — global dims
-//!       * `gemma4.attention.key_length_swa` / `value_length_swa` — SWA dims
-//!
-//! S ("sliding") layers additionally fold `attn_v` into the second half of
-//! `attn_q` so the LayerN tensor subset is just `[attn_q, attn_k]` (no
+//! S ("sliding") layers also fold `attn_v` into the second half of
+//! `attn_q`, so the GGUF tensor subset is just `[attn_q, attn_k]` (no
 //! `attn_v`).  We reconstruct the fused Q+V tensor at runtime before
 //! dispatching to `attention::attention_forward` in fused-QKV mode.
 //!
-//! `gemma_attention_forward` is the bridge from the engine loop to the
-//! existing attention math.
+//! `gemma_layer_forward` is the single entry point the engine calls.
 
 use super::attention::{attention_forward, AttentionParams};
 use crate::cache::KVCache;
 use crate::model::tensor::Tensor;
 use std::collections::HashMap;
 
+/// Helper: remove a weight from the map, materialize its f32 data (if it
+/// was loaded as quantized-only), and re-insert it.  This is the cleanest
+/// way to drop the borrow on the map before doing further lookups.
+fn materialize_in_place(weights: &mut HashMap<String, Tensor>, key: &str) {
+    if let Some(mut t) = weights.remove(key) {
+        t.materialize_data();
+        weights.insert(key.to_string(), t);
+    }
+}
+
 /// Per-layer Gemma config, derived from `gemma4.attention.*` metadata.
 #[derive(Debug, Clone)]
 pub struct GemmaLayerParams {
-    /// number of KV heads (1 for SWA layers on Gemma 3/4, 8 for global)
     pub num_kv_heads: usize,
-    /// head_dim for Q on this layer (e.g. 256)
     pub q_head_dim: usize,
-    /// head_dim for K on this layer (256 for global, 256 for SWA)
     pub k_head_dim: usize,
-    /// head_dim for V on this layer
     pub v_head_dim: usize,
-    /// whether this layer is "sliding-window" (alternating pattern)
     pub is_global: bool,
-    /// RoPE theta (global freq_base or freq_base_swa depending on layer)
     pub rope_theta: f32,
 }
 
@@ -69,14 +58,11 @@ impl Default for GemmaLayerParams {
 }
 
 /// Gemma-flavor RMSNorm: `y = x * inv_rms * (1 + w)`.
-///
-/// `weight` is the per-element scale.  `eps` is the layer-norm epsilon
-/// (Gemma default is `1e-6`).
 pub fn gemma_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
     let n = x.shape.last().copied().unwrap_or(x.data.len());
-    let seq = x.data.len() / n;
+    let seq = x.data.len() / n.max(1);
     let mut out = Vec::with_capacity(seq * n);
-    if seq == 0 {
+    if seq == 0 || n == 0 {
         return Tensor::zeros(x.shape.clone());
     }
     let inv_n = 1.0 / n as f32;
@@ -93,13 +79,7 @@ pub fn gemma_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
     Tensor::from_vec(out, x.shape.clone())
 }
 
-/// GeGLU FFN forward, Gemma 3-style.
-///
-///     z = GeLU((gate  * x))  ⊙ (up * x)
-///     y = down × z
-///
-/// where GeLU here is the *exact* tanh-based GeLU defined in:
-///     `0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 x³)))`
+/// GeGLU FFN: `down × (GeLU(gate × x) ⊙ (up × x))`.
 pub fn gemma_ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {
     let gate = weights
         .get("mlp.gate_proj.weight")
@@ -110,191 +90,270 @@ pub fn gemma_ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tenso
         .expect("Missing down_proj");
     let gate_proj = x.matmul(gate);
     let up_proj = x.matmul(up);
-    // Apply GeLU to gate, then elementwise multiply with up.
     let mut fused = vec![0.0f32; gate_proj.data.len()];
     let inv_sqrt_2_pi = (2.0f32 / std::f32::consts::PI).sqrt();
     for i in 0..gate_proj.data.len() {
         let gv = gate_proj.data[i];
-        // exact GeLU
         let gelu = 0.5 * gv
-            * (1.0 + (inv_sqrt_2_pi * (gv + 0.044715 * gv * gv * gv)).tanh());
+            * (1.0
+                + (inv_sqrt_2_pi * (gv + 0.044715 * gv * gv * gv)).tanh());
         fused[i] = gelu * up_proj.data[i];
     }
-    let fused_tensor = Tensor::from_vec(fused, gate_proj.shape.clone());
-    fused_tensor.matmul(down)
+    Tensor::from_vec(fused, gate_proj.shape.clone()).matmul(down)
 }
 
-/// Mask out positions that violate a sliding window: for token at
-/// position `t`, we only allow attending to `(t-window+1)..=t`.  `window`
-/// is the SWA size (1024 for Gemma-3/4).
+/// Build a synthetic fused QKV tensor for a Gemma-style attention layer.
+/// On G ("global") layers, K and V are independent tensors.  On S
+/// ("sliding") layers, V is baked into the second half of the projected
+/// Q tensor (Gemma 3+ convention).
+/// Build a synthetic fused QKV weight matrix for a Gemma-style attention layer.
+/// Output shape is `[hidden_size, total_out_dim]` so it can be `matmul`'d as
+/// `hidden @ qkv_weight` to produce `[seq_len, total_out_dim]`.
 ///
-/// This is invoked from the engine *after* the existing `attention_forward`
-/// returns if the layer was a SWA layer, by overwriting the cached K/V for
-/// tokens outside the window with NaN-equivalent (we instead take the
-/// cheaper route: encode the SWA mask into the per-layer params so the
-/// attention_forward itself respects it).
-pub fn gemma_attention_forward(
+/// On G ("global") layers, K and V are independent tensors.  On S
+/// ("sliding") layers, V is baked into the second half of the projected
+/// Q tensor — q_proj is twice the size of K_proj.
+//
+// Refactor: instead of taking matmul of hidden with each projection, then
+// concatenating result tensors, we *build a single weight matrix* by
+// column-stacking the gguf weights.  Because GGUF weights are stored as
+// [in, out] row-major, those are already in the form `[in_dim, out_dim]`,
+// so we can just stick them side-by-side along the output axis.
+pub fn gemma_fused_qkv(_hidden: &Tensor, layer_weights: &mut HashMap<String, Tensor>) -> Tensor {
+    // Locate + materialize f32 data from the quantized weight (loader stores
+    // Q4_K/Q6_K tensors with empty `data` and populated `q_data`).
+    materialize_in_place(layer_weights, "self_attn.q_proj.weight");
+    materialize_in_place(layer_weights, "self_attn.k_proj.weight");
+    materialize_in_place(layer_weights, "self_attn.v_proj.weight");
+    let q_w = layer_weights
+        .get("self_attn.q_proj.weight")
+        .or_else(|| layer_weights.get("attn_q.weight"))
+        .expect("gemma_fused_qkv: missing attn_q/attn_q_proj.weight");
+    let k_w = layer_weights
+        .get("self_attn.k_proj.weight")
+        .or_else(|| layer_weights.get("attn_k.weight"))
+        .expect("gemma_fused_qkv: missing attn_k/attn_k_proj.weight");
+    assert_eq!(q_w.shape.len(), 2, "weight must be 2-D, got {:?}", q_w.shape);
+    assert_eq!(k_w.shape.len(), 2, "weight must be 2-D, got {:?}", k_w.shape);
+
+    // Try a separate V projection first.
+    let v_w_opt = layer_weights
+        .get("self_attn.v_proj.weight")
+        .or_else(|| layer_weights.get("attn_v.weight"));
+
+    if let Some(v_w) = v_w_opt {
+        // Global (G) layer: K and V are independent projections.
+        assert_eq!(v_w.shape.len(), 2, "weight must be 2-D, got {:?}", v_w.shape);
+        // Stack Q, K, V along the output axis (column-wise concat).
+        // All have same in_dim (hidden_size).
+        let in_dim = q_w.shape[0];
+        let q_out = q_w.shape[1];
+        let k_out = k_w.shape[1];
+        let v_out = v_w.shape[1];
+        let total_out = q_out + k_out + v_out;
+        // GGUF row-major GGUF, so each weight is contiguous in dim 1 then 0.
+        // Stacking along output axis: out[i] is from q, k, or v based on column.
+        let mut data = vec![0.0f32; in_dim * total_out];
+        for r in 0..in_dim {
+            let q_row = &q_w.data[r * q_out..(r + 1) * q_out];
+            let k_row = &k_w.data[r * k_out..(r + 1) * k_out];
+            let v_row = &v_w.data[r * v_out..(r + 1) * v_out];
+            let mut dst = &mut data[r * total_out..r * total_out + q_out];
+            dst.copy_from_slice(q_row);
+            let mut dst = &mut data[r * total_out + q_out..r * total_out + q_out + k_out];
+            dst.copy_from_slice(k_row);
+            let mut dst = &mut data[r * total_out + q_out + k_out..r * total_out + total_out];
+            dst.copy_from_slice(v_row);
+        }
+        Tensor::from_vec(data, vec![in_dim, total_out])
+    } else {
+        // Gemma 4 GLOBAL layer with single KV head: no V projection in GGUF.
+        // Reference impl: V = K (llama.cpp gemma4.cpp line 247-248 — when V is
+        // absent, Vcur is aliased to Kcur).  We build [Q_full | K | K_clone]
+        // so attention_forward splits it into Q, K, V where V == K's values.
+        // Per llama.cpp the engine check attention_forward's V tensor uses
+        // `v.data` which is now K's contents — attention math is correct.
+        let in_dim = q_w.shape[0];
+        let q_total = q_w.shape[1];
+        let k_out = k_w.shape[1];
+        let v_out = k_out; // V = K shape
+        let total_out = q_total + k_out + v_out;
+        let mut data = vec![0.0f32; in_dim * total_out];
+        for r in 0..in_dim {
+            let q_row = &q_w.data[r * q_total..(r + 1) * q_total];
+            let k_row = &k_w.data[r * k_out..(r + 1) * k_out];
+            let dst_start = r * total_out;
+            data[dst_start..dst_start + q_total].copy_from_slice(q_row);
+            data[dst_start + q_total..dst_start + q_total + k_out].copy_from_slice(k_row);
+            data[dst_start + q_total + k_out..dst_start + total_out].copy_from_slice(k_row);
+        }
+        Tensor::from_vec(data, vec![in_dim, total_out])
+    }
+}
+
+
+/// Run a single Gemma-3/4 transformer block for one layer.
+///
+/// Sequence of operations per official Gemma spec:
+/// ```text
+///   pre_attn = rms_norm(x, attn_norm_w) * (1 + attn_norm_w)
+///   attn_out = attention(pre_attn)
+///   attn_proj_normed = rms_norm(attn_out, post_attention_norm_w) * (1 + ...)
+///   x = x + attn_proj_normed * layer_output_scale_w
+///
+///   ffn_in = rms_norm(x, ffn_norm_w) * (1 + ffn_norm_w)
+///   ffn_out = ffn(ffn_in)            # GeGLU
+///   ffn_proj_normed = rms_norm(ffn_out, post_ffw_norm_w) * (1 + ...)
+///   x = x + ffn_proj_normed * layer_output_scale_w
+/// ```
+pub fn gemma_layer_forward(
     hidden: &Tensor,
-    layer_weights: &HashMap<String, Tensor>,
+    layer_weights: &mut HashMap<String, Tensor>,
     layer_cfg: &GemmaLayerParams,
     global_cfg: &AttentionParams,
     kv_cache: &mut KVCache,
     layer_idx: usize,
     position_offset: usize,
+    rms_eps: f32,
 ) -> Tensor {
-    // Gemma's GQA pattern in SWA layers folds V into the second half of Q.
-    // To avoid touching the existing attention math, we build a synthetic
-    // "fused QKV" Tensor in the same memory layout the existing
-    // attention_forward supports with `use_fused_qkv = true`:
-    //
-    //   rows = seq_len
-    //   cols = (Q_heads × Q_head_dim) + (KV_heads × K_head_dim) + (KV_heads × V_head_dim)
-    //
-    // For a SWA Gemma layer that gives:
-    //   8192 (Q+V fused) + 256 (single KV head) + 256 (V projected later
-    //   actually baked into Q) + 256 (V from Q's lower half) = 8704
-    // but the existing attention_forward expects V in the third slot, so
-    // we lift V from the lower half of Q.
-    let seq_len = hidden.shape[0];
-    let qkv_tensor: Tensor =
-        if layer_weights.contains_key("self_attn.v_proj.weight")
-            || layer_weights.contains_key("attn_v.weight")
-        {
-            // G (global) layer — has separate attn_v. Build full fused QKV.
-            build_fused_qkv_from_separate(hidden, layer_weights, layer_cfg)
-        } else {
-            // S (sliding) layer — V is baked into the second half of attn_q.
-            build_fused_qqv(hidden, layer_weights, layer_cfg)
-        };
+    // ── Attention sub-block ──
+    // Gemma's `attn_norm.weight` is engine-mapped to `input_layernorm.weight`
+    // (per arch.rs tensor-mapping table). Fall back to either name.
+    let attn_norm_w = layer_weights
+        .get("attn_norm.weight")
+        .or_else(|| layer_weights.get("input_layernorm.weight"))
+        .expect("Missing attn_norm / input_layernorm");
+    let pre_attn = gemma_rms_norm(hidden, attn_norm_w, rms_eps);
+    let qkv = gemma_fused_qkv(&pre_attn, layer_weights);
+    let mut weights_with_qkv = layer_weights.clone();
+    weights_with_qkv.insert("attn_qkv.weight".to_string(), qkv);
 
-    // Construct per-layer params for the existing attention_forward.
+    // Build per-layer AttentionParams from ACTUAL layer tensor shapes, not
+    // from infer_gemma_layouts metadata — sliding-window layers can have
+    // q_proj_out doubled (V baked into Q), and we need head_dim to match
+    // total q_proj_out / num_heads so attention_forward shapes line up.
+    let q_proj = layer_weights
+        .get("self_attn.q_proj.weight")
+        .or_else(|| layer_weights.get("attn_q.weight"));
+    let k_proj = layer_weights
+        .get("self_attn.k_proj.weight")
+        .or_else(|| layer_weights.get("attn_k.weight"));
+    let v_proj = layer_weights
+        .get("self_attn.v_proj.weight")
+        .or_else(|| layer_weights.get("attn_v.weight"));
+    // Default values from layer_cfg (which itself comes from GGUF metadata).
+    let mut num_heads: usize = 16;
+    let mut num_kv_heads = layer_cfg.num_kv_heads;
+    let mut head_dim = layer_cfg.q_head_dim;
+    let mut kv_head_dim = layer_cfg.k_head_dim;
+    // True if V exists as a separate projection (G-layer); otherwise V is
+    // baked into the second half of Q's projection (S-layer) and head_dim is
+    // actually q_proj_out / num_heads (no doubling of head_dim).
+    let has_separate_v = v_proj.is_some();
+    if let Some(q) = q_proj {
+        if let Some(k) = k_proj {
+            let q_out = q.shape[1];
+            let k_out = k.shape[1];
+            if has_separate_v {
+                // G layer: q_out = num_heads * head_dim, k_out = num_kv_heads * kv_head_dim.
+                head_dim = if num_heads > 0 { q_out / num_heads } else { head_dim };
+                kv_head_dim = if num_kv_heads > 0 { k_out / num_kv_heads } else { kv_head_dim };
+            } else {
+                // S layer: q_out = num_heads * (head_dim + kv_head_dim) IF
+                // each Q-head has a paired V-head, OR q_out = num_heads *
+                // head_dim where each head_dim already includes Q+V halves.
+                // We pick head_dim such that attention_forward sees:
+                //   q_dim_total = q_out (the whole Q projection), because
+                // the engine's matmul shape expects q_dim = num_heads * head_dim
+                // and total_fused = q_dim + 2*kv_dim where the V lives in the
+                // second half of Q's projection.
+                head_dim = if num_heads > 0 { q_out / num_heads } else { head_dim };
+                // Decide kv_head_dim: assume num_kv_heads stays at
+                // layer_cfg.num_kv_heads (per metadata).
+                if num_kv_heads > 0 {
+                    kv_head_dim = (k_out / num_kv_heads).max(1);
+                } else {
+                    num_kv_heads = 1;
+                    kv_head_dim = k_out;
+                }
+            }
+        }
+    }
     let per_layer = AttentionParams {
-        num_heads: global_cfg.num_heads,
-        num_kv_heads: layer_cfg.num_kv_heads,
-        head_dim: layer_cfg.q_head_dim,
-        kv_head_dim: layer_cfg.k_head_dim,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        kv_head_dim,
         rope_theta: layer_cfg.rope_theta,
         rope_dim: global_cfg.rope_dim,
         use_fused_qkv: true,
         use_gate: false,
-        // SWA: window_size controls attention mask range inside attention_forward;
-        //   positive means a sliding window.
-        window_size: if layer_cfg.is_global {
-            0
-        } else {
-            // Gemma 3/4 SWA window size (1024)
-            1024
-        },
+        // sliding layers use window_size=1024; global layers use 0 (no mask)
+        window_size: if layer_cfg.is_global { 0 } else { 1024 },
     };
+    let attn_out = attention_forward(
+        &pre_attn,
+        &weights_with_qkv,
+        &per_layer,
+        kv_cache,
+        layer_idx,
+        position_offset,
+    );
 
-    // Build a one-layer weights map that has `attn_qkv.weight` instead of
-    // the separate Q/K/V tensors, so attention_forward's fused path
-    // succeeds.
-    let mut weights = layer_weights.clone();
-    weights.insert("attn_qkv.weight".to_string(), qkv_tensor);
+    // post-attention norm on attn_out
+    let post_attn_w = layer_weights
+        .get("post_attention_norm.weight")
+        .expect("Missing post_attention_norm");
+    let attn_normed = gemma_rms_norm(&attn_out, post_attn_w, rms_eps);
 
-    attention_forward(hidden, &weights, &per_layer, kv_cache, layer_idx, position_offset)
+    // layer_output_scale (scalar). Gemma stores it as a [1]-dim F32 tensor.
+    let scale_w = layer_weights.get("layer_output_scale.weight");
+    let attn_contrib = if let Some(sw) = scale_w {
+        let s = sw.data[0];
+        let mut d = attn_normed.data.clone();
+        for v in d.iter_mut() {
+            *v *= s;
+        }
+        Tensor::from_vec(d, attn_normed.shape.clone())
+    } else {
+        attn_normed
+    };
+    let mut x = hidden.add(&attn_contrib);
+
+    // ── FFN sub-block ──
+    // `ffn_norm.weight` is engine-mapped to `post_attention_layernorm.weight`.
+    let ffn_norm_w = layer_weights
+        .get("ffn_norm.weight")
+        .or_else(|| layer_weights.get("post_attention_layernorm.weight"))
+        .expect("Missing ffn_norm / post_attention_layernorm");
+    let ffn_in = gemma_rms_norm(&x, ffn_norm_w, rms_eps);
+    let ffn_out = gemma_ffn_forward(&ffn_in, layer_weights);
+    let post_ffw_w = layer_weights
+        .get("post_ffw_norm.weight")
+        .expect("Missing post_ffw_norm");
+    let ffn_normed = gemma_rms_norm(&ffn_out, post_ffw_w, rms_eps);
+    let ffn_contrib = if let Some(sw) = scale_w {
+        let s = sw.data[0];
+        let mut d = ffn_normed.data.clone();
+        for v in d.iter_mut() {
+            *v *= s;
+        }
+        Tensor::from_vec(d, ffn_normed.shape.clone())
+    } else {
+        ffn_normed
+    };
+    x = x.add(&ffn_contrib);
+    x
 }
 
-// ---------------------------------------------------------------------------
-// Internal builders
-// ---------------------------------------------------------------------------
-
-/// Build a synthetic `attn_qkv.weight` Tensor from separate Q/K/V tensors
-/// for a Gemma-style GQA layer.
-fn build_fused_qkv_from_separate(
-    hidden: &Tensor,
-    layer_weights: &HashMap<String, Tensor>,
-    layer_cfg: &GemmaLayerParams,
-) -> Tensor {
-    let q = layer_weights
-        .get("self_attn.q_proj.weight")
-        .or_else(|| layer_weights.get("attn_q.weight"))
-        .expect("Missing q_proj for gemma fused-QKV builder");
-    let k = layer_weights
-        .get("self_attn.k_proj.weight")
-        .or_else(|| layer_weights.get("attn_k.weight"))
-        .expect("Missing k_proj for gemma fused-QKV builder");
-    let v = layer_weights
-        .get("self_attn.v_proj.weight")
-        .or_else(|| layer_weights.get("attn_v.weight"))
-        .expect("Missing v_proj for gemma fused-QKV builder");
-    let seq_len = hidden.shape[0];
-    let q_proj = hidden.matmul(q);
-    let k_proj = hidden.matmul(k);
-    let v_proj = hidden.matmul(v);
-
-    let q_dim = q_proj.shape[1];
-    let kv_dim = k_proj.shape[1];
-    let total = q_dim + kv_dim * 2;
-    let mut fused = vec![0.0f32; seq_len * total];
-    for s in 0..seq_len {
-        fused[s * total..s * total + q_dim].copy_from_slice(&q_proj.data[s * q_dim..(s + 1) * q_dim]);
-        fused[s * total + q_dim..s * total + q_dim + kv_dim]
-            .copy_from_slice(&k_proj.data[s * kv_dim..(s + 1) * kv_dim]);
-        fused[s * total + q_dim + kv_dim..s * total + total]
-            .copy_from_slice(&v_proj.data[s * kv_dim..(s + 1) * kv_dim]);
+/// Apply Gemma logit soft-capping: clamp out-of-range logits via `tanh`.
+pub fn apply_logit_softcap(logits: &mut [f32], cap: f32) {
+    if cap <= 0.0 {
+        return;
     }
-    let _ = layer_cfg; // dims needed later (e.g. for rope_dim inside attention_forward)
-    Tensor::from_vec(fused, vec![seq_len, total])
-}
-
-/// Build a synthetic `attn_qkv.weight` Tensor where V is the second half of
-/// the projected Q tensor (Gemma-3/4 sliding-window convention).
-fn build_fused_qqv(
-    hidden: &Tensor,
-    layer_weights: &HashMap<String, Tensor>,
-    layer_cfg: &GemmaLayerParams,
-) -> Tensor {
-    let q = layer_weights
-        .get("self_attn.q_proj.weight")
-        .or_else(|| layer_weights.get("attn_q.weight"))
-        .expect("Missing q_proj for gemma fused-QQV builder");
-    let k = layer_weights
-        .get("self_attn.k_proj.weight")
-        .or_else(|| layer_weights.get("attn_k.weight"))
-        .expect("Missing k_proj for gemma fused-QQV builder");
-
-    let seq_len = hidden.shape[0];
-    let q_proj = hidden.matmul(q);
-    let k_proj = hidden.matmul(k);
-
-    // Q_proj is sized [seq, 2 * Q_heads × Q_head_dim] = [seq, 2 * Q × HD_Q].
-    // We reinterpret as: rows [0..Q*HD) are Q, rows [Q*HD..2*Q*HD) are V.
-    let q_total = q_proj.shape[1];
-    let kv_dim = k_proj.shape[1];
-    debug_assert_eq!(q_total, layer_cfg.q_head_dim * 2 * SomeN(global_cfg_total_heads(layer_cfg)));
-    // The fused QKV layout requested by attention_forward is
-    //   [Q(K projected) | K | V]
-    // where V's head_dim is `v_head_dim`.  When V is baked into Q's second
-    // half, the Q-projection's *second half* uses 2x the storage but the
-    // requested output V has head_dim = q_head_dim == v_head_dim (Gemma
-    // preserves this symmetry).  So we just slice
-    //   Q[right_half]   ->  V rows
-    // and join as [Q | K | V].
-    let half = q_total / 2;
-    let total = half + kv_dim + half;
-    let mut fused = vec![0.0f32; seq_len * total];
-    for s in 0..seq_len {
-        fused[s * total..s * total + half].copy_from_slice(&q_proj.data[s * q_total..s * q_total + half]);
-        fused[s * total + half..s * total + half + kv_dim]
-            .copy_from_slice(&k_proj.data[s * kv_dim..(s + 1) * kv_dim]);
-        fused[s * total + half + kv_dim..s * total + total]
-            .copy_from_slice(&q_proj.data[s * q_total + half..(s + 1) * q_total]);
+    for v in logits.iter_mut() {
+        *v = cap * ((*v) / cap).tanh();
     }
-    Tensor::from_vec(fused, vec![seq_len, total])
-}
-
-fn SomeN(_: usize) -> usize {
-    // Pull num_heads from somewhere — in real model code the engine has
-    // `global_cfg.num_heads` in scope.  We default to a sane 16 here so
-    // the assertion does not fire even when the gemma path is exercised
-    // standalone.
-    16
-}
-
-fn global_cfg_total_heads(_: &GemmaLayerParams) -> usize {
-    16
 }
 
 #[cfg(test)]
@@ -302,28 +361,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn gemma_rms_norm_uses_one_plus_weight() {
-        let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
-        let w = Tensor::from_vec(vec![0.5, 0.0], vec![2]);
-        let y = gemma_rms_norm(&x, &w, 1e-6);
-        // First row, first col:
-        //   sum_sq = 1² + 2² = 5  rms = sqrt(2.5 + 1e-6) ≈ 1.5811
-        //   inv_rms ≈ 0.6325  (1 + w) = 1.5
-        //   y = 1.0 * 0.6325 * 1.5 ≈ 0.9487
-        let r0 = y.data[0];
-        assert!((0.94..0.96).contains(&r0));
-        // Second row, second col: x=4, w=0, (1+w)=1
-        //   sum_sq = 3² + 4² = 25  rms = sqrt(12.5) ≈ 3.5355
-        //   inv_rms ≈ 0.2828   y = 4 * 0.2828 * 1 ≈ 1.131
-        let r3 = y.data[3];
-        assert!((1.10..1.16).contains(&r3));
-    }
-
-    #[test]
     fn gemma_layer_params_default_is_global_8_kv_heads() {
         let l = GemmaLayerParams::default();
         assert!(l.is_global);
         assert_eq!(l.num_kv_heads, 8);
         assert_eq!(l.q_head_dim, 256);
+    }
+
+    #[test]
+    fn gemma_rms_norm_uses_one_plus_weight() {
+        let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        let w = Tensor::from_vec(vec![0.5, 0.0], vec![2]);
+        let y = gemma_rms_norm(&x, &w, 1e-6);
+        // row 0: rms ≈ sqrt(2.5)≈1.58, inv_rms≈0.6325, (1+w)=1.5
+        //   y[0] = 1 * 0.6325 * 1.5 ≈ 0.949
+        let r0 = y.data[0];
+        assert!((0.94..0.96).contains(&r0), "r0 = {r0}");
+        // row 1 col 1: rms ≈ sqrt(12.5)≈3.536, inv_rms≈0.283, w=0
+        //   y[3] = 4 * 0.283 * 1 ≈ 1.131
+        let r3 = y.data[3];
+        assert!((1.10..1.16).contains(&r3), "r3 = {r3}");
+    }
+
+    #[test]
+    fn apply_logit_softcap_clips_when_cap_set() {
+        let mut logits = vec![100.0, 0.0, -100.0, 60.0];
+        apply_logit_softcap(&mut logits, 30.0);
+        // |x|=100 is far past cap, so |result| < cap (≈ 30).
+        assert!(logits[0].abs() <= 30.0 + 1e-3, "logits[0]={}", logits[0]);
+        assert!((logits[1]).abs() < 1e-6);
+        // tanh(60/30) = tanh(2) ≈ 0.964
+        let p = 30.0_f32 * (60.0_f32 / 30.0).tanh();
+        assert!((logits[3] - p).abs() < 1e-3, "logits[3]={} want {}", logits[3], p);
+    }
+
+    #[test]
+    fn apply_logit_softcap_passthrough_when_cap_zero() {
+        let mut logits = vec![100.0, 0.0];
+        apply_logit_softcap(&mut logits, 0.0);
+        assert_eq!(logits[0], 100.0);
+        assert_eq!(logits[1], 0.0);
     }
 }

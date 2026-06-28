@@ -162,10 +162,28 @@ impl GGUFModel {
         let mut cfg = ModelConfig::default();
         let prefix = arch.metadata_prefix();
 
-        cfg.hidden_size = Self::get_meta_int(file, &[&format!("{}.embedding_length", prefix), "llama.embedding_length", "mistral3.embedding_length", "qwen2.embedding_length", "qwen35.embedding_length"])
-            .map(|v| v as usize).unwrap_or(cfg.hidden_size);
-        cfg.num_hidden_layers = Self::get_meta_int(file, &[&format!("{}.block_count", prefix), "llama.block_count", "mistral3.block_count", "qwen2.block_count", "qwen35.block_count"])
-            .map(|v| v as usize).unwrap_or(cfg.num_hidden_layers);
+        cfg.hidden_size = Self::get_meta_int(file, &[
+            &format!("{}.embedding_length", prefix),
+            "llama.embedding_length",
+            "mistral3.embedding_length",
+            "qwen2.embedding_length",
+            "qwen35.embedding_length",
+            "gemma3.embedding_length",
+            "gemma4.embedding_length",
+        ])
+        .map(|v| v as usize)
+        .unwrap_or(cfg.hidden_size);
+        cfg.num_hidden_layers = Self::get_meta_int(file, &[
+            &format!("{}.block_count", prefix),
+            "llama.block_count",
+            "mistral3.block_count",
+            "qwen2.block_count",
+            "qwen35.block_count",
+            "gemma3.block_count",
+            "gemma4.block_count",
+        ])
+        .map(|v| v as usize)
+        .unwrap_or(cfg.num_hidden_layers);
         
         // Qwen3.5/3.6: subtract NextN/MTP layers from the main transformer count
         // (they are stored as extra decoder blocks but not executed in the main pass)
@@ -224,12 +242,13 @@ impl GGUFModel {
 
         // Gemma logit soft-capping (e.g., gemma3.logit_cap = 30.0)
         cfg.logit_soft_cap = Self::get_meta_f32(file, &[
-                &format!("{}.logit_cap", prefix),
-                "gemma.logit_cap",
-                "gemma2.logit_cap",
-                "gemma3.logit_cap",
-            ])
-            .unwrap_or(cfg.logit_soft_cap);
+            &format!("{}.logit_cap", prefix),
+            "gemma.logit_cap",
+            "gemma2.logit_cap",
+            "gemma3.logit_cap",
+            "gemma4.final_logit_softcapping",
+        ])
+        .unwrap_or(cfg.logit_soft_cap);
 
         // Compute head dimensions
         // For most models: head_dim = hidden_size / num_attention_heads.

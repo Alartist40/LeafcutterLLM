@@ -91,20 +91,23 @@ impl ModelArchitecture {
             ModelArchitecture::Unknown => "llama", // best-effort fallback
         }
     }
-
     /// Whether the full inference stack supports this architecture.
     ///
     /// "Supported" here means: we have the correct layer weight mappings
-    /// and attention/FFN structure implemented.
+    /// and attention/FFN structure implemented.  Gemma-3/4 is supported
+    /// for text models (12B It is the verification target).
     pub fn is_supported(self) -> bool {
-        matches!(self,
-            ModelArchitecture::Llama |
-            ModelArchitecture::Qwen2 |
-            ModelArchitecture::Qwen35 |
-            ModelArchitecture::Qwen36 |
-            ModelArchitecture::Mistral |
-            ModelArchitecture::Yi |
-            ModelArchitecture::Nemotron
+        matches!(
+            self,
+            ModelArchitecture::Llama
+                | ModelArchitecture::Qwen2
+                | ModelArchitecture::Qwen35
+                | ModelArchitecture::Qwen36
+                | ModelArchitecture::Mistral
+                | ModelArchitecture::Phi
+                | ModelArchitecture::Gemma
+                | ModelArchitecture::Yi
+                | ModelArchitecture::Nemotron
         )
     }
 
@@ -211,6 +214,10 @@ impl ModelArchitecture {
                 // Gemma-specific forward path.
                 ("attn_norm.weight", "input_layernorm.weight"),
                 ("ffn_norm.weight", "post_attention_layernorm.weight"),
+                // Gemma 4 has two extra per-layer RMSNorms applied AFTER
+                // attention and AFTER FFN, before the residual add.
+                ("post_attention_norm.weight", "post_attention_norm.weight"),
+                ("post_ffw_norm.weight", "post_ffw_norm.weight"),
                 // Layer-output scale (scalar, Gemma 3+)
                 ("layer_output_scale.weight", "layer_output_scale.weight"),
             ],
@@ -261,9 +268,16 @@ impl ModelArchitecture {
                 "nextn.enorm.weight",
                 "nextn.hnorm.weight",
             ],
-            ModelArchitecture::Llama => &[
-                "attn_norm.bias",
-                "ffn_norm.bias",
+            ModelArchitecture::Llama => &["attn_norm.bias", "ffn_norm.bias"],
+            ModelArchitecture::Gemma => &[
+                // Per-head RMSNorm on Q / K (Gemma 2+)
+                "attn_q_norm.weight",
+                "attn_k_norm.weight",
+                // Gemma 4-norm layout: post-attention and post-ffw norms
+                "post_attention_norm.weight",
+                "post_ffw_norm.weight",
+                // Per-layer scalar residual scale
+                "layer_output_scale.weight",
             ],
             _ => &[],
         }

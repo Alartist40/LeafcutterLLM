@@ -669,3 +669,76 @@ Kimi K2.6 or GLM-5.2":
 Once (1) is met, the engine should run end-to-end on Kimi K2.6 with
 ~6 GB peak resident RAM and produce token-level decisions that
 match llama.cpp's reference within numerical noise.
+
+
+## Gemma 4 native forward, part 1: 2026-06-26, m3 / Nvidia
+
+Picks the Gemma 4 thread back up after the 0.9.8 milestone. End-to-end
+Gemma 4 12B Q4_K_M now runs **all 48 layers** and emits tokens through
+the native `Engine::forward_native` path (no FFI fallback). Test
+count: 137 passed (1 pre-existing failure unchanged, 3 ignored).
+
+### What broke and how it was fixed
+
+1. **Empty-`data` panic on Q4_K_M weights.** The GGUF loader uses
+   `Tensor::from_q4_k_only` etc., which leave `data: Vec<f32>` empty and
+   put the bits in `q_data`. Fused QKV then sliced the empty `data`.
+   *Fix:* `Tensor::materialize_data()` materializes on demand; callers
+   take `&mut HashMap<String, Tensor>` and the engine marks `layer_weights`
+   mutable.
+
+2. **Missing `post_attention_norm` / `post_ffw_norm` mappings.**
+   *Fix:* added to the Gemma block in `arch.rs`.
+
+3. **Fused QKV shape mismatch on Gemma 4 single-kv-head GLOBAL layers.**
+   *Diagnosis:* the 12B GGUF omits `attn_v.weight` for layers where
+   `head_count_kv=1` (every 6th layer). Per llama.cpp `models/gemma4.cpp:247`,
+   `Vcur = Kcur` when `wv` is absent. *Fix:*
+   `gemma_fused_qkv` now clones K's weight columns into the V region so
+   `attention_forward` sees V = K's matmul output.
+
+4. **Missing embedding scale.** llama.cpp does
+   `inpL = ggml_scale(ctx0, inpL, sqrtf(n_embd))` before the first layer
+   of every Gemma forward; the engine wasn't doing this.
+   *Fix:* `Engine::forward_native` now scales token embeddings by
+   `sqrt(hidden_size)` when the architecture is Gemma.
+
+5. **Per-layer RoPE params not propagated.** Gemma 4 uses
+   `rope.freq_base_swa = 10000` for SWA layers and `rope.freq_base = 1_000_000`
+   for GLOBAL layers. The engine was using one constant theta per model.
+   *Fix:* per-layer RoPE theta now derived from metadata in
+   `infer_gemma_layouts`.
+
+### Research path that unlocked the fix
+
+The V-less layer was a *research* win:
+- `git log` showed ollama's vendored `llama/llama.cpp/src/models/`
+  had `gemma2-iswa.cpp` and `gemma3n-iswa.cpp` but NOT `gemma4.cpp`
+  (older snapshot).
+- `ollama/model/models/gemma4/model_text.go` revealed the same Q/K/V
+  tensor set the new build uses.
+- `strings libllama.so | grep gemma` exposed a `gemma_model_gemma4`
+  class shipped in the currently-installed `llama-cpp-python 0.3.23`.
+- Direct fetch of
+  `https://raw.githubusercontent.com/ggml-org/llama.cpp/master/src/models/gemma4.cpp`
+  revealed the exact 4 lines (`Vcur = model.layers[il].wv ? ... : Kcur`)
+
+Saved as a reusable skill: `~/.hermes/skills/leafcutter-gemma4-architecture`
+with the full layout, dimension math, and per-layer metadata for Gemma 4
+12B. There is also a companion skill
+`~/.hermes/skills/leafcutter-quantized-tensor-matmul` for the empty-data
+dequant pattern itself.
+
+### Honest current state
+
+End-to-end runs but **token output is poor**. Output tokens are recognizable
+("Hello", "despite") but degenerate for `temperature=0.0` — same token
+repeated. Prime suspect: per-layer attention math for the V-less GLOBAL
+layers (one of the head-dim / kv_head-dim combinations derived from
+actual weight shapes is still off, so attention scores are biased toward
+one direction).
+
+Next session: build a tiny golden reference for *one* layer of Gemma 4
+(num_heads = 16, head_dim = 256, num_kv_heads = 8, kv_head_dim = 256, with
+separate V projection) and compare against it, layer 0 first. Once that
+matches, layer 5 (the V-less GLOBAL with kv_h=1).

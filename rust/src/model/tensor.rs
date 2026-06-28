@@ -186,6 +186,25 @@ impl Tensor {
         self.q_data.is_some()
     }
 
+    /// Materialize f32 data from quantized weights if not already present.
+    /// After this call, `self.data` is populated and `q_data` is retained
+    /// for fast quantized matmul.  No-op if `data` is already non-empty.
+    pub fn materialize_data(&mut self) {
+        if !self.data.is_empty() {
+            return;
+        }
+        let new_data: Vec<f32> = match self.q_data.as_ref() {
+            Some(QuantizedData::Q8_0(m)) => m.dequantize(),
+            Some(QuantizedData::Q4_0(m)) => m.dequantize(),
+            Some(QuantizedData::Q4_K(m)) => m.dequantize(),
+            Some(QuantizedData::Q5_K(m)) => m.dequantize(),
+            Some(QuantizedData::Q6_K(m)) => m.dequantize(),
+            Some(QuantizedData::IQ4_NL(m)) => m.dequantize(),
+            None => return,
+        };
+        self.data = new_data;
+    }
+
     /// Attach Q8_0 quantized data to an existing tensor (used by shard loader
     /// after it has separately dequantized + transposed the f32 data).
     pub fn with_q8_0(mut self, q8: crate::kernels::q8_0::Matrix) -> Self {

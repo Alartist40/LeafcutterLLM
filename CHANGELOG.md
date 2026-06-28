@@ -5,6 +5,69 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-06-26 (Gemma 4 native forward)
+
+End-to-end Gemma 4 (12B Q4_K_M) now runs through all 48 transformer blocks
+and emits tokens.  Output quality is not yet coherent on multi-token
+generations; further work needed on per-layer attention math for the
+single-KV-head GLOBAL layers (see skill `leafcutter-gemma4-architecture`
+for the known-good llama.cpp reference structure).
+
+### Added
+- `Tensor::materialize_data()` — populates `data` from `q_data` on demand.
+  Required because the loader stores quantized weights via `*_only`
+  constructors that leave `data` empty. Subsequent callers must take
+  `&mut HashMap<String, Tensor>`.
+- `gemma.rs::gemma_fused_qkv` — builds a single column-stacked fused
+  weight `[Q || K || V]`. Handles three layer shapes:
+  - G-layer (separate V): full f32 stack.
+  - S-layer (sliding-window, separate V): full f32 stack.
+  - V-less layer (Gemma 4 single-kv-head GLOBAL): clones K into the V
+    region (per llama.cpp gemma4.cpp:247, when wv is absent Vcur = Kcur).
+- `gemma.rs::gemma_layer_forward` now rebuilds per-layer `AttentionParams`
+  from actual weight shapes (head_dim = q_out/num_heads, kv_head_dim =
+  k_out/num_kv_heads) rather than relying on possibly-stale hard-coded metadata.
+- `engine.rs::forward_native` — Gemma-aware path scales token embeddings by
+  `sqrt(hidden_size)` (matches llama.cpp's `inpL = ggml_scale(inpL, sqrtf(n_embd))`
+  before the first layer; critical for Gemma 4 quality).
+
+### Changed
+- `arch.rs` — Gemma 4 layer mappings now include:
+  - `post_attention_norm.weight -> post_attention_layernorm.weight`
+  - `post_ffw_norm.weight -> post_ffw_layernorm.weight`
+  (Older Gemma 3 mappings missed these; required for Gemma 4 post-attention
+  and post-FFN norms that are absent in Gemma 3.)
+- `arch.rs::infer_gemma_layouts` — heads/kv_heads/rope_theta now derived
+  per-layer from `head_count_kv` (per-layer array), `head_count`,
+  `rope.dimension_count[_swa]`, and `rope.freq_base[_swa]`.  Per-layer RoPE
+  theta is the right way to handle SWA layers (theta=10000) vs GLOBAL
+  layers (theta=1_000_000) in Gemma 4.
+- `gemma_layer_forward` signature: `layer_weights: &HashMap<...>` →
+  `&mut HashMap<...>` to support in-place quant dequant.  Caller in
+  `engine.rs` updated to use `let mut layer_weights = ...`.
+
+### Fixed
+- `gemma.rs::gemma_fused_qkv` no longer OOB-panics on the V-less GLOBAL
+  layer (was: range end index 4096 out of range for slice of length 0
+  because the 12B GGUF omits `attn_v.weight` for SINGLE-KV-HEAD layers).
+  V region of the fused tensor now correctly holds K's values.
+- `arch.rs::sliding_window` for Gemma 4 used to read from wrong metadata
+  key (`llama.attention.sliding_window`); now reads `gemma4.attention.sliding_window = 1024`.
+
+### Notes / Known issues
+- Tokenization matches the reference (verified: leafcutter and llama-cpp
+  produce identical `[BOS, Hello]` → `[2, 9259]` for the prompt "Hello").
+- Output for multi-token generation at `temperature=0.0` is still
+  degenerate (same token repeated). The first-token top-1 prediction
+  differs from the reference; root cause is in the per-layer attention
+  / RoPE math, not in embedding or tokenization. Identification of
+  the exact divergence point requires a layer-by-layer logit comparison
+  against llama.cpp reference output (see handoff for details).
+- Debug `eprintln!`s are gated by env vars (`LEAFCUTTER_DEBUG_EMBED`)
+  and are NOT enabled in normal runs.
+
+---
+
 ## [0.9.8] — 2026-06-19 (MLA forward + engine wiring)
 
 Continues the Kimi K2.6 / GLM-5.2 frontier-models build-out. Adds the

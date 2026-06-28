@@ -42,7 +42,12 @@ impl Default for AttentionParams {
 }
 
 pub fn apply_rotary_emb(x: &mut Tensor, seq_len: usize, num_heads: usize, head_dim: usize, rope_dim: usize, theta: f32, position_offset: usize) {
-    let rope_dim = if rope_dim > 0 { rope_dim } else { head_dim };
+    // Defensive: rope_dim must not exceed head_dim. Some model configs
+    // (e.g., partial RoPE variants, duplicated rope_dim metadata) advertise
+    // a rope_dim > head_dim; we silently clamp rather than OOB-panic on Q/K.
+    let rope_dim = if rope_dim > 0 && rope_dim <= head_dim { rope_dim } else { head_dim };
+    let n = x.data.len();
+    let stride = num_heads * head_dim;
     for i in 0..seq_len {
         for h in 0..num_heads {
             for d in 0..rope_dim / 2 {
@@ -51,9 +56,15 @@ pub fn apply_rotary_emb(x: &mut Tensor, seq_len: usize, num_heads: usize, head_d
                 let cos_a = angle.cos();
                 let sin_a = angle.sin();
 
-                let base = i * num_heads * head_dim + h * head_dim;
+                let base = i * stride + h * head_dim;
                 let x1_idx = base + d;
                 let x2_idx = base + d + rope_dim / 2;
+
+                if x1_idx >= n || x2_idx >= n {
+                    // Defensive: should be unreachable once rope_dim <= head_dim.
+                    // Skip this pair rather than crash; preserves Llama/Qwen behavior.
+                    continue;
+                }
 
                 let x1 = x.data[x1_idx];
                 let x2 = x.data[x2_idx];
