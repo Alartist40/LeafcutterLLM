@@ -729,16 +729,79 @@ with the full layout, dimension math, and per-layer metadata for Gemma 4
 `~/.hermes/skills/leafcutter-quantized-tensor-matmul` for the empty-data
 dequant pattern itself.
 
-### Honest current state
+### Honest current state (as of commit `ef5e278`, pushed to origin/main)
 
-End-to-end runs but **token output is poor**. Output tokens are recognizable
-("Hello", "despite") but degenerate for `temperature=0.0` — same token
-repeated. Prime suspect: per-layer attention math for the V-less GLOBAL
-layers (one of the head-dim / kv_head-dim combinations derived from
-actual weight shapes is still off, so attention scores are biased toward
-one direction).
+End-to-end Gemma 4 12B forward pass runs **all 48 layers** without
+panics and emits tokens through the native `Engine::forward_native`
+path. Test count: 137 passed (1 pre-existing failure unchanged, 3
+ignored). No regressions on previously-validated models (Llama-3,
+Qwen3.5, Ministral).
 
-Next session: build a tiny golden reference for *one* layer of Gemma 4
-(num_heads = 16, head_dim = 256, num_kv_heads = 8, kv_head_dim = 256, with
-separate V projection) and compare against it, layer 0 first. Once that
-matches, layer 5 (the V-less GLOBAL with kv_h=1).
+**What works:**
+
+* GGUF tensor load + GGUF metadata-driven layout inference.
+* Q4_K_M / Q6_K dequant through all 17 layer kinds.
+* Tokenization produces `[BOS, Hello]` → `[2, 9259]`, byte-identical
+  to llama-cpp's SentencePiece BPE for the same prompts.
+* 48 transformer blocks execute end-to-end. KV cache flows across
+  all layers. Embedding scaling `sqrt(hidden_size)` applied before
+  layer 0. Final RMSNorm + softcap (`cap × tanh(logit/cap)`) applied.
+* First-token prediction for "Hello" alone is `id=9259 'Hello'`
+  (recognizable).
+
+**What's broken / not done:**
+
+* Multi-token generation at `temperature=0.0` produces the same
+  token repeatedly (degeneration). The first-token top-1 prediction
+  diverges from llama-cpp's reference and the pre-softmax logits
+  come back 10–20× larger than expected (+20 to +30 range vs. the +/-
+  a few range we'd expect from a correctly-normalised 12B forward).
+* Tokenization is verified correct, embedding is verified plausibly
+  scaled (L2 ≈ 1.4 raw → magnitude matches llama.cpp scale), so the
+  divergence is in the 48-layer chain itself.
+
+### Concrete next steps (in priority order)
+
+1. **Dump hidden-state norms at selected layers** under `LEAFCUTTER_DEBUG_LAYERS=1`.
+   REPL the existing logger or surgically add an `env::var` probe in
+   `gemma_layer_forward` after the post-attention residual and after
+   the FFN residual. The expected shape (per llama.cpp) is values
+   in `O(1)` to `O(10)` range across all 48 layers. The first layer
+   that shows norm in the `O(100)`+ range is where the divergence
+   starts. The encoding chain already prints `tok0 L2=…` so this
+   matches the harness.
+
+2. **Once the bad layer is identified**, build a one-layer golden
+   reference for *just that layer* in pure Rust using hardcoded
+   weights (hand-extract one Q,K,V,O row from GGUF) and compare at the
+   tensor level. Do this for layer 0 (SWA, separate V, head_dim=256)
+   first since it's the simplest case.
+
+3. **Test isolation**: validate layer 0 first while mocking the rest
+   of the model with identity. If layer 0 is correct but layer 1
+   isn't, the bug is in the residual stream wiring (post_attention_norm
+   weights, layer_output_scale, post_ffw_norm position).
+
+4. **Once layer 0 SWA forward matches** (within fp32 noise ~1e-3),
+   layer 5 GLOBAL with `head_count_kv=1` and no V projection is
+   the next tier — that path's fused QKV currently sets V = K which
+   needs validation against llama.cpp's `Vcur = Kcur; ggml_rms_norm(Vcur,
+   f_norm_rms_eps)` normalisation step which our engine skips.
+
+5. **Attn sink tensor** (`blk.{i}.attn_sinks`, present in newer
+   llama.cpp PR #13194): if we run with the latest llama.cpp, it
+   expects per-head "sink" values added to attention logits before
+   softmax. Gemma 4 12B Q4_K_M we have on disk may or may not have
+   this tensor. Confirm with `./dump_gemma4_meta`. If present, wire
+   it into `attention_forward` for the GLOBAL layers where it lives.
+
+### Companion skills
+
+* `~/.hermes/skills/leafcutter-gemma4-architecture` — full layout,
+  dimension math, and per-layer metadata for Gemma 4 12B. Includes
+  the conv chain (MMaaw, WWcur → KKV) and the V-from-K fallback
+  for head_count_kv=1 layers.
+* `~/.hermes/skills/leafcutter-quantized-tensor-matmul` — empty-data
+  dequant pattern (`Tensor::materialize_data()`).
+
+Both should be the **first** thing read in the next session.
