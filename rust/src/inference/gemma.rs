@@ -58,6 +58,11 @@ impl Default for GemmaLayerParams {
 }
 
 /// Gemma-flavor RMSNorm: `y = x * inv_rms * (1 + w)`.
+/// Reference: HF transformers `Gemma3RMSNorm.forward` (modeling_gemma3.py:141).
+/// Gemma 3/4 trains the weight with the convention that the on-disk weight is
+/// centered around 0 and applied with a `+1` shift at inference — exactly the
+/// opposite of Llama, which trains around 0 and applies `w` directly.
+/// See https://github.com/huggingface/transformers/pull/29402 for context.
 pub fn gemma_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
     let n = x.shape.last().copied().unwrap_or(x.data.len());
     let seq = x.data.len() / n.max(1);
@@ -72,11 +77,9 @@ pub fn gemma_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
         let rms = (sum_sq * inv_n + eps).sqrt();
         let inv_rms = 1.0 / rms;
         for d in 0..n {
-            // Reference: `y = x * scale * w` from llama.cpp's
-            // `ggml_compute_forward_rms_norm_f32` (no `+ 1` shift).
-            // The on-disk GGUF weight is applied directly.
+            // Match HF Gemma3: `y = x * inv_rms * (weight + 1)`
             let w = weight.data[d];
-            out.push(x.data[base + d] * inv_rms * w);
+            out.push(x.data[base + d] * inv_rms * (w + 1.0));
         }
     }
     Tensor::from_vec(out, x.shape.clone())
