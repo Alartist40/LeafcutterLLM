@@ -72,7 +72,10 @@ pub fn gemma_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
         let rms = (sum_sq * inv_n + eps).sqrt();
         let inv_rms = 1.0 / rms;
         for d in 0..n {
-            let w = weight.data[d] + 1.0;
+            // Reference: `y = x * scale * w` from llama.cpp's
+            // `ggml_compute_forward_rms_norm_f32` (no `+ 1` shift).
+            // The on-disk GGUF weight is applied directly.
+            let w = weight.data[d];
             out.push(x.data[base + d] * inv_rms * w);
         }
     }
@@ -81,15 +84,15 @@ pub fn gemma_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
 
 /// GeGLU FFN: `down × (GeLU(gate × x) ⊙ (up × x))`.
 pub fn gemma_ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {
-    let gate = weights
-        .get("mlp.gate_proj.weight")
-        .expect("Missing gate_proj");
-    let up = weights.get("mlp.up_proj.weight").expect("Missing up_proj");
+    let gate_proj = x.matmul(
+        weights
+            .get("mlp.gate_proj.weight")
+            .expect("Missing gate_proj"),
+    );
+    let up_proj = x.matmul(weights.get("mlp.up_proj.weight").expect("Missing up_proj"));
     let down = weights
         .get("mlp.down_proj.weight")
         .expect("Missing down_proj");
-    let gate_proj = x.matmul(gate);
-    let up_proj = x.matmul(up);
     let mut fused = vec![0.0f32; gate_proj.data.len()];
     let inv_sqrt_2_pi = (2.0f32 / std::f32::consts::PI).sqrt();
     for i in 0..gate_proj.data.len() {
@@ -369,18 +372,32 @@ mod tests {
     }
 
     #[test]
-    fn gemma_rms_norm_uses_one_plus_weight() {
+    fn gemma_rms_norm_multiplies_weight_directly() {
+        // Reference: llama.cpp `ggml_compute_forward_rms_norm_f32` does
+        //   y = x * (1 / sqrt(mean(x²) + eps)) * w
+        // I.e. the on-disk weight `w` is applied directly, no `+1` offset.
+        // (Gemma stores already `(1 + γ₀)` so adding another 1 was wrong.)
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
+        // Row 0: x = [1, 2]; mean(x²) = (1 + 4)/2 = 2.5; inv_rms = 1/√2.5 ≈ 0.6325
+        //   y[0] = 1 * 0.6325 * w[0] = 0.6325 / 2 = 0.31625
+        //   y[1] = 2 * 0.6325 * w[1] = 1.265 * 0  = 0
         let w = Tensor::from_vec(vec![0.5, 0.0], vec![2]);
         let y = gemma_rms_norm(&x, &w, 1e-6);
-        // row 0: rms ≈ sqrt(2.5)≈1.58, inv_rms≈0.6325, (1+w)=1.5
-        //   y[0] = 1 * 0.6325 * 1.5 ≈ 0.949
-        let r0 = y.data[0];
-        assert!((0.94..0.96).contains(&r0), "r0 = {r0}");
-        // row 1 col 1: rms ≈ sqrt(12.5)≈3.536, inv_rms≈0.283, w=0
-        //   y[3] = 4 * 0.283 * 1 ≈ 1.131
-        let r3 = y.data[3];
-        assert!((1.10..1.16).contains(&r3), "r3 = {r3}");
+        assert!(
+            (0.30..0.34).contains(&y.data[0]),
+            "y[0] = {} (expected ≈0.316)",
+            y.data[0]
+        );
+        assert!(y.data[1].abs() < 1e-5, "y[1] = {}", y.data[1]);
+        // Row 1: x = [3, 4]; mean(x²) = (9 + 16)/2 = 12.5; inv_rms = 1/√12.5 ≈ 0.2828
+        //   y[2] = 3 * 0.2828 * w[0] = 0.8485 * 0.5 = 0.4243
+        //   y[3] = 4 * 0.2828 * w[1] = 1.1314 * 0 = 0
+        assert!(
+            (0.40..0.45).contains(&y.data[2]),
+            "y[2] = {} (expected ≈0.424)",
+            y.data[2]
+        );
+        assert!(y.data[3].abs() < 1e-5, "y[3] = {}", y.data[3]);
     }
 
     #[test]

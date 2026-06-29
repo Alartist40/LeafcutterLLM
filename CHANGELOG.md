@@ -57,14 +57,27 @@ for the known-good llama.cpp reference structure).
 ### Notes / Known issues
 - Tokenization matches the reference (verified: leafcutter and llama-cpp
   produce identical `[BOS, Hello]` → `[2, 9259]` for the prompt "Hello").
-- Output for multi-token generation at `temperature=0.0` is still
-  degenerate (same token repeated). The first-token top-1 prediction
-  differs from the reference; root cause is in the per-layer attention
-  / RoPE math, not in embedding or tokenization. Identification of
-  the exact divergence point requires a layer-by-layer logit comparison
-  against llama.cpp reference output (see handoff for details).
-- Debug `eprintln!`s are gated by env vars (`LEAFCUTTER_DEBUG_EMBED`)
+- The exact RMSNorm formulation was corrected to match llama.cpp
+  `ggml_compute_forward_rms_norm_f32`: `y = x * (1/sqrt(mean(x²) + eps)) * w`,
+  with the on-disk weight applied directly (no `+ 1` shift).
+  Earlier code applied `(w + 1)`, which was the root cause of the
+  17× logit inflation against the reference.
+- Output for multi-token generation at `temperature=0.0` is **still**
+  degenerate (same token repeated). First-token top-1 is now a
+  sensible distribution across several plausible continuations, but
+  pre-softcap magnitudes are still saturating the `cap × tanh(x/cap)`
+  clamp at 30.0 — meaning logits are still ~5–10× too large. The bug
+  is somewhere further upstream (most likely layer-0 attention output
+  or the embedding-vs-RMSNorm interaction in the very first layer).
+  Localising this requires per-layer logit dumps; see handoff doc.
+- Debug `eprintln!`s are gated by env vars (`LEAFCUTTER_DEBUG_NORMS`)
   and are NOT enabled in normal runs.
+
+### Test infra added
+- `tests/debug_gemma_rmsnorm.rs` — single-shot integration test that
+  loads the model, runs the embed → RMSNorm path in isolation, and
+  prints L2 statistics. Useful for verifying future fixes or debugging
+  new Gemma variants.
 
 ---
 
