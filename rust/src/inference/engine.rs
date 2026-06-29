@@ -47,6 +47,9 @@ pub struct Engine {
     /// Negative = use Gemma 4 default (-30.0 → soft-cap at 30).
     /// Field on ModelConfig already exists; this is a per-engine cache.
     pub gemma_logit_softcap: f32,
+    /// Whether the embedding pipeline applied `hidden ×= sqrt(n_embd)`,
+    /// requiring `1/sqrt(n_embd)` revert in the lm_head path.
+    pub embed_uses_sqrt_scale: bool,
     pub speculative_head: Option<SpeculativeHead>,
     /// Whether lm_head is tied to token embeddings (no separate output.weight tensor).
     lm_head_tied: bool,
@@ -270,6 +273,7 @@ impl Engine {
             gemma_layouts,
             gemma_norm_eps,
             gemma_logit_softcap,
+            embed_uses_sqrt_scale: is_gemma,
             speculative_head,
             lm_head_tied,
 
@@ -827,7 +831,26 @@ impl Engine {
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
         let hidden_last = &hidden.data[(seq_len - 1) * hidden_size..seq_len * hidden_size];
-        self.lm_head_projection(hidden_last, "token_embd.weight", hidden_size, vocab_size)
+        // For Gemma, the embedding pre-scale applied by `forward_native`
+        // (`hidden *= sqrt(n_embd)`) carries all the way to the lm_head,
+        // inflating logits by `sqrt(n_embd)` (≈ 62× on a 3840-wide model).
+        // Reverting it here brings logits back into the reference's
+        // [−5, +5] range and lets the softcap stop masking the
+        // distribution.
+        let inv = if self.embed_uses_sqrt_scale {
+            1.0 / (hidden_size as f32).sqrt()
+        } else {
+            1.0
+        };
+        if inv != 1.0 {
+            let mut scaled = hidden_last.to_vec();
+            for v in scaled.iter_mut() {
+                *v *= inv;
+            }
+            self.lm_head_projection(&scaled, "token_embd.weight", hidden_size, vocab_size)
+        } else {
+            self.lm_head_projection(hidden_last, "token_embd.weight", hidden_size, vocab_size)
+        }
     }
 
     /// Compute logits when lm_head is a separate tensor (output.weight).
@@ -838,7 +861,20 @@ impl Engine {
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
         let hidden_last = &hidden.data[(seq_len - 1) * hidden_size..seq_len * hidden_size];
-        self.lm_head_projection(hidden_last, "output.weight", hidden_size, vocab_size)
+        let inv = if self.embed_uses_sqrt_scale {
+            1.0 / (hidden_size as f32).sqrt()
+        } else {
+            1.0
+        };
+        if inv != 1.0 {
+            let mut scaled = hidden_last.to_vec();
+            for v in scaled.iter_mut() {
+                *v *= inv;
+            }
+            self.lm_head_projection(&scaled, "output.weight", hidden_size, vocab_size)
+        } else {
+            self.lm_head_projection(hidden_last, "output.weight", hidden_size, vocab_size)
+        }
     }
 
     /// Generic lm_head projection: dot(hidden_last, embed_row) for each token.
