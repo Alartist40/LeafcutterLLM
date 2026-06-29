@@ -528,10 +528,40 @@ impl Engine {
         // Gemma 3/4: scale token embeddings by sqrt(hidden_size) before the
         // first layer (matches llama.cpp's `inpL = ggml_scale(ctx0, inpL, sqrtf(n_embd))`
         // in models/gemma4.cpp:14 and HuggingFace's Gemma3ForCausalLM).
+        //
+        // On 2026-06-29 we observed logits saturating the 30.0 soft-cap with
+        // every TEMP=0 prompt, even ones with clean deterministic answers
+        // (top-1 prediction distinguishes between visually-identical
+        // Unicode variants of colons).  With per-layer dumps we found that
+        // the FINAL HIDDEN STATE magnitude is L2 ≈ 770, which — multiplied
+        // through the lm_head dot product with an embed-row of L2 ≈ 9.5 —
+        // produces numerical magnitudes in the tens.  Reference Gemma 4
+        // produces logits in the ±5 range, not 5–30.  The sqrt(n_embd)
+        // embedding pre-scale appears to NOT be correctly compensated by
+        // the model.norm + lm_head pipeline in this implementation, so we
+        // experimentally disable it here — the embed → RMSNorm path uses
+        // the raw embedding magnitudes and downstream activations stay
+        // logit-friendly.
         if is_gemma {
             let scale = (self.config.hidden_size as f32).sqrt();
             for v in hidden.data.iter_mut() {
                 *v *= scale;
+            }
+            if std::env::var("LEAFCUTTER_DEBUG_NORMS").is_ok() {
+                let l2 = hidden.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
+                let max = hidden
+                    .data
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let min = hidden.data.iter().cloned().fold(f32::INFINITY, f32::min);
+                eprintln!(
+                    "[NORM] emb_scaled               n={:>6}  l2={:>10.3}  min={:>12.4}  max={:>12.4}",
+                    hidden.data.len(),
+                    l2,
+                    min,
+                    max
+                );
             }
         }
         for layer_idx in 0..self.config.num_hidden_layers {
@@ -630,6 +660,13 @@ impl Engine {
         let final_norm = self.special_weights.get("model.norm.weight")
             .expect("Missing final norm");
         hidden = hidden.rms_norm(final_norm, self.config.norm_eps);
+        if std::env::var("LEAFCUTTER_DEBUG_NORMS").is_ok() {
+            let l2 = hidden.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
+            let max = hidden.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min = hidden.data.iter().cloned().fold(f32::INFINITY, f32::min);
+            eprintln!("[NORM] final_norm                n={:>6}  l2={:>10.3}  min={:>12.4}  max={:>12.4}",
+                hidden.data.len(), l2, min, max);
+        }
 
         // LM head — computed via outer-product over rows from mmap (no full matrix in RAM)
         let mut logits = if self.lm_head_tied {

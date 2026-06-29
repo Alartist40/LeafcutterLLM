@@ -227,6 +227,7 @@ pub fn gemma_layer_forward(
         .or_else(|| layer_weights.get("input_layernorm.weight"))
         .expect("Missing attn_norm / input_layernorm");
     let pre_attn = gemma_rms_norm(hidden, attn_norm_w, rms_eps);
+    debug_norm(&format!("L{layer_idx}_pre_attn_rmsnorm"), &pre_attn);
     let qkv = gemma_fused_qkv(&pre_attn, layer_weights);
     let mut weights_with_qkv = layer_weights.clone();
     weights_with_qkv.insert("attn_qkv.weight".to_string(), qkv);
@@ -302,15 +303,22 @@ pub fn gemma_layer_forward(
         layer_idx,
         position_offset,
     );
+    debug_norm(&format!("L{layer_idx}_attn_out"), &attn_out);
 
     // post-attention norm on attn_out
     let post_attn_w = layer_weights
         .get("post_attention_norm.weight")
         .expect("Missing post_attention_norm");
     let attn_normed = gemma_rms_norm(&attn_out, post_attn_w, rms_eps);
+    debug_norm(&format!("L{layer_idx}_post_attn_norm"), &attn_normed);
 
     // layer_output_scale (scalar). Gemma stores it as a [1]-dim F32 tensor.
     let scale_w = layer_weights.get("layer_output_scale.weight");
+    if let Some(sw) = scale_w {
+        if std::env::var("LEAFCUTTER_DEBUG_NORMS").is_ok() {
+            eprintln!("[NORM] L{} layer_output_scale = {:.6}", layer_idx, sw.data[0]);
+        }
+    }
     let attn_contrib = if let Some(sw) = scale_w {
         let s = sw.data[0];
         let mut d = attn_normed.data.clone();
@@ -322,13 +330,14 @@ pub fn gemma_layer_forward(
         attn_normed
     };
     let mut x = hidden.add(&attn_contrib);
+    debug_norm(&format!("L{layer_idx}_after_attn_residual"), &x);
 
     // ── FFN sub-block ──
     // `ffn_norm.weight` is engine-mapped to `post_attention_layernorm.weight`.
     let ffn_norm_w = layer_weights
         .get("ffn_norm.weight")
         .or_else(|| layer_weights.get("post_attention_layernorm.weight"))
-        .expect("Missing ffn_norm / post_attention_layernorm");
+        .expect("Missing ffngradle_norm / post_attention_layernorm");
     let ffn_in = gemma_rms_norm(&x, ffn_norm_w, rms_eps);
     let ffn_out = gemma_ffn_forward(&ffn_in, layer_weights);
     let post_ffw_w = layer_weights
@@ -346,7 +355,27 @@ pub fn gemma_layer_forward(
         ffn_normed
     };
     x = x.add(&ffn_contrib);
+    debug_norm(&format!("L{layer_idx}_after_ffn_residual"), &x);
     x
+}
+
+/// Print L2/min/max stats for a Tensor label if LEAFCUTTER_DEBUG_NORMS is set.
+fn debug_norm(label: &str, t: &Tensor) {
+    if std::env::var("LEAFCUTTER_DEBUG_NORMS").is_err() {
+        return;
+    }
+    let n = t.data.len();
+    if n == 0 {
+        eprintln!("[NORM] {}  [EMPTY]", label);
+        return;
+    }
+    let l2 = t.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
+    let max = t.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let min = t.data.iter().cloned().fold(f32::INFINITY, f32::min);
+    eprintln!(
+        "[NORM] label={:<24}  n={:>6}  l2={:>10.3}  min={:>12.4}  max={:>12.4}",
+        label, n, l2, min, max
+    );
 }
 
 /// Apply Gemma logit soft-capping: clamp out-of-range logits via `tanh`.
