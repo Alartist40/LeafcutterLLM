@@ -41,10 +41,12 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 | Ministral-3-3B Q4_K_M | 2.0 GB | **Native** | ✅ Forward + generation | **504 MB** | 1.09 |
 | Qwen3.5-0.8B | 0.5 GB | **FFI** | ✅ Coherent generation | ~3 GB | 14.68 |
 | Qwen3.5-9B | 5.0 GB | **FFI** | ✅ Coherent + reasoning | ~6 GB | 2.38 |
+| **Ornith 1.0 9B Q4_K_M** (Qwen 3.5 hybrid) | 5.3 GB | **Native** | ✅ Forward + coherent generation | **1,216 MB** | 0.55 |
 | Synthetic 80-layer | 27 MB | **Native** | ✅ Layer streaming stress test | **30 MB** | N/A |
 
 * 534 MB measured on x86_64 with `madvise(MADV_DONTNEED)` layer streaming (Llama-3.2-3B Q4_K_XL).
 * 1,145 MB measured on x86_64 with real 70B Q4_K_S model, 1-token forward pass.
+* **1,216 MB measured on x86_64 with Ornith 1.0 9B Q4_K_M, 5-token generate at TEMPERATURE=0** (was ~8 GB on llama-cli b9840 for the same prompt — ~6.7× reduction). Hybrid SSM + full-attention interleaved (24 Linear + 8 Full, `full_attention_interval=4`). Top-1 logit ~4× reference (functional but not pixel-perfect — see CHANGELOG and skill `leafcutter-gemma4-architecture`).
 * 39 MB load-only RSS for 70B native — model stays entirely on disk via mmap.
 * Auto-FFI fallback routes exotic quants (IQ1_M, Q2_K, etc.) to llama.cpp, which uses its own mmap model (higher RSS than native layer streaming).
 

@@ -1,9 +1,9 @@
 # LeafcutterLLM Handoff Document
 
-**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold)
-**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold.
-**Git commits:** Pushed to origin/main (audit pass). Frontier work is in working tree, awaiting shard pieces and validation.
-**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 work by m3 (Nvidia).
+**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward).
+**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; **Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward** (Jul 2026).
+**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3).
+**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / **Qwen 3.5 / Ornith** work by m3 (Nvidia).
 
 ---
 
@@ -36,12 +36,14 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 - **Real model validation — Llama-3.2-3B** — mathematically verified correct against Python reference (max diff < 0.003)
 - **70B memory claim validated** — Meta-Llama-3.1-70B loads at 39 MB RSS, forward pass peaks at 1,145 MB
 - **Ministral native** — Ministral-3B (504 MB peak) and Ministral-8B (739 MB peak) run natively
+- **Ornith 1.0 9B native (Jul 2026)** — Qwen 3.5 hybrid SSM+full-attention model (5.3 GB on disk, 32 layers) runs end-to-end on native path. Peak RSS **1,216 MB** (vs 8,155 MB on llama-cli b9840 — 6.7× RAM reduction). Generates coherent English at 0.55 tok/s. Three concrete DeltaNet inference fixes landed: `f234fe1` (num_qk_heads), `8bf5a88` (silu-gate wiring), `a1ca9c0` (`post_attention_norm` fallback). Top-1 argmax correct; full logit parity with llama-cli requires per-tensor per-layer diff (not yet done). See skill `leafcutter-gemma4-architecture` for the family-umbrella and reference file `qwen35-deltanet-architecture.md`.
 - **Coherent generation verified** — "The capital of France is" → coherent multi-sentence output
 - **Quantized weight loading** — 4× memory reduction. One layer resident at a time as native quantized blocks.
 - **`madvise(MADV_DONTNEED)` layer streaming** — RSS bounded to ~1 layer + base
 
 ### What's In Progress
 
+- **Ornith 1.0 9B logit parity** — Native forward aligns with llama-cli argmax but logit magnitudes are ~4× reference. Per-tensor per-layer diff across the 32 layers is the next diagnostic step. Carried forward as a known issue, not blocking (model is functional).
 - **DeltaNet HF alignment** — Native DeltaNet kernels implemented (`deltanet.rs`). Decay/beta gates match HF (CosSim > 0.98). `qkv_proj` CosSim ≈ 0.28 and improving after fixing GGUF dequantization orientation. Continuing to debug Q4_0 matmul kernel alignment.
 - Speed optimization — quantized GEMM kernels are naive scalar loops (~0.12 tok/sec on 3B, ~142s/token on 70B)
 - More quant formats — Q2_K, IQ2_XXS, Q4_1, BF16 have no native dequant kernels

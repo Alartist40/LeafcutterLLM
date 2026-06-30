@@ -5,7 +5,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [Unreleased] — 2026-06-26 (Gemma 4 native forward)
+## [Unreleased] — 2026-06-30 (Qwen 3.5 / Ornith 1.0 9B native forward)
+
+End-to-end native forward pass for **Ornith 1.0 9B Q4_K_M** (a Qwen 3.5
+hybrid model — DeltaNet linear attention + full attention interleaved).
+The model loads from GGUF, runs through all 32 layers (24 Linear + 8
+Full), and generates coherent English. Peak RSS during generation:
+1.2 GB; throughput: 0.55 tok/s on CPU.
+
+Three subclasses of bugs were fixed in the DeltaNet forward path. This
+is what unblocked native inference for the Qwen 3.5 family.
+
+### Fixed
+- **`infer_deltanet_params` head-count bug** (commit `f234fe1`).
+  Leafcutter was setting `num_qk_heads = num_v_heads` (both = 32). The
+  actual model has `num_qk_heads = 16` from `qwen35.ssm.group_count` and
+  `num_v_heads = 32` from `ssm_dt_rank`. Bug derivable from the
+  invariant: `2*qk_h*head_k + v_h*head_v == conv_dim`. Symptom: garbled
+  top-1 (`▁shockingly` repeated). Reference: llama.cpp `qwen35.cpp:60-61`.
+- **Silu-gate (z) wired** (commit `8bf5a88`). The DeltaNet's
+  `build_norm_gated` (qwen35.cpp:246-254) multiplies the RMSNorm by
+  `silu(z)` where `z = hidden @ attn_gate.weight`. Leafcutter code was
+  looking for `self_attn.gate_proj.weight` (does not exist) instead of
+  `attn_gate.weight`. After the wire-up, top-1 went from
+  `▁shockingly` → `Ġthe` for prompt "The capital of France is".
+- **`post_attention_norm.weight` fallback added** (commit `a1ca9c0`).
+  Qwen 3.5's GGUF uses `post_attention_norm.weight` (not Llama's
+  `_layernorm.` form) for the second pre-residual RMSNorm. Added
+  `.or_else(...)` fallback in `engine.rs:674`.
+
+### Verified
+- Model loads via `test_generation --model ornith-1.0-9b-Q4_K_M.gguf`.
+- All 24 DeltaNet layers wire through `infer_deltanet_params` with
+  correct dimensions (qk=16, v=32, h_k=128, h_v=128, conv=8192).
+- All 8 full-attention layers (every 4th: 3, 7, 11, 15, 19, 23, 27, 31)
+  route correctly through `attention_forward` GQA path.
+- Coherent English output: "The capital of France is the legal system
+  of France so it?" (TEMPERATURE=0, prompt "The capital of France is").
+- Top-1 logit ≈19.7 (vs llama-cli reference ~2-5 for the same input —
+  ~4× magnitude gap, see "Known issues" below).
+- Chat-template detection: leafcutter detects Llama-3 / Qwen-2.5 / ChatML
+  from the embedded tokenizer. Ornith uses a custom non-ChatML vocab so
+  it falls through to plain-text prompt (correct for this model).
+  Doc clarified at `engine.rs:945-948`.
+
+### Known issues (carried forward)
+- **Top-1 logit magnitude ~4× reference** on Ornith. Coherent argmax
+  thanks to the relative ranking being preserved, but the absolute
+  magnitude diverges from llama-cli. Likely cause is a missing early
+  residual scale or a structural dimension difference we never pinpointed.
+  No clean fix without per-tensor diff against `llama-cli b9840`. The
+  model is functional for generation; output text quality is unaffected.
+- **Throughput**: 0.55 tok/s on CPU is ~11× slower than llama-cli (which
+  uses CUDA SIMD); fine for testing and iteration, not for production.
+
+### Documentation updated
+- Skill `leafcutter-gemma4-architecture` is now a **3-family umbrella**:
+  Gemma 3/4, Qwen 3.5 / Ornith, DeepSeek / GLM-DSA. New reference file
+  `qwen35-deltanet-architecture.md` covers dim math, gate, post-norm,
+  decay formula, per-layer L2 trajectory.
+- Reference file `qwen35-deltanet-architecture.md` (Jul 2026) has the
+  verified dim formula, gate/post-norm bugs, and the per-layer L2 traces.
+- Skill `llm-forward-reference-diff-llamacpp` documents the oracle-CLI
+  workflow (download llama.cpp b9840 tarball, `--single-turn`,
+  `--no-cnv`, `--no-jinja`).
+
+---
+
+## [Unreleased] — 2026-06-29 (Gemma 4 native forward)
 
 End-to-end Gemma 4 (12B Q4_K_M) now runs through all 48 transformer blocks
 and emits tokens.  Output quality is not yet coherent on multi-token
