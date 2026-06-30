@@ -57,12 +57,24 @@ impl Default for GemmaLayerParams {
     }
 }
 
-/// Gemma-flavor RMSNorm: `y = x * inv_rms * (1 + w)`.
-/// Reference: HF transformers `Gemma3RMSNorm.forward` (modeling_gemma3.py:141).
-/// Gemma 3/4 trains the weight with the convention that the on-disk weight is
-/// centered around 0 and applied with a `+1` shift at inference — exactly the
-/// opposite of Llama, which trains around 0 and applies `w` directly.
-/// See https://github.com/huggingface/transformers/pull/29402 for context.
+/// Gemma RMSNorm.
+///
+/// **Gemma 4 (this model):** `y = x * rsqrt(mean(x²) + eps) * w` — the weight
+/// is applied **directly**, with NO `+1` shift. This matches HF
+/// `Gemma4RMSNorm.forward` (modeling_gemma4.py:207-211), which intentionally
+/// differs from Gemma 2/3:
+///   - Gemma 2/3 (`Gemma{2,3}RMSNorm`): `output * (1.0 + self.weight)` — `+1`.
+///   - Gemma 4 (`Gemma4RMSNorm`):      `output * self.weight`       — direct.
+///
+/// The on-disk GGUF weight is the trained `γ` (initialized to `ones`, applied
+/// directly); the GGUF converter does not bake in a `+1`. Applying `(w + 1)`
+/// here therefore inflates every activation by a factor of up to ~2x per norm,
+/// which compounds across 48 layers × 4 norms = 192 applications and is the
+/// leading cause of the "logits 10–20× too large, degenerate generation"
+/// symptom documented in `GEMMA4_DEBUG_LOG.md` Finding 1.
+///
+/// `with_scale=False` norms (e.g. Gemma 4 `v_norm`) pass an all-ones weight
+/// and reduce to pure RMS — handled by the same code path.
 pub fn gemma_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
     let n = x.shape.last().copied().unwrap_or(x.data.len());
     let seq = x.data.len() / n.max(1);
@@ -77,9 +89,9 @@ pub fn gemma_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
         let rms = (sum_sq * inv_n + eps).sqrt();
         let inv_rms = 1.0 / rms;
         for d in 0..n {
-            // Match HF Gemma3: `y = x * inv_rms * (weight + 1)`
+            // Match HF Gemma4: `y = x * inv_rms * w` (direct, no +1).
             let w = weight.data[d];
-            out.push(x.data[base + d] * inv_rms * (w + 1.0));
+            out.push(x.data[base + d] * inv_rms * w);
         }
     }
     Tensor::from_vec(out, x.shape.clone())
@@ -198,20 +210,31 @@ pub fn gemma_fused_qkv(_hidden: &Tensor, layer_weights: &mut HashMap<String, Ten
 }
 
 
-/// Run a single Gemma-3/4 transformer block for one layer.
+/// Run a single Gemma-4 transformer block for one layer.
 ///
-/// Sequence of operations per official Gemma spec:
+/// Mirrors HF `Gemma4TextDecoderLayer.forward` (modeling_gemma4.py:1392-1439)
+/// exactly:
 /// ```text
-///   pre_attn = rms_norm(x, attn_norm_w) * (1 + attn_norm_w)
-///   attn_out = attention(pre_attn)
-///   attn_proj_normed = rms_norm(attn_out, post_attention_norm_w) * (1 + ...)
-///   x = x + attn_proj_normed * layer_output_scale_w
+///   residual = x
+///   h = input_layernorm(x)                # attn_norm
+///   h = attention(h)
+///   h = post_attention_layernorm(h)       # post_attention_norm
+///   x = residual + h                      # ★ NO layer_output_scale here
 ///
-///   ffn_in = rms_norm(x, ffn_norm_w) * (1 + ffn_norm_w)
-///   ffn_out = ffn(ffn_in)            # GeGLU
-///   ffn_proj_normed = rms_norm(ffn_out, post_ffw_norm_w) * (1 + ...)
-///   x = x + ffn_proj_normed * layer_output_scale_w
+///   residual = x
+///   h = pre_feedforward_layernorm(x)      # ffn_norm
+///   h = mlp(h)                            # GeGLU
+///   h = post_feedforward_layernorm(h)     # post_ffw_norm
+///   x = residual + h                      # ★ NO layer_output_scale here
 /// ```
+///
+/// `layer_scalar` / `layer_output_scale`: HF declares this as a fixed buffer
+/// (`register_buffer("layer_scalar", torch.ones(1))`, init.ones_), i.e. **always
+/// 1.0** in real checkpoints. We deliberately IGNORE the `layer_output_scale.weight`
+/// tensor because the Q4_K_M GGUF we target contains garbage in those slots
+/// (`7e+32`, `nan`, …) — a known Gemma-4 conversion artifact (see
+/// GEMMA4_DEBUG_LOG.md Finding 4). Multiplying by it destroyed the residual
+/// stream from layer 0 onward.
 pub fn gemma_layer_forward(
     hidden: &Tensor,
     layer_weights: &mut HashMap<String, Tensor>,
@@ -229,6 +252,21 @@ pub fn gemma_layer_forward(
         .get("attn_norm.weight")
         .or_else(|| layer_weights.get("input_layernorm.weight"))
         .expect("Missing attn_norm / input_layernorm");
+    if std::env::var("LEAFCUTTER_DEBUG_NORMS").is_ok() && layer_idx < 2 {
+        let n = attn_norm_w.data.len();
+        let l2: f32 = attn_norm_w.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
+        let mx = attn_norm_w.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let mn = attn_norm_w.data.iter().cloned().fold(f32::INFINITY, f32::min);
+        eprintln!(
+            "[NORM-DIAG] L{}_attn_norm_w  n={} l2={:.3} min={:.4} max={:.4}  first5=[{:.4},{:.4},{:.4},{:.4},{:.4}]  keys={:?}",
+            layer_idx, n, l2, mn, mx,
+            attn_norm_w.data[0], attn_norm_w.data[1],
+            attn_norm_w.data.get(2).copied().unwrap_or(0.0),
+            attn_norm_w.data.get(3).copied().unwrap_or(0.0),
+            attn_norm_w.data.get(4).copied().unwrap_or(0.0),
+            &layer_weights.keys().collect::<Vec<_>>()[..8.min(layer_weights.len())]
+        );
+    }
     let pre_attn = gemma_rms_norm(hidden, attn_norm_w, rms_eps);
     debug_norm(&format!("L{layer_idx}_pre_attn_rmsnorm"), &pre_attn);
     let qkv = gemma_fused_qkv(&pre_attn, layer_weights);
@@ -308,56 +346,34 @@ pub fn gemma_layer_forward(
     );
     debug_norm(&format!("L{layer_idx}_attn_out"), &attn_out);
 
-    // post-attention norm on attn_out
+    // post-attention norm on attn_out (Gemma norm sits BETWEEN sublayer output
+    // and the residual add — see HF Gemma4TextDecoderLayer.forward lines 1405-1406).
     let post_attn_w = layer_weights
         .get("post_attention_norm.weight")
         .expect("Missing post_attention_norm");
     let attn_normed = gemma_rms_norm(&attn_out, post_attn_w, rms_eps);
     debug_norm(&format!("L{layer_idx}_post_attn_norm"), &attn_normed);
 
-    // layer_output_scale (scalar). Gemma stores it as a [1]-dim F32 tensor.
-    let scale_w = layer_weights.get("layer_output_scale.weight");
-    if let Some(sw) = scale_w {
-        if std::env::var("LEAFCUTTER_DEBUG_NORMS").is_ok() {
-            eprintln!("[NORM] L{} layer_output_scale = {:.6}", layer_idx, sw.data[0]);
-        }
-    }
-    let attn_contrib = if let Some(sw) = scale_w {
-        let s = sw.data[0];
-        let mut d = attn_normed.data.clone();
-        for v in d.iter_mut() {
-            *v *= s;
-        }
-        Tensor::from_vec(d, attn_normed.shape.clone())
-    } else {
-        attn_normed
-    };
-    let mut x = hidden.add(&attn_contrib);
+    // Residual add — NO layer_output_scale (HF uses layer_scalar=1.0 always;
+    // the GGUF slot is garbage, see doc comment above).
+    let mut x = hidden.add(&attn_normed);
     debug_norm(&format!("L{layer_idx}_after_attn_residual"), &x);
 
     // ── FFN sub-block ──
-    // `ffn_norm.weight` is engine-mapped to `post_attention_layernorm.weight`.
+    // `ffn_norm.weight` is engine-mapped to `pre_feedforward_layernorm.weight`
+    // (a.k.a. the legacy `post_attention_layernorm.weight` Llama name).
     let ffn_norm_w = layer_weights
         .get("ffn_norm.weight")
         .or_else(|| layer_weights.get("post_attention_layernorm.weight"))
-        .expect("Missing ffngradle_norm / post_attention_layernorm");
+        .expect("Missing ffn_norm / post_attention_layernorm");
     let ffn_in = gemma_rms_norm(&x, ffn_norm_w, rms_eps);
     let ffn_out = gemma_ffn_forward(&ffn_in, layer_weights);
     let post_ffw_w = layer_weights
         .get("post_ffw_norm.weight")
         .expect("Missing post_ffw_norm");
     let ffn_normed = gemma_rms_norm(&ffn_out, post_ffw_w, rms_eps);
-    let ffn_contrib = if let Some(sw) = scale_w {
-        let s = sw.data[0];
-        let mut d = ffn_normed.data.clone();
-        for v in d.iter_mut() {
-            *v *= s;
-        }
-        Tensor::from_vec(d, ffn_normed.shape.clone())
-    } else {
-        ffn_normed
-    };
-    x = x.add(&ffn_contrib);
+    // Residual add — NO layer_output_scale.
+    x = x.add(&ffn_normed);
     debug_norm(&format!("L{layer_idx}_after_ffn_residual"), &x);
     x
 }
@@ -405,10 +421,10 @@ mod tests {
 
     #[test]
     fn gemma_rms_norm_multiplies_weight_directly() {
-        // Reference: llama.cpp `ggml_compute_forward_rms_norm_f32` does
-        //   y = x * (1 / sqrt(mean(x²) + eps)) * w
-        // I.e. the on-disk weight `w` is applied directly, no `+1` offset.
-        // (Gemma stores already `(1 + γ₀)` so adding another 1 was wrong.)
+        // Reference: HF `Gemma4RMSNorm.forward` (modeling_gemma4.py:207-211)
+        // does `y = x * rsqrt(mean(x²) + eps) * w` — weight applied DIRECTLY,
+        // no `+1`. Gemma 4 differs from Gemma 2/3 (which use `(1 + w)`).
+        // (Gemma 2/3 store `(1 + γ₀)` semantics; Gemma 4 reverted to direct.)
         let x = Tensor::from_vec(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2]);
         // Row 0: x = [1, 2]; mean(x²) = (1 + 4)/2 = 2.5; inv_rms = 1/√2.5 ≈ 0.6325
         //   y[0] = 1 * 0.6325 * w[0] = 0.6325 / 2 = 0.31625
