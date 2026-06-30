@@ -227,7 +227,13 @@ pub fn deltanet_forward(
         }
 
         // Apply z-gate if attn_gate.weight exists
-        if let Some(gate_w) = weights.get("self_attn.gate_proj.weight") {
+        // Reference: llama.cpp qwen35.cpp:240  z = hidden @ wqkv_gate (named `attn_gate.weight` in GGUF)
+        //            qwen35.cpp:456         final_output = build_norm_gated(...)
+        //                                  where build_norm_gated does  normalized * silu(z)
+        if let Some(gate_w) = weights.get("attn_gate.weight")
+            .or_else(|| weights.get("self_attn.gate_proj.weight"))
+            .or_else(|| weights.get("wqkv_gate.weight"))
+        {
             let z = hidden_states.matmul(gate_w);
             // z shape: [seq_len, output_dim_per_token] — element-wise with reshaped_data
             let mut silu_sum = 0.0f32;
