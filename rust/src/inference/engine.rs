@@ -672,6 +672,7 @@ impl Engine {
 
             // Post-attention/SSM norm + FFN
             let post_norm_weight = layer_weights.get("post_attention_layernorm.weight")
+                .or_else(|| layer_weights.get("post_attention_norm.weight"))  // Qwen 3.5 GGUF name
                 .or_else(|| layer_weights.get("ffn_norm.weight"))
                 .expect("Missing post-norm");
             let normed = hidden.rms_norm(post_norm_weight, self.config.norm_eps);
