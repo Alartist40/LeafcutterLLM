@@ -301,47 +301,82 @@ impl Engine {
             if !has_qkv { continue; }
 
             if let Some(info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "attn_qkv.weight")) {
-                let dims: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
-                if dims.len() >= 2 {
-                    // GGUF stores 2-D weights as [in_dim, out_dim]
-                    let conv_dim = dims[1];
+                let dims: Vec<Vec<usize>> = info.dimensions.iter().map(|&d| vec![d as usize]).collect();
+                // 2-D GGUF layout: dim[0] is hidden_in (n_embd), dim[1] is conv_dim (= 2*K + V after the qkv projection gap).
+                let hidden_in = *info.dimensions.first().unwrap_or(&0) as usize;
+                let conv_dim = *info.dimensions.get(1).unwrap_or(&0) as usize;
+                let _ = dims; // keep linter happy on existing field reads
 
-                    // num_v_heads = ssm_a length (one decay param per V-head)
-                    let num_v_heads = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_a"))
-                        .map(|t| t.dimensions.iter().map(|&d| d as usize).product())
-                        .unwrap_or(32);
+                // num_v_heads = ssm_dt_rank (matches the shape of `ssm_dt.bias` AND ssm_a,
+                // and the second dim of `ssm_alpha.weight` = [n_embd, n_v_heads]).
+                // Reference: llama.cpp qwen35.cpp:61  `n_v_heads = hparams.ssm_dt_rank`
+                let num_v_heads = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_dt.bias"))
+                    .or_else(|| model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_a")))
+                    .map(|t| t.dimensions.iter().map(|&d| d as usize).product::<usize>())
+                    .unwrap_or(32);
 
-                    // head_v_dim from ssm_out input_dim / num_v_heads
-                    let head_v_dim = if let Some(out_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_out.weight")) {
-                        let out_dims: Vec<usize> = out_info.dimensions.iter().map(|&d| d as usize).collect();
-                        out_dims[0] / num_v_heads.max(1)
-                    } else { 128 };
+                // num_qk_heads = ssm_n_group (one / (groups)) heads-per-K-head.
+                // Reference: llama.cpp qwen35.cpp:60 `n_k_heads = hparams.ssm_n_group`.
+                // We can derive it from the FIRST dim of `ssm_alpha.weight`'s *transposed* GGUF layout too,
+                // but the metadata is cleaner. Fall back to `ssm.group_count` then 16.
+                let num_qk_heads: usize = {
+                    // shape of ssm_alpha.weight = [n_embd, n_v_heads] — already tells us V-heads.
+                    // For K-heads, we rely on metadata; ssm.group_count is the canonical key.
+                    if let Some(meta) = model.file.get_metadata_int("qwen35.ssm.group_count") {
+                        let v = meta as usize;
+                        if v > 0 { v } else { 16 }
+                    } else if let Some(meta) = model.file.get_metadata_int("ssm.group_count") {
+                        let v = meta as usize;
+                        if v > 0 { v } else { 16 }
+                    } else {
+                        16
+                    }
+                };
 
-                    // Assume num_qk_heads = num_v_heads for DeltaNet layers
-                    let num_qk_heads = num_v_heads;
+                // head_v_dim from ssm_out[0] / num_v_heads, OR from ssm_norm.weight shape
+                let head_v_dim = if let Some(out_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_out.weight")) {
+                    let in_v = *out_info.dimensions.first().unwrap_or(&0) as usize;
+                    (in_v / num_v_heads.max(1)).max(1)
+                } else if let Some(norm_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_norm.weight")) {
+                    *norm_info.dimensions.first().unwrap_or(&128) as usize
+                } else { 128 };
 
-                    let head_k_dim = if num_qk_heads > 0 && conv_dim > num_v_heads * head_v_dim {
-                        (conv_dim - num_v_heads * head_v_dim) / (2 * num_qk_heads)
-                    } else { head_v_dim };
+                // head_k_dim  derived from invariant: conv_dim = 2*K + V = 2 * (num_qk_heads * head_k_dim) + (num_v_heads * head_v_dim)
+                let head_k_dim = if num_qk_heads > 0 && conv_dim >= num_v_heads * head_v_dim {
+                    let k_total = (conv_dim - num_v_heads * head_v_dim) / 2;
+                    (k_total / num_qk_heads).max(1)
+                } else {
+                    head_v_dim
+                };
 
-                    let conv_kernel = if let Some(conv_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_conv1d.weight")) {
-                        conv_info.dimensions[0] as usize
-                    } else { 4 };
-
-                    eprintln!("  DeltaNet: qk_heads={}, v_heads={}, head_k={}, head_v={}, conv_dim={}, conv_k={}",
-                        num_qk_heads, num_v_heads, head_k_dim, head_v_dim, conv_dim, conv_kernel);
-
-                    return DeltaNetParams {
-                        num_qk_heads,
-                        num_v_heads,
-                        head_k_dim,
-                        head_v_dim,
-                        conv_dim,
-                        conv_kernel,
-                        state_size: head_v_dim,
-                        norm_eps: config.norm_eps,
-                    };
+                // Cross-check: ensure 2*qk_h*head_k + v_h*head_v == conv_dim (sanity)
+                if num_qk_heads * head_k_dim * 2 + num_v_heads * head_v_dim != conv_dim {
+                    eprintln!(
+                        "  DeltaNet WARN: dim mismatch on layer {}: 2*{}*{} + {}*{} = {} != conv_dim {}",
+                        layer_idx, num_qk_heads, head_k_dim, num_v_heads, head_v_dim,
+                        2 * num_qk_heads * head_k_dim + num_v_heads * head_v_dim, conv_dim
+                    );
                 }
+
+                let conv_kernel = if let Some(conv_info) = model.file.get_tensor_info(&format!("{}.{}", prefix, "ssm_conv1d.weight")) {
+                    *conv_info.dimensions.first().unwrap_or(&4) as usize
+                } else { 4 };
+
+                eprintln!(
+                    "  DeltaNet: qk_heads={}, v_heads={}, head_k={}, head_v={}, conv_dim={}, conv_k={}, hidden_in={}",
+                    num_qk_heads, num_v_heads, head_k_dim, head_v_dim, conv_dim, conv_kernel, hidden_in
+                );
+
+                return DeltaNetParams {
+                    num_qk_heads,
+                    num_v_heads,
+                    head_k_dim,
+                    head_v_dim,
+                    conv_dim,
+                    conv_kernel,
+                    state_size: head_v_dim,
+                    norm_eps: config.norm_eps,
+                };
             }
         }
         eprintln!("  Warning: Could not infer DeltaNet params, using defaults");
@@ -543,9 +578,9 @@ impl Engine {
         // produces logits in the ±5 range, not 5–30.  The sqrt(n_embd)
         // embedding pre-scale appears to NOT be correctly compensated by
         // the model.norm + lm_head pipeline in this implementation, so we
-        // experimentally disable it here — the embed → RMSNorm path uses
-        // the raw embedding magnitudes and downstream activations stay
-        // logit-friendly.
+        // Gemma 3/4: scale token embeddings by sqrt(hidden_size) before the
+        // first layer (matches llama.cpp's `inpL = ggml_scale(ctx0, inpL, sqrtf(n_embd))`
+        // in models/gemma4.cpp:14 and HuggingFace's Gemma3ForCausalLM).
         if is_gemma {
             let scale = (self.config.hidden_size as f32).sqrt();
             for v in hidden.data.iter_mut() {
@@ -561,10 +596,7 @@ impl Engine {
                 let min = hidden.data.iter().cloned().fold(f32::INFINITY, f32::min);
                 eprintln!(
                     "[NORM] emb_scaled               n={:>6}  l2={:>10.3}  min={:>12.4}  max={:>12.4}",
-                    hidden.data.len(),
-                    l2,
-                    min,
-                    max
+                    hidden.data.len(), l2, min, max
                 );
             }
         }
