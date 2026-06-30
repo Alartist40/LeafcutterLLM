@@ -875,7 +875,7 @@ impl Engine {
         } else {
             1.0
         };
-        if inv != 1.0 {
+        let logits = if inv != 1.0 {
             let mut scaled = hidden_last.to_vec();
             for v in scaled.iter_mut() {
                 *v *= inv;
@@ -883,7 +883,8 @@ impl Engine {
             self.lm_head_projection(&scaled, "token_embd.weight", hidden_size, vocab_size)
         } else {
             self.lm_head_projection(hidden_last, "token_embd.weight", hidden_size, vocab_size)
-        }
+        };
+        logits
     }
 
     /// Compute logits when lm_head is a separate tensor (output.weight).
@@ -943,7 +944,8 @@ impl Engine {
     }
 
     /// Format a chat prompt based on the model's special tokens.
-    /// Auto-detects Llama-3, Qwen2.5, or plain text.
+    /// Auto-detects Llama-3, Qwen2.5/Qwen3 (ChatML `<|im_start|>`), or
+    /// raw-text by default for Ornith-family models.
     pub fn format_chat_prompt(&self, system: &str, user: &str) -> String {
         let tok = self.tokenizer_from_model();
         let has_llama3 = tok.as_ref()
@@ -966,7 +968,8 @@ impl Engine {
                 system, user
             )
         } else {
-            // Plain text fallback
+            // Plain text fallback (used for Ornith 1.0 9B which ships
+            // a custom non-ChatML tokenizer).  Pass through verbatim.
             user.to_string()
         }
     }
