@@ -154,7 +154,11 @@ impl LlamaContext {
     pub fn tokenize(&self, text: &str, add_special: bool, parse_special: bool) -> Vec<llama_token> {
         unsafe {
             let vocab = bindings::llama_model_get_vocab(self.model.as_ptr());
-            let c_text = CString::new(text).unwrap_or_default();
+            // Strip embedded NUL bytes — CString::new fails on them, and
+            // they would silently truncate the input.  NULs in user text
+            // are almost never intentional.
+            let clean: String = text.replace('\0', "");
+            let c_text = CString::new(clean).expect("NULs stripped; empty string is valid CString");
             let text_len = c_text.as_bytes().len() as i32;
 
             // First call: get required buffer size

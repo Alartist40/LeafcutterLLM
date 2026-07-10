@@ -9,7 +9,7 @@
 //! For Cynapse integration:
 //!   leafcutter --meta                                    # Print synapse metadata JSON
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -237,7 +237,7 @@ fn run_ffi_benchmark(engine: &Arc<dyn leafcutter::api::LeafcutterEngine>) {
     println!("\n🏁 Running benchmark...");
     let prompt = "Hello";
     let start = Instant::now();
-    let (text, tokens) = engine.generate(prompt, 10, 0.7).unwrap();
+    let (text, tokens) = engine.generate(prompt, 10, 0.7, 0.9).unwrap();
     let elapsed = start.elapsed();
 
     let tok_per_sec = tokens.len() as f64 / elapsed.as_secs_f64();

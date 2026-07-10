@@ -99,6 +99,10 @@ impl Engine {
             deltanet_params: DeltaNetParams::default(),
             mla_params: crate::inference::mla::MlaParams::default(),
             moe_params: crate::inference::moe::MoeConfig::default(),
+            gemma_layouts: Vec::new(),
+            gemma_norm_eps: 1e-6,
+            gemma_logit_softcap: 0.0,
+            embed_uses_sqrt_scale: false,
             speculative_head: None,
             lm_head_tied: false,
             ssm_cache: SSMStateCache::new(),
@@ -106,6 +110,7 @@ impl Engine {
             gguf_path: path.to_string(),
             cached_tokenizer: std::sync::Mutex::new(None),
             cached_lm_head_size: std::sync::atomic::AtomicUsize::new(0),
+            seq_offset: 0,
             #[cfg(feature = "llama-ffi")]
             ffi_model: Some(model),
             #[cfg(feature = "llama-ffi")]
@@ -946,9 +951,14 @@ impl Engine {
                     buf.resize(hidden_size, 0.0);
                     CAP.with(|c| c.set(buf.capacity()));
                 }
-                file.get_tensor_row_f32_into(tensor_name, token_id, &mut buf)
-                    .expect("lm_head row");
-                hidden_last.iter().zip(buf.iter()).map(|(a, b)| a * b).sum::<f32>()
+                if file.get_tensor_row_f32_into(tensor_name, token_id, &mut buf).is_none() {
+                    // Row read failed (corrupted GGUF, disk error, OOB) —
+                    // emit a zero logit for this token rather than crashing
+                    // the entire generation.
+                    0.0
+                } else {
+                    hidden_last.iter().zip(buf.iter()).map(|(a, b)| a * b).sum::<f32>()
+                }
             })
         }).collect()
     }

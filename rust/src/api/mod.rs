@@ -18,7 +18,7 @@ use std::time::Instant;
 
 use crate::llama_ffi::{backend_init, LlamaModel, LlamaContext};
 use crate::inference::engine::Engine as NativeEngine;
-use crate::tokenizer::{BaseTokenizer, GgufBpeTokenizer};
+use crate::tokenizer::GgufBpeTokenizer;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -231,7 +231,15 @@ pub async fn generate_handler(
     Json(req): Json<GenerateRequest>,
 ) -> Result<Json<GenerateResponse>, (StatusCode, String)> {
     let start = Instant::now();
-    let id = format!("req-{}", start.elapsed().as_nanos());
+    // Use wall-clock nanos for uniqueness — start.elapsed() here is ~0
+    // and would produce duplicate IDs across concurrent requests.
+    let id = format!(
+        "req-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    );
 
     let capped_max = engine.max_seq_len().min(req.max_tokens);
 
@@ -257,7 +265,7 @@ pub async fn generate_handler(
 pub async fn health_handler(State(engine): State<SharedEngine>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "ok".to_string(),
-        version: "v0.9.5-production".to_string(),
+        version: format!("v{}", env!("CARGO_PKG_VERSION")),
         engine: engine.name().to_string(),
     })
 }
