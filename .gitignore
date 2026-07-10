@@ -45,3 +45,8 @@ go-backup/
 # OS generated files
 .DS_Store
 .env
+
+# Adhoc instrumentation logs (debug during audit)
+rust/norms.log
+rust/norms_diag.log
+rust/stdout.log

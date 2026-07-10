@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 # LeafcutterLLM — One-Line Installer
 # Usage: curl -fsSL https://raw.githubusercontent.com/Alartist40/LeafcutterLLM/main/install.sh | bash
+# Version is auto-derived from rust/Cargo.toml so it can't drift.
 set -euo pipefail
 
-LEAFCUTTER_VERSION="0.9.0"
+# Auto-derive version from Cargo.toml to avoid drift.
+# Falls back to "0.9.0" if the extraction fails.
+LEAFCUTTER_VERSION="$(
+    grep -E '^version\s*=' "$(dirname "$0")/rust/Cargo.toml" 2>/dev/null \
+        | head -n 1 \
+        | sed -E 's/.*"([^"]+)".*/\1/' \
+        || echo "0.9.0"
+)"
 REPO_URL="https://github.com/Alartist40/LeafcutterLLM.git"
 INSTALL_DIR="${HOME}/.leafcutter"
 BIN_DIR="${HOME}/.local/bin"
