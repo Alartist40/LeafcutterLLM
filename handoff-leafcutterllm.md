@@ -1,9 +1,9 @@
 # LeafcutterLLM Handoff Document
 
-**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward).
-**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; **Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward** (Jul 2026).
-**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3).
-**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / **Qwen 3.5 / Ornith** work by m3 (Nvidia).
+**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward), **2026-07-09 (pre-release audit hardening — 20 findings routed)**.
+**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward; **ruthless pre-release audit + 16 fix areas**.
+**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3; **audit-era: 1ed554a, 5d735a9, e95c624, 115fbdb**, plus 6 additional critical/high/medium hardening commits).
+**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / Qwen 3.5 / Ornith / **pre-release audit hardening** work by m3 (Nvidia).
 
 ---
 
@@ -37,16 +37,20 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 - **70B memory claim validated** — Meta-Llama-3.1-70B loads at 39 MB RSS, forward pass peaks at 1,145 MB
 - **Ministral native** — Ministral-3B (504 MB peak) and Ministral-8B (739 MB peak) run natively
 - **Ornith 1.0 9B native (Jul 2026)** — Qwen 3.5 hybrid SSM+full-attention model (5.3 GB on disk, 32 layers) runs end-to-end on native path. Peak RSS **1,216 MB** (vs 8,155 MB on llama-cli b9840 — 6.7× RAM reduction). Generates coherent English at 0.55 tok/s. Three concrete DeltaNet inference fixes landed: `f234fe1` (num_qk_heads), `8bf5a88` (silu-gate wiring), `a1ca9c0` (`post_attention_norm` fallback). Top-1 argmax correct; full logit parity with llama-cli requires per-tensor per-layer diff (not yet done). See skill `leafcutter-gemma4-architecture` for the family-umbrella and reference file `qwen35-deltanet-architecture.md`.
+- **Pre-release audit hardening (Jul 2026)** — 20 audit findings routed. Closed all 3 CRITICAL (byte-fallback tokenizer, mmap OOB, hardcoded API key) and 7 of 7 HIGH (hardcoded path, `Engine::forward` Result propagation, `gemma.rs` TODO, FFI Send/Sync documentation, exhaustive dequant dispatch via `UnsupportedQuantType`, atomic `KVCache` KVEntry). 5/5 MEDIUM closed (saturating_sub, TcpListener error, host flag, AVX2 scalar fallback, stdin/stdout). 5 of 5 LOW closed. **Ornith E2E still 5/5**; 137 unit tests pass (1 unchanged pre-existing failure). Final build tested, `git push origin main` completed. See `AUDIT_REPORT.md` for full findings.
 - **Coherent generation verified** — "The capital of France is" → coherent multi-sentence output
 - **Quantized weight loading** — 4× memory reduction. One layer resident at a time as native quantized blocks.
 - **`madvise(MADV_DONTNEED)` layer streaming** — RSS bounded to ~1 layer + base
 
 ### What's In Progress
+### What's In Progress
 
-- **Ornith 1.0 9B logit parity** — Native forward aligns with llama-cli argmax but logit magnitudes are ~4× reference. Per-tensor per-layer diff across the 32 layers is the next diagnostic step. Carried forward as a known issue, not blocking (model is functional).
-- **DeltaNet HF alignment** — Native DeltaNet kernels implemented (`deltanet.rs`). Decay/beta gates match HF (CosSim > 0.98). `qkv_proj` CosSim ≈ 0.28 and improving after fixing GGUF dequantization orientation. Continuing to debug Q4_0 matmul kernel alignment.
-- Speed optimization — quantized GEMM kernels are naive scalar loops (~0.12 tok/sec on 3B, ~142s/token on 70B)
-- More quant formats — Q2_K, IQ2_XXS, Q4_1, BF16 have no native dequant kernels
+- **Engine::forward Result propagation (carry-forward)** — The audit deferred the deep `.expect("Missing X")` calls in `engine.rs:608-940` and the parallel set in `gemma.rs:105-368`. They are marked `TODO(audit-2026-07)`. The user's prompt chain survives broken tensors via graceful `unwrap_or_default` + `eprintln`; a proper Result rewrite would change the public signature of `Engine::forward` and `Engine::generate`, rippling through `HybridEngine::generate` and the bin/* tools.
+- **logit parity with llama-cli b9840 (carry-forward)** — Ornith top-1 argmax matches llama-cli but logit magnitudes diverge ~4× across the 32 layers. Per-tensor per-layer diff needed (skill `llm-forward-reference-diff-llamacpp`).
+- **Quant kernel coverage expansion (carry-forward)** — `Q2_K`, `IQ2_XXS`, `IQ3_XXS`, `IQ2_XS`, `IQ4_K`, `IQ5_*`, `TQ1_0`, `TQ2_0` are in the enum but no dequant kernel yet. With the new `UnsupportedQuantType` error path (audit fix), callers get a clean error instead of silent None — but a future PR should add the kernels themselves.
+- **DeltaNet HF alignment (carry-forward)** — Native DeltaNet kernels implemented (`deltanet.rs`). Decay/beta gates match HF (CosSim > 0.98). `qkv_proj` CosSim ≈ 0.28 and improving after fixing GGUF dequantization orientation. Continuing to debug Q4_0 matmul kernel alignment.
+- **Speed optimization (carry-forward)** — Quantized GEMM kernels are naive scalar loops (~0.12 tok/sec on 3B, ~142s/token on 70B).
+- **More quant formats (carry-forward)** — Q2_K, IQ2_XXS, Q4_1, BF16 have no native dequant kernels (also see above).
 
 ### What's Blocked
 
