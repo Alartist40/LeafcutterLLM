@@ -49,6 +49,14 @@ Routed the 20 audit findings (3 critical, 7 high, 5 medium, 5 low/info) from
   propagation deferred to follow-up.
 - **`install.sh`** (INFO #20): Version auto-derived from `rust/Cargo.toml`
   via `grep`. No longer hardcoded — can't drift.
+- **`api/mod.rs`** (FINDING M): Hardcoded `"v0.9.5-production"` in
+  `health_handler` replaced with `env!("CARGO_PKG_VERSION")`. The
+  `/health` endpoint now reflects `Cargo.toml` automatically.
+- **`inference/engine.rs`** (FINDING K): `lm_head_projection` previously
+  panicked (`expect("lm_head row")`) on any failure from
+  `get_tensor_row_f32_into`. Replaced with `.is_none()` guard returning
+  `0.0` logit for that token — a corrupted-row or OOB on a single token
+  no longer kills the entire generation.
 
 ### Documentation
 - `AUDIT_REPORT.md` — 20 ranks, file:line ref, plan-of-action.
