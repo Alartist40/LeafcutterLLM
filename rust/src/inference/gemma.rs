@@ -98,26 +98,26 @@ pub fn gemma_rms_norm(x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
 }
 
 /// GeGLU FFN: `down × (GeLU(gate × x) ⊙ (up × x))`.
-pub fn gemma_ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {
-    let gate_proj = x.matmul(
-        weights
-            .get("mlp.gate_proj.weight")
-            .expect("Missing gate_proj"),
-    );
-    let up_proj = x.matmul(weights.get("mlp.up_proj.weight").expect("Missing up_proj"));
+pub fn gemma_ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Result<Tensor, String> {
+    let gate = weights
+        .get("mlp.gate_proj.weight")
+        .ok_or_else(|| "gemma_ffn: missing mlp.gate_proj.weight".to_string())?;
+    let up = weights
+        .get("mlp.up_proj.weight")
+        .ok_or_else(|| "gemma_ffn: missing mlp.up_proj.weight".to_string())?;
     let down = weights
         .get("mlp.down_proj.weight")
-        .expect("Missing down_proj");
-    let mut fused = vec![0.0f32; gate_proj.data.len()];
+        .ok_or_else(|| "gemma_ffn: missing mlp.down_proj.weight".to_string())?;
+    let gate_proj = x.matmul(gate);
+    let up_proj = x.matmul(up);
     let inv_sqrt_2_pi = (2.0f32 / std::f32::consts::PI).sqrt();
+    let mut fused = vec![0.0f32; gate_proj.data.len()];
     for i in 0..gate_proj.data.len() {
         let gv = gate_proj.data[i];
-        let gelu = 0.5 * gv
-            * (1.0
-                + (inv_sqrt_2_pi * (gv + 0.044715 * gv * gv * gv)).tanh());
+        let gelu = 0.5 * gv * (1.0 + (inv_sqrt_2_pi * (gv + 0.044715 * gv * gv * gv)).tanh());
         fused[i] = gelu * up_proj.data[i];
     }
-    Tensor::from_vec(fused, gate_proj.shape.clone()).matmul(down)
+    Ok(Tensor::from_vec(fused, gate_proj.shape.clone()).matmul(down))
 }
 
 /// Build a synthetic fused QKV tensor for a Gemma-style attention layer.
@@ -137,7 +137,7 @@ pub fn gemma_ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tenso
 // column-stacking the gguf weights.  Because GGUF weights are stored as
 // [in, out] row-major, those are already in the form `[in_dim, out_dim]`,
 // so we can just stick them side-by-side along the output axis.
-pub fn gemma_fused_qkv(_hidden: &Tensor, layer_weights: &mut HashMap<String, Tensor>) -> Tensor {
+pub fn gemma_fused_qkv(_hidden: &Tensor, layer_weights: &mut HashMap<String, Tensor>) -> Result<Tensor, String> {
     // Locate + materialize f32 data from the quantized weight (loader stores
     // Q4_K/Q6_K tensors with empty `data` and populated `q_data`).
     materialize_in_place(layer_weights, "self_attn.q_proj.weight");
@@ -146,11 +146,11 @@ pub fn gemma_fused_qkv(_hidden: &Tensor, layer_weights: &mut HashMap<String, Ten
     let q_w = layer_weights
         .get("self_attn.q_proj.weight")
         .or_else(|| layer_weights.get("attn_q.weight"))
-        .expect("gemma_fused_qkv: missing attn_q/attn_q_proj.weight");
+        .ok_or_else(|| "gemma_fused_qkv: missing attn_q/attn_q_proj.weight".to_string())?;
     let k_w = layer_weights
         .get("self_attn.k_proj.weight")
         .or_else(|| layer_weights.get("attn_k.weight"))
-        .expect("gemma_fused_qkv: missing attn_k/attn_k_proj.weight");
+        .ok_or_else(|| "gemma_fused_qkv: missing attn_k/attn_k_proj.weight".to_string())?;
     assert_eq!(q_w.shape.len(), 2, "weight must be 2-D, got {:?}", q_w.shape);
     assert_eq!(k_w.shape.len(), 2, "weight must be 2-D, got {:?}", k_w.shape);
 
@@ -159,7 +159,7 @@ pub fn gemma_fused_qkv(_hidden: &Tensor, layer_weights: &mut HashMap<String, Ten
         .get("self_attn.v_proj.weight")
         .or_else(|| layer_weights.get("attn_v.weight"));
 
-    if let Some(v_w) = v_w_opt {
+    Ok(if let Some(v_w) = v_w_opt {
         // Global (G) layer: K and V are independent projections.
         assert_eq!(v_w.shape.len(), 2, "weight must be 2-D, got {:?}", v_w.shape);
         // Stack Q, K, V along the output axis (column-wise concat).
@@ -206,7 +206,7 @@ pub fn gemma_fused_qkv(_hidden: &Tensor, layer_weights: &mut HashMap<String, Ten
             data[dst_start + q_total + k_out..dst_start + total_out].copy_from_slice(k_row);
         }
         Tensor::from_vec(data, vec![in_dim, total_out])
-    }
+    })
 }
 
 
@@ -244,14 +244,14 @@ pub fn gemma_layer_forward(
     layer_idx: usize,
     position_offset: usize,
     rms_eps: f32,
-) -> Tensor {
+) -> Result<Tensor, String> {
     // ── Attention sub-block ──
     // Gemma's `attn_norm.weight` is engine-mapped to `input_layernorm.weight`
     // (per arch.rs tensor-mapping table). Fall back to either name.
     let attn_norm_w = layer_weights
         .get("attn_norm.weight")
         .or_else(|| layer_weights.get("input_layernorm.weight"))
-        .expect("Missing attn_norm / input_layernorm");
+        .ok_or_else(|| format!("layer {}: missing attn_norm / input_layernorm", layer_idx))?;
     if std::env::var("LEAFCUTTER_DEBUG_NORMS").is_ok() && layer_idx < 2 {
         let n = attn_norm_w.data.len();
         let l2: f32 = attn_norm_w.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
@@ -269,7 +269,7 @@ pub fn gemma_layer_forward(
     }
     let pre_attn = gemma_rms_norm(hidden, attn_norm_w, rms_eps);
     debug_norm(&format!("L{layer_idx}_pre_attn_rmsnorm"), &pre_attn);
-    let qkv = gemma_fused_qkv(&pre_attn, layer_weights);
+    let qkv = gemma_fused_qkv(&pre_attn, layer_weights)?;
     let mut weights_with_qkv = layer_weights.clone();
     weights_with_qkv.insert("attn_qkv.weight".to_string(), qkv);
 
@@ -350,7 +350,7 @@ pub fn gemma_layer_forward(
     // and the residual add — see HF Gemma4TextDecoderLayer.forward lines 1405-1406).
     let post_attn_w = layer_weights
         .get("post_attention_norm.weight")
-        .expect("Missing post_attention_norm");
+        .ok_or_else(|| format!("layer {}: missing post_attention_norm.weight", layer_idx))?;
     let attn_normed = gemma_rms_norm(&attn_out, post_attn_w, rms_eps);
     debug_norm(&format!("L{layer_idx}_post_attn_norm"), &attn_normed);
 
@@ -365,17 +365,17 @@ pub fn gemma_layer_forward(
     let ffn_norm_w = layer_weights
         .get("ffn_norm.weight")
         .or_else(|| layer_weights.get("post_attention_layernorm.weight"))
-        .expect("Missing ffn_norm / post_attention_layernorm");
+        .ok_or_else(|| format!("layer {}: missing ffn_norm / post_attention_layernorm", layer_idx))?;
     let ffn_in = gemma_rms_norm(&x, ffn_norm_w, rms_eps);
-    let ffn_out = gemma_ffn_forward(&ffn_in, layer_weights);
+    let ffn_out = gemma_ffn_forward(&ffn_in, layer_weights)?;
     let post_ffw_w = layer_weights
         .get("post_ffw_norm.weight")
-        .expect("Missing post_ffw_norm");
+        .ok_or_else(|| format!("layer {}: missing post_ffw_norm.weight", layer_idx))?;
     let ffn_normed = gemma_rms_norm(&ffn_out, post_ffw_w, rms_eps);
     // Residual add — NO layer_output_scale.
     x = x.add(&ffn_normed);
     debug_norm(&format!("L{layer_idx}_after_ffn_residual"), &x);
-    x
+    Ok(x)
 }
 
 /// Print L2/min/max stats for a Tensor label if LEAFCUTTER_DEBUG_NORMS is set.

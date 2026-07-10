@@ -45,7 +45,7 @@ fn main() {
             .or_else(|| layer_weights.get("ffn_norm.weight"))
             .expect("Missing post-norm");
         let post_norm = hidden.rms_norm(post_norm_weight, engine.config.norm_eps);
-        let ffn_out = leafcutter::inference::engine::Engine::ffn_forward(&post_norm, &layer_weights);
+        let ffn_out = leafcutter::inference::engine::Engine::ffn_forward(&post_norm, &layer_weights).expect("ffn_forward failed");
         
         let before = max_abs(&hidden.data);
         hidden = hidden.add(&layer_out);

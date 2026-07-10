@@ -37,7 +37,7 @@ fn main() {
             hidden = hidden.add(&attn_out);
         }
         
-        let ffn_out = leafcutter::inference::engine::Engine::ffn_forward(&post_norm, &layer_weights);
+        let ffn_out = leafcutter::inference::engine::Engine::ffn_forward(&post_norm, &layer_weights).expect("ffn_forward failed");
         println!("Layer {} ffn_out RMS: {:.4}", layer_idx, rms(&ffn_out.data));
         hidden = hidden.add(&ffn_out);
         

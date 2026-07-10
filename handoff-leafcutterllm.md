@@ -44,7 +44,15 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 
 ### What's In Progress
 
-- **Engine::forward Result propagation (carry-forward)** — The audit deferred the deep `.expect("Missing X")` calls in `engine.rs:608-940` and the parallel set in `gemma.rs:105-368`. They are marked `TODO(audit-2026-07)`. The user's prompt chain survives broken tensors via graceful `unwrap_or_default` + `eprintln`; a proper Result rewrite would change the public signature of `Engine::forward` and `Engine::generate`, rippling through `HybridEngine::generate` and the bin/* tools.
+- **Engine::forward Result propagation (DONE 2026-07-10)** — Resolved `TODO(audit-2026-07)`.
+  `forward_native` propagates `Result<Tensor, String>` end-to-end. All 4
+  `.expect("Missing pre/post-norm")` panics → `.ok_or_else()?`. `ffn_forward`
+  and `ffn_moe_forward` return `Result` instead of panicking. `gemma.rs`
+  `gemma_rms_norm` and `gemma_fused_qkv` return `Result` — all 8 `.expect()`
+  removed. 15 bin/* tools updated to `.expect("ffn_forward failed")` at call
+  sites (diagnostic-only, loud-fail). `forward_debug` intentionally retains
+  `.expect()` for diagnostic loud-fail. Verified: 137 tests pass, both feature
+  configs build clean, Ornith E2E 5/5 green.
 - **logit parity with llama-cli b9840 (carry-forward)** — Ornith top-1 argmax matches llama-cli but logit magnitudes diverge ~4× across the 32 layers. Per-tensor per-layer diff needed (skill `llm-forward-reference-diff-llamacpp`).
 - **Quant kernel coverage expansion (carry-forward)** — `Q2_K`, `IQ2_XXS`, `IQ3_XXS`, `IQ2_XS`, `IQ4_K`, `IQ5_*`, `TQ1_0`, `TQ2_0` are in the enum but no dequant kernel yet. With the new `UnsupportedQuantType` error path (audit fix), callers get a clean error instead of silent None — but a future PR should add the kernels themselves.
 - **DeltaNet HF alignment (carry-forward)** — Native DeltaNet kernels implemented (`deltanet.rs`). Decay/beta gates match HF (CosSim > 0.98). `qkv_proj` CosSim ≈ 0.28 and improving after fixing GGUF dequantization orientation. Continuing to debug Q4_0 matmul kernel alignment.

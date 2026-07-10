@@ -620,7 +620,7 @@ impl Engine {
             let mut layer_weights = self
                 .model
                 .load_layer(layer_idx)
-                .expect("Failed to load layer");
+                .map_err(|e| format!("layer {} load: {}", layer_idx, e))?;
 
             // ── Gemma 3/4 fast path ── every layer is 4 RMSNorms + attention +
             // GeGLU + per-layer residual scale.  Skip all per-layer type routing.
@@ -635,7 +635,7 @@ impl Engine {
                     layer_idx,
                     self.seq_offset,
                     self.gemma_norm_eps,
-                );
+                )?;
                 hidden = new_hidden;
                 // Drop mmap pages — keep RSS bounded
                 self.model.file.drop_pages_from_cache();
@@ -664,9 +664,10 @@ impl Engine {
                 || layer_weights.contains_key("mlp.shared_expert_gate.weight");
 
             // Pre-norm
-            let pre_norm_weight = layer_weights.get("input_layernorm.weight")
+            let pre_norm_weight = layer_weights
+                .get("input_layernorm.weight")
                 .or_else(|| layer_weights.get("attn_norm.weight"))
-                .expect("Missing pre-norm");
+                .ok_or_else(|| format!("layer {}: missing pre-norm (input_layernorm/attn_norm)", layer_idx))?;
             let normed = hidden.rms_norm(pre_norm_weight, self.config.norm_eps);
 
             if has_standard_attn {
@@ -686,20 +687,16 @@ impl Engine {
             //  Currently no engine layer silently does this; it's logged.)
 
             // Post-attention/SSM norm + FFN
-            let post_norm_weight = layer_weights.get("post_attention_layernorm.weight")
-                .or_else(|| layer_weights.get("post_attention_norm.weight"))  // Qwen 3.5 GGUF name
+            let post_norm_weight = layer_weights
+                .get("post_attention_layernorm.weight")
+                .or_else(|| layer_weights.get("post_attention_norm.weight")) // Qwen 3.5 GGUF name
                 .or_else(|| layer_weights.get("ffn_norm.weight"))
-                .expect("Missing post-norm");
+                .ok_or_else(|| format!("layer {}: missing post-norm (post_attention_layernorm/_norm/ffn_norm)", layer_idx))?;
             let normed = hidden.rms_norm(post_norm_weight, self.config.norm_eps);
             let ffn_out = if has_moe {
-                Self::ffn_moe_forward(
-                    &normed,
-                    &layer_weights,
-                    &self.moe_params,
-                    has_shared_expert,
-                )
+                Self::ffn_moe_forward(&normed, &layer_weights, &self.moe_params, has_shared_expert)?
             } else {
-                Self::ffn_forward(&normed, &layer_weights)
+                Self::ffn_forward(&normed, &layer_weights)?
             };
             hidden = hidden.add(&ffn_out);
 
@@ -709,8 +706,10 @@ impl Engine {
         }
 
         // Final norm
-        let final_norm = self.special_weights.get("model.norm.weight")
-            .expect("Missing final norm");
+        let final_norm = self
+            .special_weights
+            .get("model.norm.weight")
+            .ok_or_else(|| "missing model.norm.weight (final norm)".to_string())?;
         hidden = hidden.rms_norm(final_norm, self.config.norm_eps);
         if std::env::var("LEAFCUTTER_DEBUG_NORMS").is_ok() {
             let l2 = hidden.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
@@ -793,7 +792,10 @@ impl Engine {
                 .or_else(|| layer_weights.get("ffn_norm.weight"))
                 .expect("Missing post-norm");
             let normed = hidden.rms_norm(post_norm_weight, self.config.norm_eps);
-            let ffn_out = Self::ffn_forward(&normed, &layer_weights);
+            // forward_debug is a diagnostic-only path — keep the old panic on
+            // missing FFN weights to surface inconsistencies loudly.
+            let ffn_out = Self::ffn_forward(&normed, &layer_weights)
+                .expect("forward_debug: ffn_forward failed");
             hidden = hidden.add(&ffn_out);
 
             let rss_after_layer = read_rss_kb();
@@ -1050,10 +1052,16 @@ impl Engine {
         Some(tok.decode(&clean_ids))
     }
 
-    pub fn ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {
-        let gate = weights.get("mlp.gate_proj.weight").expect("Missing gate");
-        let up = weights.get("mlp.up_proj.weight").expect("Missing up");
-        let down = weights.get("mlp.down_proj.weight").expect("Missing down");
+    pub fn ffn_forward(x: &Tensor, weights: &HashMap<String, Tensor>) -> Result<Tensor, String> {
+        let gate = weights
+            .get("mlp.gate_proj.weight")
+            .ok_or_else(|| "ffn_forward: missing mlp.gate_proj.weight".to_string())?;
+        let up = weights
+            .get("mlp.up_proj.weight")
+            .ok_or_else(|| "ffn_forward: missing mlp.up_proj.weight".to_string())?;
+        let down = weights
+            .get("mlp.down_proj.weight")
+            .ok_or_else(|| "ffn_forward: missing mlp.down_proj.weight".to_string())?;
 
         let gate_proj = x.matmul(gate);
         let up_proj = x.matmul(up);
@@ -1065,7 +1073,7 @@ impl Engine {
         }
         let fused_tensor = Tensor::from_vec(fused, activated.shape.clone());
 
-        fused_tensor.matmul(down)
+        Ok(fused_tensor.matmul(down))
     }
 
     /// MoE FFN forward (DeepSeek-2 / GLM-DSA).  Per-token, top-k routing
@@ -1083,7 +1091,7 @@ impl Engine {
         weights: &HashMap<String, Tensor>,
         cfg: &crate::inference::moe::MoeConfig,
         has_shared_expert: bool,
-    ) -> Tensor {
+    ) -> Result<Tensor, String> {
         let seq_len = x.shape[0];
         let hidden_dim = x.shape[1];
 
@@ -1142,7 +1150,7 @@ impl Engine {
         }
         let _ = has_shared_expert; // reserved for later exp_probs_b wiring
 
-        crate::inference::moe::moe_forward(x, &working, cfg)
+        Ok(crate::inference::moe::moe_forward(x, &working, cfg))
     }
 
     /// Get engine info for diagnostics

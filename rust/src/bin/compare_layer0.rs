@@ -71,7 +71,7 @@ fn main() {
     print_stats("post_norm", &post_norm.data);
 
     // FFN
-    let ffn_out = Engine::ffn_forward(&post_norm, &weights);
+    let ffn_out = Engine::ffn_forward(&post_norm, &weights).expect("ffn_forward failed");
     print_stats("ffn_out", &ffn_out.data);
 
     // Residual

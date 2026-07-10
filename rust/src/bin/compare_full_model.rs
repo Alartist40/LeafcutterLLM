@@ -230,7 +230,7 @@ fn main() {
         let has_ffn = weights.contains_key("mlp.gate_proj.weight")
             || weights.contains_key("ffn_gate.weight");
         if has_ffn {
-            let ffn_out = leafcutter::inference::engine::Engine::ffn_forward(&x_normed, &weights);
+            let ffn_out = leafcutter::inference::engine::Engine::ffn_forward(&x_normed, &weights).expect("ffn_forward failed");
             x = residual_ffn.add(&ffn_out);
         }
 

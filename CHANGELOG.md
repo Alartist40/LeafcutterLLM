@@ -43,10 +43,18 @@ Routed the 20 audit findings (3 critical, 7 high, 5 medium, 5 low/info) from
   back to scalar when `n % 256 != 0`. No more dimension assertion panics.
 - **`inference/engine.rs`** (HIGH #5): `pub fn forward` no longer panics
   on FFI errors; propagates `Result` and returns empty tensor on
-  failure with a log line. The remaining `.expect("Missing X")` calls in
-  the deep forward paths are documented as deferred (`TODO(audit-2026-07)`).
-- **`inference/gemma.rs`** (HIGH #6): See TODO above — full Result
-  propagation deferred to follow-up.
+  failure with a log line.
+- **`inference/engine.rs`** (RESOLVED `TODO(audit-2026-07)`):
+  `forward_native` now propagates `Result` end-to-end. All 4
+  `.expect("Missing pre/post-norm")` panics converted to `.ok_or_else()?`
+  error propagation. `ffn_forward` and `ffn_moe_forward` return
+  `Result<Tensor, String>` instead of panicking on missing gate/up/down
+  weights. The `forward_debug` diagnostic path retains `.expect()` by
+  design (loud-fail for diagnostic inconsistencies).
+- **`inference/gemma.rs`** (RESOLVED `TODO(audit-2026-07)`):
+  `gemma_rms_norm` and `gemma_fused_qkv` now return `Result<Tensor, String>`
+  instead of panicking. Call site `gemma_layer_forward` uses `?` to
+  propagate. All 8 `.expect()` calls removed from production paths.
 - **`install.sh`** (INFO #20): Version auto-derived from `rust/Cargo.toml`
   via `grep`. No longer hardcoded — can't drift.
 - **`api/mod.rs`** (FINDING M): Hardcoded `"v0.9.5-production"` in
