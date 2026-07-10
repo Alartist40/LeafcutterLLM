@@ -202,6 +202,7 @@ pub enum BridgeError {
 // ---------------------------------------------------------------------------
 
 use crate::inference::engine::Engine;
+use crate::tokenizer::GgufBpeTokenizer;
 
 /// A unified inference backend that tries native Rust first,
 /// then falls back to the llama.cpp bridge.
@@ -209,6 +210,9 @@ pub struct HybridEngine {
     pub native: Option<Engine>,
     pub bridge: Option<LlamaBridge>,
     pub model_path: String,
+    /// Tokenizer for the native path. Built from the GGUF embedded vocab
+    /// at load time so we never fall back to byte-level tokenization.
+    tokenizer: Option<GgufBpeTokenizer>,
 }
 
 impl HybridEngine {
@@ -217,10 +221,17 @@ impl HybridEngine {
         match Engine::load(path) {
             Ok(engine) => {
                 println!("✅ Native Rust engine loaded: {} layers", engine.config.num_hidden_layers);
+                // Build a real tokenizer from the GGUF embedded vocab so the
+                // native generate path never uses byte-level fallback.
+                let tokenizer = GgufBpeTokenizer::from_gguf(path);
+                if tokenizer.is_none() {
+                    eprintln!("⚠️  No GGUF-embedded tokenizer found for {}; native path will not work correctly", path);
+                }
                 return Ok(Self {
                     native: Some(engine),
                     bridge: None,
                     model_path: path.to_string(),
+                    tokenizer,
                 });
             }
             Err(e) => {
@@ -237,16 +248,25 @@ impl HybridEngine {
             native: None,
             bridge: Some(bridge),
             model_path: path.to_string(),
+            tokenizer: None,
         })
     }
 
     pub fn generate(&mut self, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32) -> String {
         if let Some(engine) = &mut self.native {
-            // Native path: byte-level tokenization (placeholder)
-            let tokens: Vec<usize> = prompt.bytes().map(|b| b as usize).collect();
+            // Native path: use the GGUF-embedded tokenizer, NOT byte casting.
+            // If no tokenizer is available, return an explicit error — do not
+            // silently corrupt the input by treating each byte as a token ID.
+            let tokenizer = match &self.tokenizer {
+                Some(t) => t,
+                None => {
+                    eprintln!("❌ No tokenizer available for native path; cannot tokenize input");
+                    return "[Error: no tokenizer available — cannot use native generate without a GGUF tokenizer]".to_string();
+                }
+            };
+            let tokens = tokenizer.encode(prompt);
             let generated = engine.generate(&tokens, max_tokens, temperature, top_p);
-            // Best-effort decode: treat tokens as bytes
-            String::from_utf8_lossy(&generated.iter().map(|&t| t as u8).collect::<Vec<u8>>()).to_string()
+            tokenizer.decode(&generated)
         } else if let Some(bridge) = &self.bridge {
             // Bridge path
             match bridge.generate(prompt, max_tokens, temperature, top_p) {

@@ -36,6 +36,17 @@ pub struct LlamaBatch {
     capacity: i32,
 }
 
+// SAFETY: LlamaModel and LlamaContext wrap llama.cpp opaque pointers.
+// These are **not** thread-safe at the C level — concurrent
+// access to a single Context can corrupt the KV cache. The Native
+// backend wraps a per-context mutex (NativeStreamingEngine + HybridEngine).
+// Callers in `LeafcutterEngine::generate` MUST ensure each context is
+// owned by one request at a time. Direct use of these raw unsafe impls
+// from multiple threads without synchronisation is a data race.
+//
+// TODO: replace these blanket impls with `Mutex<LlamaContext>` (the
+// Native backend already does this) so the unsafe impls can be removed
+// once all FFI call sites are audited.
 unsafe impl Send for LlamaModel {}
 unsafe impl Sync for LlamaModel {}
 unsafe impl Send for LlamaContext {}

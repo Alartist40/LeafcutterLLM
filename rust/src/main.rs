@@ -46,6 +46,10 @@ enum Commands {
         /// HTTP port to listen on
         #[arg(short, long, default_value_t = 8081)]
         port: u16,
+        /// Host/interface to bind (default: 127.0.0.1 loopback; set to
+        /// 0.0.0.0 to expose on all interfaces — only with auth enabled).
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
         /// Engine type (native-streaming or llama-ffi)
         #[arg(short, long, default_value = "native-streaming")]
         engine: String,
@@ -144,9 +148,9 @@ async fn main() {
     }
 
     match cli.command {
-        Some(Commands::Server { model, port, engine, benchmark }) => {
+        Some(Commands::Server { model, port, host, engine, benchmark }) => {
             #[cfg(feature = "llama-ffi")]
-            run_server(&model, port, &engine, benchmark).await;
+            run_server(&model, port, &host, &engine, benchmark).await;
             #[cfg(not(feature = "llama-ffi"))]
             {
                 eprintln!("❌ Server mode requires llama.cpp FFI. Build with: cargo build --features llama-ffi");
@@ -173,20 +177,11 @@ async fn main() {
             cmd_list_models(&dir);
         }
         None => {
-            #[cfg(feature = "llama-ffi")]
-            run_server(
-                "/home/xander/Documents/portfolio/AI Models/Qwen3.5-9B-IQ4_NL.gguf",
-                8081,
-                "native-streaming",
-                false,
-            ).await;
-            #[cfg(not(feature = "llama-ffi"))]
-            {
-                eprintln!("Usage: leafcutter <COMMAND>");
-                eprintln!("Commands: generate, list-models");
-                eprintln!("Server/chat require: cargo build --features llama-ffi");
-                std::process::exit(1);
-            }
+            // No subcommand: print help and exit. Never bake a hardcoded
+            // user path into the binary.
+            let _ = Cli::command().print_help();
+            println!();
+            std::process::exit(0);
         }
     }
 }
@@ -196,11 +191,12 @@ async fn main() {
 // ═════════════════════════════════════════════════════════════════════════════
 
 #[cfg(feature = "llama-ffi")]
-async fn run_server(model_path: &str, port: u16, engine_type: &str, benchmark: bool) {
+async fn run_server(model_path: &str, port: u16, host: &str, engine_type: &str, benchmark: bool) {
     use leafcutter::api::{FfiEngine, NativeStreamingEngine, LeafcutterEngine};
 
     println!("🌿 LeafcutterLLM v0.9.5 (Server Mode: {})", engine_type);
     println!("   Model: {}", model_path);
+    println!("   Host: {}", host);
 
     let engine: Arc<dyn LeafcutterEngine> = if engine_type == "native-streaming" {
         match NativeStreamingEngine::load(model_path) {
@@ -231,7 +227,7 @@ async fn run_server(model_path: &str, port: u16, engine_type: &str, benchmark: b
         return;
     }
 
-    leafcutter::api::run_server(engine, port).await;
+    leafcutter::api::run_server(engine, port, host).await;
 }
 
 #[cfg(feature = "llama-ffi")]
@@ -358,12 +354,16 @@ fn cmd_chat(
     eprintln!("\nType your message and press Enter. Type 'quit' or 'exit' to stop.\n");
 
     loop {
-        print!("\n🧑 You: ");
-        io::stdout().flush().unwrap();
+        print!("You: ");
+        if io::stdout().flush().is_err() {
+            break;
+        }
 
         let mut input = String::new();
-        io::stdin().read_line(&mut input).unwrap();
-        let input = input.trim();
+        if io::stdin().read_line(&mut input).is_err() {
+            break;
+        }
+        let input = input.trim().to_string();
 
         if input.eq_ignore_ascii_case("quit") || input.eq_ignore_ascii_case("exit") {
             eprintln!("👋 Goodbye!");
@@ -380,23 +380,27 @@ fn cmd_chat(
 
         let tokens = ctx.tokenize(&conversation, false, true);
 
-        // Context management: truncate if approaching limit
-        let tokens = if tokens.len() > ctx_size as usize - max_tokens {
+        // Context management: truncate if approaching limit.
+        // Use saturating_sub to avoid underflow when max_tokens > ctx_size.
+        let available = (ctx_size as usize).saturating_sub(max_tokens);
+        let tokens = if tokens.len() > available {
             eprintln!("[⚠️  Context nearly full — truncating older messages]");
             let system_prompt = format!(
                 "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\n{}<|eot_id|>", system
             );
             let system_tokens = ctx.tokenize(&system_prompt, false, true);
-            let keep = ctx_size as usize - max_tokens - system_tokens.len();
+            let keep = available.saturating_sub(system_tokens.len());
             let mut truncated = system_tokens;
-            truncated.extend_from_slice(&tokens[tokens.len() - keep..]);
+            truncated.extend_from_slice(&tokens[tokens.len().saturating_sub(keep)..]);
             truncated
         } else {
             tokens
         };
 
         print!("\n🤖 Assistant: ");
-        io::stdout().flush().unwrap();
+        if io::stdout().flush().is_err() {
+            break;
+        }
 
         let generated = ctx.generate(&tokens, max_tokens, temperature, model.eos_token());
         let response: String = generated.iter()
@@ -506,21 +510,39 @@ fn cmd_generate_native(
     };
 
     let tokens = if use_hf {
-        hf_tok.as_ref().unwrap().encode(&prompt_text)
+        match &hf_tok {
+            Some(t) => t.encode(&prompt_text),
+            None => {
+                eprintln!("❌ HF tokenizer selected but not available");
+                std::process::exit(1);
+            }
+        }
     } else {
-        gguf_tok.as_ref().unwrap().encode(&prompt_text)
+        match &gguf_tok {
+            Some(t) => t.encode(&prompt_text),
+            None => {
+                eprintln!("❌ No GGUF-embedded tokenizer found. Cannot tokenize input.");
+                eprintln!("   Ensure the GGUF file contains tokenizer.ggml.tokens metadata.");
+                std::process::exit(1);
+            }
+        }
     };
     eprintln!("📝 Prompt tokens: {}", tokens.len());
-    eprintln!("📝 Token IDs: {:?}", tokens);
 
     let info = engine.info();
     eprintln!("   Arch: {}  Layers: {}  Hidden: {}", info.architecture, info.total_layers, info.hidden_size);
 
     let generated = engine.generate(&tokens, max_tokens, temperature, 0.9);
     let text = if use_hf {
-        hf_tok.as_ref().unwrap().decode(&generated)
+        match &hf_tok {
+            Some(t) => t.decode(&generated),
+            None => String::new(),
+        }
     } else {
-        gguf_tok.as_ref().unwrap().decode(&generated)
+        match &gguf_tok {
+            Some(t) => t.decode(&generated),
+            None => String::new(),
+        }
     };
     println!("{}", text);
 }

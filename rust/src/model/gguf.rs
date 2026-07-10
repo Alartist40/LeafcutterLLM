@@ -29,6 +29,11 @@ pub enum GGUError {
     TruncatedData,
     #[error("Missing tensor: {0}")]
     MissingTensor(String),
+    /// Quant type `{1}` (which we don't have a kernel for: `{0}`).
+    /// Returned instead of silently failing dequant when the user picks an
+    /// unsupported format. See quant.rs `is_supported()`.
+    #[error("Unsupported quant type: {0} (numeric={1})")]
+    UnsupportedQuantType(String, u32),
 }
 
 #[derive(Debug, Clone)]
@@ -124,6 +129,15 @@ impl GGUFile {
         let size = calculate_tensor_size(&t.dimensions, t.typ);
         let start = self.data_offset + t.offset;
         let end = start + size as u64;
+        // Bounds-check against the actual mmap length to prevent OOB panic
+        // on truncated or crafted GGUF files.
+        if end > self.mmap.len() as u64 {
+            eprintln!(
+                "Leafcutter: tensor '{}' data extends past mmap boundary (end={}, mmap_len={})",
+                name, end, self.mmap.len()
+            );
+            return None;
+        }
         Some(&self.mmap[start as usize..end as usize])
     }
 
@@ -154,7 +168,17 @@ impl GGUFile {
 
         let tensor_start = (self.data_offset + info.offset) as usize;
         let row_start = tensor_start + row_idx * row_bytes;
-        let raw = &self.mmap[row_start..row_start + row_bytes];
+        let row_end = row_start + row_bytes;
+        // Bounds-check against actual mmap length to prevent OOB panic
+        // on truncated or crafted GGUF files.
+        if row_end > self.mmap.len() {
+            eprintln!(
+                "Leafcutter: row {} of '{}' extends past mmap boundary (end={}, mmap_len={})",
+                row_idx, name, row_end, self.mmap.len()
+            );
+            return None;
+        }
+        let raw = &self.mmap[row_start..row_end];
 
         let mut out = vec![0.0f32; cols];
         match qtype {

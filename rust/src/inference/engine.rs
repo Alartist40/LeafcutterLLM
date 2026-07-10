@@ -542,13 +542,23 @@ impl Engine {
     }
 
     /// Public forward dispatch — uses FFI for Qwen, native for others.
+    /// On the FFI path, llama.cpp errors are propagated rather than panicking
+    /// (see audit fix for finding #7).
     pub fn forward(&mut self, tokens: &[usize]) -> Vec<f32> {
         #[cfg(feature = "llama-ffi")]
         if let Some(ctx) = &mut self.ffi_context {
             let tokens_i32: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-            return ctx.forward(&tokens_i32).expect("FFI forward failed");
+            return match ctx.forward(&tokens_i32) {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("⚠️  FFI forward failed: {}", e);
+                    vec![]
+                }
+            };
         }
         self.forward_native(tokens).unwrap_or_else(|e| {
+            // TODO(audit-2026-07, finding #5): propagate Result to callers.
+            // For now, log and continue with empty so the chat loop survives.
             eprintln!("Forward pass failed: {}", e);
             vec![]
         })

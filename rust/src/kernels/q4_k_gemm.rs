@@ -50,7 +50,16 @@ pub fn q4_k_matmul_scalar(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usize, _k:
 unsafe fn q4_k_matmul_avx2_inner(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usize, _k: usize, n: usize) {
     use std::arch::x86_64::*;
 
-    assert_eq!(n % 256, 0, "AVX2 path requires n multiple of 256");
+    // AVX2 path requires n % 256 == 0 for the loop math. If a tensor's
+    // outer dim isn't a multiple of 256 (some custom architectures), the
+    // scalar fallback handles the tail. We require n % 8 at minimum for
+    // any 256-bit vector work; otherwise fall back per the public entry.
+    if n % 256 != 0 {
+        // Caller-guarded: pub fn falls back before this is reached.
+        // Panic in debug only; release returns gracefully via the public fn.
+        debug_assert!(n % 256 == 0, "AVX2 path requires n multiple of 256");
+        return;
+    }
     let bpr = b.blocks_per_row();
 
     for i in 0..m {
@@ -238,10 +247,19 @@ pub fn q4_k_matmul_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usiz
 // ============================================================================
 
 /// Dispatch to the best available Q4_K GEMM kernel.
-/// Uses row-dequantize hybrid: dequantize one B row to temp buffer, then SIMD FMA.
+/// Falls back to scalar when n % 256 != 0 (some custom architectures).
 pub fn q4_k_matmul(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
     assert_eq!(b.cols, n);
     assert_eq!(b.rows, k);
+
+    // If n isn't a multiple of 256, the SIMD kernels can't vectorize
+    // correctly. Fall back to scalar (rare path — most modern architectures
+    // have 256-aligned hidden sizes).
+    if n % 256 != 0 {
+        q4_k_matmul_scalar(a, b, c, m, k, n);
+        return;
+    }
+
     let bpr = b.blocks_per_row();
 
     // Zero C

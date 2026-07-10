@@ -14,65 +14,76 @@ pub mod deltanet_state;
 use crate::model::tensor::Tensor;
 use std::collections::HashMap;
 
+/// Per-layer KV cache entry. K, V, and shape are stored **atomically** in one
+/// struct so that they can never desync (the previous design used three
+/// separate HashMaps, which risked panic if K was inserted but V was missing).
+#[derive(Clone)]
+struct KVEntry {
+    k: Vec<f32>,
+    v: Vec<f32>,
+    /// Shape: [seq_len, num_kv_heads, head_dim]
+    shape: Vec<usize>,
+}
+
 pub struct KVCache {
-    /// f32 storage per layer
-    k_data: HashMap<usize, Vec<f32>>,
-    v_data: HashMap<usize, Vec<f32>>,
-    /// Shape for each layer's K/V tensor: [seq_len, num_kv_heads, head_dim]
-    shapes: HashMap<usize, Vec<usize>>,
+    /// f32 storage per layer (atomic K/V/shape trio)
+    layers: HashMap<usize, KVEntry>,
 }
 
 impl KVCache {
     pub fn new(_num_layers: usize) -> Self {
         Self {
-            k_data: HashMap::new(),
-            v_data: HashMap::new(),
-            shapes: HashMap::new(),
+            layers: HashMap::new(),
         }
     }
 
     pub fn clear(&mut self) {
-        self.k_data.clear();
-        self.v_data.clear();
-        self.shapes.clear();
+        self.layers.clear();
     }
 
     /// Append K and V tensors for a layer. Input is f32; stored as f32.
+    /// K, V, and shape are updated atomically — no panics from desync.
     pub fn append(&mut self, layer_idx: usize, k: Tensor, v: Tensor) {
-        if let Some(existing_k) = self.k_data.get_mut(&layer_idx) {
-            existing_k.extend_from_slice(&k.data);
-            self.v_data.get_mut(&layer_idx).unwrap().extend_from_slice(&v.data);
-            // Update shape along sequence dimension (dim 0)
-            self.shapes.get_mut(&layer_idx).unwrap()[0] += k.shape[0];
+        if let Some(entry) = self.layers.get_mut(&layer_idx) {
+            entry.k.extend_from_slice(&k.data);
+            entry.v.extend_from_slice(&v.data);
+            entry.shape[0] += k.shape[0];
         } else {
-            // First time for this layer
-            self.k_data.insert(layer_idx, k.data);
-            self.v_data.insert(layer_idx, v.data);
-            self.shapes.insert(layer_idx, k.shape);
+            self.layers.insert(
+                layer_idx,
+                KVEntry {
+                    k: k.data,
+                    v: v.data,
+                    shape: k.shape,
+                },
+            );
         }
     }
 
     /// Get f32 K and V tensors for a layer.
     pub fn get(&self, layer_idx: usize) -> Option<(Tensor, Tensor)> {
-        let k_f32 = self.k_data.get(&layer_idx)?;
-        let v_f32 = self.v_data.get(&layer_idx)?;
-        let shape = self.shapes.get(&layer_idx)?.clone();
+        let entry = self.layers.get(&layer_idx)?;
         Some((
-            Tensor::from_vec(k_f32.clone(), shape.clone()),
-            Tensor::from_vec(v_f32.clone(), shape),
+            Tensor::from_vec(entry.k.clone(), entry.shape.clone()),
+            Tensor::from_vec(entry.v.clone(), entry.shape.clone()),
         ))
     }
 
     /// Report memory usage in bytes (f32 storage).
     pub fn memory_bytes(&self) -> usize {
-        let k_bytes: usize = self.k_data.values().map(|v| v.len() * 4).sum();
-        let v_bytes: usize = self.v_data.values().map(|v| v.len() * 4).sum();
-        k_bytes + v_bytes
+        self.layers
+            .values()
+            .map(|e| (e.k.len() + e.v.len()) * 4)
+            .sum()
     }
 
     /// Total sequence length cached (same for all layers; returns first layer's seq_len).
     pub fn total_seq_len(&self) -> usize {
-        self.shapes.values().next().map(|s| s.get(0).copied().unwrap_or(0)).unwrap_or(0)
+        self.layers
+            .values()
+            .next()
+            .map(|e| e.shape.get(0).copied().unwrap_or(0))
+            .unwrap_or(0)
     }
 }
 

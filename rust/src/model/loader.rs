@@ -442,6 +442,13 @@ impl GGUFModel {
         let qtype = QuantType::from_u32(typ)
             .ok_or(GGUError::InvalidTensorType(typ))?;
 
+        // Reject quant types we don't have kernels for. Previously the
+        // catch-all silently returned Err, but now we also flag it explicitly
+        // so callers can distinguish "missing kernel" from a corrupted tensor.
+        if !qtype.is_supported() {
+            return Err(GGUError::UnsupportedQuantType(qtype.name().to_string(), typ));
+        }
+
         match qtype {
             QuantType::F32 => {
                 for i in 0..count {

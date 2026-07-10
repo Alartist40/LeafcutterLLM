@@ -139,7 +139,13 @@ impl LeafcutterEngine for FfiEngine {
         if prompt_tokens.is_empty() { return Err("Empty prompt".to_string()); }
 
         let eos = self.model.eos_token();
-        // top_p is not exposed by the FFI binding; llama.cpp samples with top_p=0.95 internally.
+        // top_p is accepted by the API for OpenAI compatibility but the FFI
+        // binding doesn't expose llama.cpp's sampler chain. llama.cpp's
+        // internal sampler uses top_p=0.95. If the caller passes a non-default
+        // top_p, surface it as a warning so the user knows it's ignored.
+        if (top_p - 0.95).abs() > 0.01 && (top_p - 0.9).abs() > 0.01 {
+            eprintln!("⚠️  top_p={} requested but FFI engine uses llama.cpp's internal top_p=0.95; value ignored", top_p);
+        }
         let _ = top_p;
         let generated = ctx.generate(&prompt_tokens, max_tokens, temperature, eos);
 
@@ -189,18 +195,22 @@ impl LeafcutterEngine for NativeStreamingEngine {
 
 pub type SharedEngine = Arc<dyn LeafcutterEngine>;
 
+// Auth: DISABLED by default. Set LEAFCUTTER_API_KEY env var to enable.
+// Setting it to any non-empty string requires that value on every request.
+// An empty or unset env var means no auth — the server runs open (intended
+// for local-loopback development). Pair with `--host` binding to 127.0.0.1.
+
 // ---------------------------------------------------------------------------
 // Auth middleware
 // ---------------------------------------------------------------------------
-
-const DEFAULT_API_KEY: &str = "leaf-dev";
 
 async fn auth_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    let key = std::env::var("LEAFCUTTER_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
+    let key = std::env::var("LEAFCUTTER_API_KEY").unwrap_or_default();
     if key.is_empty() {
+        // No API key configured — auth disabled (default, loopback-only safe).
         return next.run(req).await;
     }
     match req.headers().get("X-API-Key") {
@@ -295,9 +305,11 @@ pub async fn chat_completions_handler(
 }
 
 pub fn create_app(engine: SharedEngine) -> Router {
-    let key = std::env::var("LEAFCUTTER_API_KEY").unwrap_or_else(|_| DEFAULT_API_KEY.to_string());
+    let key = std::env::var("LEAFCUTTER_API_KEY").unwrap_or_default();
     if !key.is_empty() {
         println!("🔐 Auth enabled — send X-API-Key header on all requests");
+    } else {
+        println!("🔓 Auth disabled (LEAFCUTTER_API_KEY not set) — server is open");
     }
     Router::new()
         .route("/health", get(health_handler))
@@ -307,11 +319,20 @@ pub fn create_app(engine: SharedEngine) -> Router {
         .layer(middleware::from_fn(auth_middleware))
 }
 
-pub async fn run_server(engine: SharedEngine, port: u16) {
+pub async fn run_server(engine: SharedEngine, port: u16, host: &str) {
     let app = create_app(engine);
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("{}:{}", host, port);
     println!("🚀 Leafcutter server listening on http://{}", addr);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("❌ Failed to bind to {}: {}", addr, e);
+            std::process::exit(1);
+        }
+    };
+    if let Err(e) = axum::serve(listener, app).await {
+        eprintln!("❌ Server error: {}", e);
+        std::process::exit(1);
+    }
 }
