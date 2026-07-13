@@ -250,11 +250,22 @@ impl Tensor {
         let n = other.shape[1];
         assert_eq!(k, other.shape[0]);
 
+        let profile = std::env::var("LEAFCUTTER_PROFILE").is_ok();
+        let t0 = if profile { Some(std::time::Instant::now()) } else { None };
+
         // Fast path: if other has quantized weights, use native GEMM.
         // Quantized matrices are stored in native GGUF layout [n, k];
         // we compute C = A @ B^T using transposed-B kernels.
         if let Some(ref q) = other.q_data {
             let mut result = vec![0.0f32; m * n];
+            let qtype = match q {
+                QuantizedData::Q8_0(_) => "Q8_0",
+                QuantizedData::Q4_0(_) => "Q4_0",
+                QuantizedData::Q4_K(_) => "Q4_K",
+                QuantizedData::IQ4_NL(_) => "IQ4_NL",
+                QuantizedData::Q5_K(_) => "Q5_K",
+                QuantizedData::Q6_K(_) => "Q6_K",
+            };
             match q {
                 QuantizedData::Q8_0(q8) => {
                     assert_eq!(q8.cols, k, "Q8_0 cols mismatch");
@@ -287,10 +298,20 @@ impl Tensor {
                     crate::kernels::q6_k_gemm::q6_k_matmul_transposed_b(&self.data, q6, &mut result, m, k, n);
                 }
             }
+            if let Some(t0) = t0 {
+                let elapsed = t0.elapsed();
+                eprintln!("[PROFILE] matmul {:>6}  m={:>4} k={:>4} n={:>6}  {:>8.2}ms",
+                    qtype, m, k, n, elapsed.as_secs_f32() * 1000.0);
+            }
             return Self::from_vec_with_backend(result, vec![m, n], self.backend);
         }
 
         let result = self.backend.matmul(&self.data, &other.data, m, k, n);
+        if let Some(t0) = t0 {
+            let elapsed = t0.elapsed();
+            eprintln!("[PROFILE] matmul {:>6}  m={:>4} k={:>4} n={:>6}  {:>8.2}ms",
+                "f32", m, k, n, elapsed.as_secs_f32() * 1000.0);
+        }
         Self::from_vec_with_backend(result, vec![m, n], self.backend)
     }
 
