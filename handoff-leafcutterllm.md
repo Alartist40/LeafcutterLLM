@@ -44,6 +44,13 @@ The ultimate vision is to surpass airllm in speed and capability, leveraging Rus
 
 ### What's In Progress
 
+- **CPU thread pool throttling (DONE 2026-07-13)** — Rayon's default pool
+  (16 vCPUs on Ryzen 5800HS) caused 1586% peak CPU during inference. Added
+  `init::configure_thread_pool()` that auto-caps to `physical_cores - 1`
+  (7). Peak CPU halved to 706% with zero throughput cost and byte-identical
+  model output. Override via `RAYON_NUM_THREADS` or `LEAFCUTTER_THREADS` env
+  vars. Full study in `docs/CPU_THROTTLING_STRATEGY.md`. Verified: Ornith
+  E2E 5/5 green, 137 unit tests pass.
 - **Engine::forward Result propagation (DONE 2026-07-10)** — Resolved `TODO(audit-2026-07)`.
   `forward_native` propagates `Result<Tensor, String>` end-to-end. All 4
   `.expect("Missing pre/post-norm")` panics → `.ok_or_else()?`. `ffn_forward`

@@ -6,6 +6,8 @@ pub mod backend;
 pub mod bridge;
 pub mod cache;
 
+pub mod init;
+
 pub mod inference;
 pub mod kernels;
 

@@ -203,6 +203,19 @@ impl GgufBpeTokenizer {
 }
 
 fn main() {
+    // Cap rayon thread pool early. Accepts:
+    //   - RAYON_NUM_THREADS env var (rayon's standard hook)
+    //   - LEAFCUTTER_THREADS env var (programmatic override)
+    //   - default = available_parallelism() - 1
+    // Idempotent — second call inside rayon returns Err which we ignore.
+    if let Ok(s) = std::env::var("LEAFCUTTER_THREADS") {
+        if let Ok(n) = s.parse::<usize>() {
+            let _ = leafcutter::init::configure_thread_pool(Some(n));
+        }
+    } else {
+        let _ = leafcutter::init::configure_thread_pool(None);
+    }
+
     let args = Args::parse();
 
     println!("🌿 Leafcutter Generation Test");

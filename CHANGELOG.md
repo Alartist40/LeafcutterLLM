@@ -5,6 +5,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-07-13 (CPU thread pool throttling)
+
+Empirical study and code-level fix for the CPU over-subscription problem
+(rayon's default pool = all 16 vCPUs → 1586% peak CPU, fan noise, thermal
+throttle). Added `init::configure_thread_pool` module that auto-caps to
+`physical_cores - 1` (7 on the test Ryzen 5800HS). Peak CPU halved
+(1586→706%) with zero throughput cost and byte-identical model output.
+
+See `docs/CPU_THROTTLING_STRATEGY.md` for the full empirical study with
+thread-count sweep table (T2–T16) and reproducer scripts.
+
+### CPU throttling
+
+- **`init.rs`** (NEW): `configure_thread_pool(Option<usize>)`,
+  `default_thread_count()`, `effective_thread_count()`. Auto-detects
+  physical cores from `/proc/cpuinfo`; falls back to
+  `available_parallelism/2` on non-Linux. Override priority:
+  `RAYON_NUM_THREADS` > `LEAFCUTTER_THREADS` > auto-detect.
+- **`bin/test_generation.rs`**: calls `configure_thread_pool` at
+  startup.
+- **`scripts/bench_run.sh`** (NEW): reusable benchmark harness with
+  `/proc/PID/stat`-based CPU% sampling.
+
 ## [Unreleased] — 2026-07-09 (Pre-release audit hardening)
 
 Routed the 20 audit findings (3 critical, 7 high, 5 medium, 5 low/info) from
