@@ -5,6 +5,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-07-14 (Profiling instrumentation + fused-kernel experiment)
+
+Added profiling instrumentation to `Tensor::matmul` (env-gated by
+`LEAFCUTTER_PROFILE=1`). Emits per-call quant type, m, k, n, ms.
+
+Empirical study on Ornith 1.0 9B Q6_K (5-token test):
+  ~992 matmul calls, ~9.2 s of kernel time
+  Mix: 864 Q4_K, 128 Q6_K
+  Hot Q6_K shapes: m=26×4096×12288, m=26×12288×4096, m=26×4096×8192
+
+Tried gating a fused-dequant Q6_K kernel via `LEAFCUTTER_FUSED_Q6K=1`:
+  - Correctness proven against q6_k_matmul_transposed_b (unit test passes).
+  - On real model: kernel time 9.2s → 22.3s (regression).
+  - Reverted. Kernel remains in q6_k_fused.rs for reference, not wired
+    into production. Lessons recorded for future maintainers.
+
 ## [Unreleased] — 2026-07-13 (CPU thread pool throttling)
 
 Empirical study and code-level fix for the CPU over-subscription problem
