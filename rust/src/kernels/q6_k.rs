@@ -43,6 +43,13 @@ impl Block {
     /// Dequantize this block to a 256-element f32 output slice.
     pub fn dequantize(&self, out: &mut [f32]) {
         assert_eq!(out.len(), Self::K);
+        self.dequantize_scalar(out);
+    }
+
+    /// Scalar reference dequantize — kept as fallback and ground truth.
+    #[inline]
+    pub fn dequantize_scalar(&self, out: &mut [f32]) {
+        assert_eq!(out.len(), Self::K);
         let mut ql_off = 0;
         let mut qh_off = 0;
         let mut sc_off = 0;
@@ -60,7 +67,7 @@ impl Block {
                 let q4 = ((self.ql[ql_off + l + 32] >> 4) as i8
                     | (((self.qh[qh_off + l] >> 6) & 3) as i8) << 4) - 32;
 
-                out[idx + l + 0]  = self.d * self.scales[sc_off + is + 0] as i8 as f32 * q1 as f32;
+                out[idx + l + 0] = self.d * self.scales[sc_off + is + 0] as i8 as f32 * q1 as f32;
                 out[idx + l + 32] = self.d * self.scales[sc_off + is + 2] as i8 as f32 * q2 as f32;
                 out[idx + l + 64] = self.d * self.scales[sc_off + is + 4] as i8 as f32 * q3 as f32;
                 out[idx + l + 96] = self.d * self.scales[sc_off + is + 6] as i8 as f32 * q4 as f32;

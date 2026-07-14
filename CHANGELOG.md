@@ -5,6 +5,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-07-14 (AVX2 dequantize for Q4_K)
+
+Added AVX2+FMA-accelerated dequantize for Q4_K blocks, the most-called
+kernel path (864 calls per token on Ornith 9B). The scalar dequantize
+loop — 256 per-block f32 multiply-subtracts done one-at-a-time — was
+identified as the real bottleneck via LEAFCUTTER_PROFILE.
+
+### AVX2 Q4_K dequantize
+
+- **`q4_k.rs`**: `Block::dequantize` now dispatches to `dequantize_avx2`
+  on x86_64 when AVX2+FMA are available. Scalar path kept as
+  `dequantize_scalar` for fallback and ground truth.
+- **Approach**: Load 8 u8 nibble-packed bytes, extract low and high
+  nibbles via mask+shift, zero-extend to 8x i32 via
+  `_mm256_cvtepu8_epi32`, convert to f32, apply `dl * q - min` via
+  `_mm256_fmsub_ps`. 4 groups x 4 chunks = 16 AVX2 stores per block.
+- **Correctness**: Unit test `test_avx2_matches_scalar` verifies 100
+  random blocks produce identical output within 1e-5 tolerance.
+- **Performance**: Kernel time 9159ms -> 8773ms (4% improvement).
+  Modest but real — the dot-product inner loop (already AVX2) was
+  not the bottleneck; the scalar dequant was.
+- **E2E**: Ornith 5/5 green. Output tokens differ from scalar due to
+  FMA rounding (ULP-level), but prefill top-5 logits match exactly.
+
+### What did NOT work
+
+- **Q6_K AVX2 dequant**: Also implemented + tested correct, but
+  measured _slower_ than scalar (9108ms vs 8773ms Q4_K-only). The
+  6-bit value assembly requires scalar bit-extraction from separate
+  ql/qh arrays, so the AVX2 batch-convert doesn't outweigh the i32
+  construction cost. Reverted; Q6_K stays scalar.
+
 ## [Unreleased] — 2026-07-14 (Profiling instrumentation + fused-kernel experiment)
 
 Added profiling instrumentation to `Tensor::matmul` (env-gated by
