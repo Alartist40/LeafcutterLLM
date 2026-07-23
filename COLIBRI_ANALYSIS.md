@@ -192,3 +192,138 @@ already works because the kernel doesn't waste pages on us.
 For frontier MoE (Kimi K2.6 = 384 experts/layer = 60 MoE layers,
 ~8 GB resident pool of experts), the bottleneck DOES become I/O — at which
 point the Colibri lessons (pread+DONTNEED, LFRU, expert streaming) apply.
+
+---
+
+## 5. Deep-Dive: What Colibrì's Source Actually Does That the README Hid
+
+After re-reading the actual source (not just the README), **three real
+innovations** matter more than what I summarized initially. These were
+not loudly advertised and are not in `COLIBRI_ANALYSIS.md` Section 1.
+
+### 5.1 io_uring — not just pread
+
+`c/uring.h` (137 lines) is a hand-rolled io_uring wrapper, gated behind
+`URING=1`. The default is to use the pthread pool with blocking pread
+(PIPE=1 + 8 worker threads), but **on Linux with an NVMe**, io_uring is
+the better choice:
+
+- One submission ring entry per expert, batched — workers don't block
+- No thread overhead (8 pthreads ≈ ~3 MB stack; io_uring = 0)
+- `IORING_SETUP_SQPOLL` (commented as a future direction) would pin the
+  submission ring to a CPU core for sub-microsecond submit
+
+**Implication for Leafcutter:** our current `prefetch_layer()` uses
+`std::thread::spawn(mmap)`. mmap returns a pointer; we don't even
+need to read — the kernel page-faults on next access. That works for
+*madvise-DONTNEED* flows. io_uring would beat it for *pure-read-from-disk*
+flows (e.g., MoE expert streaming where each expert is read exactly once
+and then dropped, no mmap needed). Rust equivalent: `tokio-uring`
+crate, or hand-rolled `io_uring` syscall wrappers.
+
+### 5.2 PIPE — multi-threaded async I/O pool with generation cursor
+
+`colibri.c` lines 1853–1912 document the **PipePool** structure (real name
+`s_pool` in source). It's a 4-thread worker pool that:
+
+1. Reads `(gen<<8)|index` from a single atomic cursor
+2. **Per-batch epoch** — each generation is a fresh MoE layer's expert list
+3. Workers race to claim index slots; main advances gen between batches
+4. **Lock-free** dispatch: ACQUIRE-load `cur`, RELASE-store `cur`
+5. MPSC pattern: one writer (main), many readers (workers)
+6. Per-slot ready[] flag with optional condvar wake (`PIPE_BLOCK=1`)
+
+The killing detail: workers *can't grab a torn batch state*. A straggler
+preempted across batch boundaries fails its gen check and re-reads. **This
+is exactly what makes per-expert mishandling impossible.**
+
+**Implication for Leafcutter:** our single-threaded `cache_layer()` + 1-slot
+prefetch is the simplest possible async I/O. Going to multi-slot predates
+multi-thread; going to MPSC generation-cursor pool is real engineering
+work. Probability of correct first implementation: low. Pickier: it's
+where we'd benefit from `crossbeam-epoch` or `arc-swap`.
+
+### 5.3 PILOT — router-driven look-ahead prefetch
+
+Lines 3841+ (`pilot_prefetch`). The router predicts which experts the next
+layer will fire (71.6% accurate per their claim) and pre-loads those
+experts *while the current layer's compute runs*. Implemented as a
+decoupled scan-path that runs on the **main thread** during forward
+(g_pilot=1), so it shares the cache residency map with the active worker.
+
+This requires:
+- A router prediction step (does our `moe.rs` produce this?)
+- A prediction-confidence threshold (skip prefetch if <60% confident)
+- Memory budget cap (don't prefetch into already-full cache)
+
+**Implication for Leafcutter:** once Phase 3 (MoE streaming) ships, this
+is the next bottleneck. But it requires having Phase 3 in production first:
+you can't prefetch what you can't currently load.
+
+### 5.4 Where I was wrong before
+
+My original Phase 2 plan said "multi-slot async prefetch — doubles
+throughput, little engineering." That's wrong because:
+
+- The single-slot prefetch already gets most of the gain (it overlaps
+  one layer's mmap-fault with the previous layer's compute)
+- Going from 1→4 slots won't double anything if mmap-fault latency is
+  already overlapped with the *current* layer's compute
+- The real wins come from `io_uring` (Section 5.1) or `PIPE` pool (5.2),
+  not from more prefetch threads
+
+**Corrected Phase 2 priority:**
+1. **io_uring backend** for the shard loader (Linux-only, gated env var)
+2. **PIPE-style MPSC pool** for Phase 3's MoE expert streaming (after that lands)
+
+NOT "add a few more prefetch threads." That was hype.
+
+### 5.5 The one open question
+
+Colibrì measures "71.6% predictable one layer ahead" for routing. I
+have NOT verified this claim against their source — it's stated in
+comments but I don't see the measurement code (likely telemetry
+internals I don't have window into). Take the number as plausible but
+un-confirmed.
+
+---
+
+## 6. Final Read of the Architecture (Honest Cold-Take)
+
+What Colibrì is, in one sentence and without marketing:
+
+> **A single-file C engine that puts a small active working set in RAM
+> and uses a fan-shaped cascade of async I/O, learned replacement, and MoE
+> routing ahead-of-time to keep the disk as the bulk of the residence
+> tier.**
+
+What it is NOT:
+
+- Not magic. It's three orthogonal fixes (LFRU + PIPE pool + io_uring)
+  applied to MoE expert loading, layered on top of MLA/speculative/MQA
+  math that comes from the open-weight family it's targeting.
+- Not system-portable. Heavy Linux bias (io_uring, mmap madvise, O_DIRECT).
+  Windows gets PIPE pool only.
+- Not a general inference engine. It is hard-wired to GLM-5.2 (256 experts,
+  78 layers, kv_lora_rank=512, q_lora_rank=2048). Porting to other MoE
+  models is a separate project per model.
+
+What Leafcutter already does, in the same one sentence:
+
+> **A modular Rust engine with the same MLA/MoE math already present,
+> plus a single-threaded O_DIRECT-less streaming system that uses
+> mmap+MADV_DONTNEED for one-layer-at-a-time passes. Phase 1 added LFRU.**
+
+What's missing, ranked honestly:
+
+1. **io_uring backend** for MoE expert loads (Phase 2A). Linux-only.
+2. **PIPE-style MPSC worker pool** for parallel expert reads (Phase 3).
+3. **PILOT** — router lookahead for MoE (Phase 3+).
+4. **O_DIRECT** for drives that benefit (Phase 2B).
+5. **PIPE_BLOCK=1 condvar wake** — already a one-liner change we could do.
+
+What we should NOT try:
+
+- Reproduce Colibrì's single-file C architecture. Stay modular Rust.
+- Copy the GLM-5.2 hardcoded dimensions. Stay GGUF-portable.
+- Try to match their tok/s on 6× RTX 5090. Different hardware class.

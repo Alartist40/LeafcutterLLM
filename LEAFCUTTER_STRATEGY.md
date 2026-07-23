@@ -238,7 +238,13 @@ The prior `LEAFCUTTER_STRATEGY.md` (now superseded) claimed:
 
 - **Phase 1 (NOW):** LFRU cache replacement for FIFO in `shard/loader.rs`.
   Port Colibri's tier.h LFRU. Bench. Don't ship if hit-rate improvement <10%.
-- **Phase 2 (2–4 weeks):** Multi-slot async prefetch worker. Begin G2 push.
+- **Phase 2 (2–4 weeks):** Linux io_uring backend for the shard loader
+  (gated by `LEAFCUTTER_IO=uring`; falls back to mmap+MADV_DONTNEED on
+  non-Linux or when `io_uring` syscall fails). NOT "more prefetch
+  threads" — that had been falsely framed as "2× with little engineering."
+  See COLIBRI_ANALYSIS.md §5.
+- **Phase 2B (parallelizable, 1 week):** O_DIRECT for drives that
+  benefit (gated `LEAFCUTTER_IO_DIRECT=1`); bench per-disk before/after.
 - **Phase 3 (4–8 weeks):** MoE expert streaming for Kimi K2.6 / GLM-5.2.
   Top-k-of-N expert pager with per-layer LRU.
 - **Phase 4 (G4, parallel):** MLA KV persist with hash-keyed cache files.
@@ -271,8 +277,12 @@ MoE expert streaming (Phase 3). Why:
   patterns; less risky than the AVX2 dequant work because the I/O
   subsystem is clearly correct already.
 
-Second priority right behind it: **multi-slot async prefetch in
-`shard/loader.rs`**. Doubles throughput with little engineering.
+Second priority right behind it: **io_uring backend for the shard
+loader** (see COLIBRI_ANALYSIS.md §5.1). Linux-only, gated behind
+`LEAFCUTTER_IO=uring`. The "Doubles throughput with little engineering"
+claim that previously lived here was wrong: a single-slot prefetch
+already overlaps most of the mmap-fault latency, so adding more
+slots doesn't 2× anything.
 
 Everything else (LFRU, KV persistence, MTP) is incremental
 polish, not new capability.
