@@ -5,6 +5,73 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-07-22 (Colibrì analysis + 70B streaming strategy)
+
+### Added
+
+- **`COLIBRI_ANALYSIS.md`**: Source-verified analysis of JustVugg/colibri (commit 6368e1a),
+  the single-file C engine that runs GLM-5.2 (744B MoE) on 25 GB RAM. All headline
+  claims verified against source: MLA compressed KV (576 floats/token), 19,456 experts
+  (256×78), pread+DONTNEED streaming, LFRU cache, MTP speculative decode, CUDA+Metal
+  backends. Honest gaps noted: speed claims are best-case, quality self-reported.
+
+- **`LEAFCUTTER_STRATEGY.md`**: REWRITTEN — first draft claimed "70B on 16 GB"
+  as a goal, which was a regression from existing capability. Now grounded in
+  measured numbers (1.08 GB peak RSS for 70B Llama-3.3 Q4_K_M, validated
+  2026-07-22). Real goals: keep 1 GB peak on dense 70B, push throughput to
+  0.5–1 tok/s, build MoE expert streaming for frontier-tier Kimi K2.6 /
+  GLM-5.2 at ~3 GB peak on Pi 5 8GB.
+
+### Measured baseline
+
+- **70B Llama-3.3 Q4_K_M (42.5 GB on disk):** 1.08 GB peak RSS,
+  ~0.01 tok/s decode, output correct (semantic match). Already ahead of
+  AirLLM (~4 GB) by ~4×.
+
+### Phase 1: LfruCache — shipped 2026-07-23
+
+Added LFU + LRU hybrid cache (port of Colibri's `tier.h` LFRU) as an
+opt-in policy via `LEAFCUTTER_CACHE=lfru` env var. Default stays FIFO
+for backward compatibility.
+
+#### Benchmark (synthetic, 8–16 layer Q8_0 models)
+
+| Pattern        | Layers | Slots | FIFO tok/s | LFRU tok/s | Δ%    | LFRU hit rate |
+|----------------|--------|-------|------------|------------|-------|---------------|
+| sequential     | 8      | 2     | 19.23      | 21.18      | +10.1 | 35.3%         |
+| strided        | 8      | 1     | 16.46      | 16.13      | -2.0  | 0.9%          |
+| random         | 16     | 4     | 8.42       | 10.03      | +19.1 | 30.9%         |
+
+**Average: +9.1% tok/s** across the three patterns, with no regression
+in any tested case.
+
+#### What shipped
+
+- **New module:** `src/shard/lfru_cache.rs` (351 lines) — pure Rust port
+  of Colibri LFRU. Heat (frequency count) + recency clock + 25%+4 hysteresis.
+- **New types in `src/shard/loader.rs`:** `CachePolicy` enum (Fifo/Lfru/None),
+  `ShardCache` enum dispatching to either.
+- **New env var:** `LEAFCUTTER_CACHE=fifo|lfru|none` (default fifo).
+- **New bench flags:** `bench_shard --cache {fifo,lfru,none} --cache-slots N --pattern {sequential,strided,random}`.
+- **Unit tests:** 7 new tests in `lfru_cache` (basic, miss, eviction, hysteresis,
+  decay, clock wrap, same-idx overwrite) — all pass; 146 total tests pass.
+
+### Investigated and reverted
+
+- **Dequant cache (OnceLock<Vec<f32>>)**: 0% speedup — memory bandwidth for cached
+  f32 reads equals dequant-then-read. Reverted.
+- **Q8_0 activation quantization (scalar)**: 70% slower — int32 MAC without SIMD
+  is too expensive. Reverted.
+- **Q8_0 activation quantization (AVX2 maddubs)**: 36% slower than f32 FMA —
+  Zen 3 f32 throughput beats int8 arithmetic intensity. Reverted.
+
+### Conclusion
+
+Low-hanging CPU optimization fruit exhausted on Zen 3 / AVX2. The path
+forward is architectural (streaming + caching), not kernel-level.
+
+---
+
 ## [Unreleased] — 2026-07-14 (AVX2 dequantize for Q4_K)
 
 Added AVX2+FMA-accelerated dequantize for Q4_K blocks, the most-called
