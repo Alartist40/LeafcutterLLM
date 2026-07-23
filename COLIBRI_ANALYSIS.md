@@ -286,6 +286,28 @@ comments but I don't see the measurement code (likely telemetry
 internals I don't have window into). Take the number as plausible but
 un-confirmed.
 
+### 5.6 Phase 2A finding (2026-07-23)
+
+Pre-flight measurement of mmap-fault vs pread on 5800HS / NVMe
+contradicts the "io_uring is faster" premise (see `rust/src/bin/
+bench_measure_io.rs`, gitignored). The current mmap+MADV_DONTNEED
+flow is already 1.8× faster per layer than pread-dontneed on this
+hardware, because the kernel page cache shortcircuits the disk read
+and we work in a ≤1 GB working set.
+
+The 70B decode at 92 s/tok has I/O as <0.06% of wall time. Even if
+io_uring shaved that to 0%, decode rate would not visibly change.
+Conclusion: **skip Phase 2A.** io_uring would be engineering theater
+on this hardware profile.
+
+Colibri benefits from io_uring because they target a 25 GB RAM floor
+on a 372 GB model — every forward pass reads cold from disk, so
+submitting 8 reads ahead of compute wins ~30% wall time. Our
+hardware profile (16 GB RAM, kernel page cache easily fits working
+set) makes the same optimization **noise**. Don't do it.
+
+Real bottleneck on 70B is dequant + AVX2 matmul, not I/O.
+
 ---
 
 ## 6. Final Read of the Architecture (Honest Cold-Take)

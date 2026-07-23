@@ -238,11 +238,14 @@ The prior `LEAFCUTTER_STRATEGY.md` (now superseded) claimed:
 
 - **Phase 1 (NOW):** LFRU cache replacement for FIFO in `shard/loader.rs`.
   Port Colibri's tier.h LFRU. Bench. Don't ship if hit-rate improvement <10%.
-- **Phase 2 (2–4 weeks):** Linux io_uring backend for the shard loader
-  (gated by `LEAFCUTTER_IO=uring`; falls back to mmap+MADV_DONTNEED on
-  non-Linux or when `io_uring` syscall fails). NOT "more prefetch
-  threads" — that had been falsely framed as "2× with little engineering."
-  See COLIBRI_ANALYSIS.md §5.
+- **Phase 2A (skip, pre-flight failed 2026-07-23):** io_uring backend
+  was the original Phase 2. Pre-flight measurement contradicts the
+  premise. On 5800HS / NVMe / 16 GB hardware, mmap+MADV_DONTNEED is
+  **1.8× faster per layer** than pread-dontneed. The OS page cache
+  shortcircuits the disk read; our I/O fraction of 70B decode time
+  is <0.06%. Colibri's io_uring wins on 25 GB RAM with 372 GB models
+  where every read is cold from disk; our profile is different. Skip.
+  See "Phase 2A finding" in COLIBRI_ANALYSIS.md §5.
 - **Phase 2B (parallelizable, 1 week):** O_DIRECT for drives that
   benefit (gated `LEAFCUTTER_IO_DIRECT=1`); bench per-disk before/after.
 - **Phase 3 (4–8 weeks):** MoE expert streaming for Kimi K2.6 / GLM-5.2.
