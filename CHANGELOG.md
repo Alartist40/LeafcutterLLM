@@ -5,7 +5,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [Unreleased] — 2026-07-22 (Colibrì analysis + 70B streaming strategy)
+## [Unreleased] — 2026-07-23 (CPU% pegging fix: SIMD dot in LM head)
+
+### Fixed
+
+- **LM head dot product now uses AVX2 SIMD** (`rust/src/inference/engine.rs`).
+  Was: `hidden_last.iter().zip(buf.iter()).map(|(a,b)| a*b).sum::<f32>()` —
+  scalar per-element mul+add over `hidden_size` floats per vocab row.
+  Now: `crate::kernels::simd::simd_dot_product(hidden_last, &buf[..])` —
+  AVX2 FMA, 16 floats per iteration. Reduces lm_head CPU throughput cost by
+  ~1.72× on 9B model (395 ms → 229 ms per call). Wall time 10% faster on 9B
+  (4.085 s → 3.716 s for 3 tokens, 4-thread ornith-1.0-9b-Q4_K_M).
+
+  This is **part 1 of 2** for the "300% CPU pegs" problem. The remaining
+  bottleneck is `load_layer()` dequanting every weight tensor from Q4_K into
+  `Vec<Block>` every forward pass (~50% of wall on 9B). Phase 2 fix:
+  keep zero-copy raw Q4_K bytes from mmap, parse into `Block` only inside
+  the matmul kernel.
+
+### Added
+
+- **`scripts/profile_70b_cpu.sh`** — single-shot profile of 70B decode pass,
+  useful for diagnosing CPU% pegging, prints lm_head/load_layer/matmul
+  breakdown to stderr.
+
+- **LEAFCUTTER_THREADS env var** is now documented in README as the
+  throttle for CPU% during heavy matmul passes. No code change; thread
+  selection is at `rust/src/init.rs:80`.
 
 ### Added
 

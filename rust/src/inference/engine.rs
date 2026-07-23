@@ -617,10 +617,17 @@ impl Engine {
         }
         for layer_idx in 0..self.config.num_hidden_layers {
             // Load current layer (dequantizes on demand, drops after use)
+            let _lt0 = if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+                Some(std::time::Instant::now())
+            } else { None };
             let mut layer_weights = self
                 .model
                 .load_layer(layer_idx)
                 .map_err(|e| format!("layer {} load: {}", layer_idx, e))?;
+            if let Some(lt0) = _lt0 {
+                eprintln!("[PROFILE] load_layer {}: {:.3} ms",
+                    layer_idx, lt0.elapsed().as_secs_f64() * 1000.0);
+            }
 
             // ── Gemma 3/4 fast path ── every layer is 4 RMSNorms + attention +
             // GeGLU + per-layer residual scale.  Skip all per-layer type routing.
@@ -909,6 +916,8 @@ impl Engine {
     /// corresponds to one vocab token's weights.  We compute dot(hidden, row_j)
     /// for each token j — same pattern as tied embeddings.
     fn lm_head_separate_forward(&self, hidden: &Tensor, seq_len: usize) -> Vec<f32> {
+        let profile = std::env::var("LEAFCUTTER_PROFILE").is_ok();
+        let _t0 = if profile { Some(std::time::Instant::now()) } else { None };
         let hidden_size = self.config.hidden_size;
         let vocab_size = self.config.vocab_size;
         let hidden_last = &hidden.data[(seq_len - 1) * hidden_size..seq_len * hidden_size];
@@ -917,7 +926,7 @@ impl Engine {
         } else {
             1.0
         };
-        if inv != 1.0 {
+        let logits = if inv != 1.0 {
             let mut scaled = hidden_last.to_vec();
             for v in scaled.iter_mut() {
                 *v *= inv;
@@ -925,7 +934,12 @@ impl Engine {
             self.lm_head_projection(&scaled, "output.weight", hidden_size, vocab_size)
         } else {
             self.lm_head_projection(hidden_last, "output.weight", hidden_size, vocab_size)
+        };
+        if let Some(t0) = _t0 {
+            eprintln!("[PROFILE] lm_head_separate_forward: {:.3} ms (vocab={})",
+                t0.elapsed().as_secs_f64() * 1000.0, vocab_size);
         }
+        logits
     }
 
     /// Generic lm_head projection: dot(hidden_last, embed_row) for each token.
@@ -959,7 +973,7 @@ impl Engine {
                     // the entire generation.
                     0.0
                 } else {
-                    hidden_last.iter().zip(buf.iter()).map(|(a, b)| a * b).sum::<f32>()
+                    crate::kernels::simd::simd_dot_product(hidden_last, &buf[..hidden_size])
                 }
             })
         }).collect()

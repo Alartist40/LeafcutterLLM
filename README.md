@@ -644,6 +644,36 @@ cd rust && cargo build --release --bin leafcutter
 3. CPU is throttling due to heat — ensure proper cooling on Pi
 4. RAM is insufficient — use a smaller model (TinyLlama instead of LLaMA-7B)
 
+### CPU% pegs at 300% during generation
+
+**This is normal.** Leafcutter uses rayon for parallelism, so on a 4-core CPU
+it'll saturate 4 cores during the heavy matmul and load_layer passes. The
+work is real — it's all on the decode critical path, not a busy-loop.
+
+**If the system feels unresponsive**, cap rayon thread count:
+```bash
+LEAFCUTTER_THREADS=2 ./target/release/test_generation ...
+```
+The default is one thread per physical core (`rust/src/init.rs:80`). Lower
+values free up the system for interactive use at the cost of slower tokens/sec.
+
+**To see exactly where the time goes**, run with profiling:
+```bash
+LEAFCUTTER_PROFILE=1 ./target/release/test_generation --model X.gguf \
+  --prompt "hi" --tokens 3 --temperature 0.7 --raw
+```
+Outputs per-call timings for `[PROFILE] lm_head_separate_forward`, `[PROFILE] matmul`,
+and `[PROFILE] load_layer` to stderr. Use this to identify which layer type is
+the bottleneck for your model.
+
+As of 2026-07-23, the typical decode breakdown on a 9B Q4_K_M model is:
+- `lm_head_separate_forward`: ~20% of wall (after SIMD fix)
+- `load_layer` (Q4_K → f32 dequant per forward pass): ~50% of wall
+- per-layer matmuls (Q4_K, Q6_K): ~30% of wall
+
+The `load_layer` cost is the next target for optimization (Phase 2 — zero-copy
+raw Q4_K bytes instead of a freshly-parsed `Vec<Block>` per pass).
+
 ### Container build times out during apt-get
 
 **Solution:**
