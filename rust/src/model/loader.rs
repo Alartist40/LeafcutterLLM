@@ -361,49 +361,75 @@ impl GGUFModel {
             let (mut tensor, needs_transpose) = match qtype {
                 QuantType::Q8_0 => {
                     let q8 = crate::kernels::q8_0::Matrix {
-                        rows: shape_data[0], cols: shape_data[1],
+                        rows: shape_data[0],
+                        cols: shape_data[1],
                         blocks: crate::kernels::q8_0::blocks_from_bytes(raw),
                     };
                     (Tensor::from_q8_0_only(q8, shape_gguf.clone()), false)
                 }
                 QuantType::Q4_0 => {
                     let q4 = crate::kernels::q4_0::Matrix {
-                        rows: shape_data[0], cols: shape_data[1],
+                        rows: shape_data[0],
+                        cols: shape_data[1],
                         blocks: crate::kernels::q4_0::blocks_from_bytes(raw),
                     };
                     (Tensor::from_q4_0_only(q4, shape_gguf.clone()), false)
                 }
                 QuantType::Q4_K => {
-                    let q4 = crate::kernels::q4_k::Matrix {
-                        rows: shape_data[0], cols: shape_data[1],
+                    let raw_bytes = raw.len();
+                    let mat = crate::kernels::q4_k::Matrix {
+                        rows: shape_data[0],
+                        cols: shape_data[1],
                         blocks: crate::kernels::q4_k::blocks_from_bytes(raw),
                     };
-                    (Tensor::from_q4_k_only(q4, shape_gguf.clone()), false)
+                    if std::env::var("LEAFCUTTER_PROFILE_BLOCKS").is_ok() {
+                        eprintln!(
+                            "[BLOCKS] Q4_K {}: rows={} cols={} blocks={} raw={}MB",
+                            gguf_name,
+                            shape_data[0],
+                            shape_data[1],
+                            mat.blocks.len(),
+                            raw_bytes / 1024 / 1024
+                        );
+                    }
+                    (Tensor::from_q4_k_only(mat, shape_gguf.clone()), false)
                 }
                 QuantType::IQ4_NL => {
                     let q4 = crate::kernels::iq4_nl::Matrix {
-                        rows: shape_data[0], cols: shape_data[1],
+                        rows: shape_data[0],
+                        cols: shape_data[1],
                         blocks: crate::kernels::iq4_nl::blocks_from_bytes(raw),
                     };
                     (Tensor::from_iq4_nl_only(q4, shape_gguf.clone()), false)
                 }
                 QuantType::Q5_K => {
                     let q5 = crate::kernels::q5_k::Matrix {
-                        rows: shape_data[0], cols: shape_data[1],
+                        rows: shape_data[0],
+                        cols: shape_data[1],
                         blocks: crate::kernels::q5_k::blocks_from_bytes(raw),
                     };
                     (Tensor::from_q5_k_only(q5, shape_gguf.clone()), false)
                 }
                 QuantType::Q6_K => {
-                    let q6 = crate::kernels::q6_k::Matrix {
-                        rows: shape_data[0], cols: shape_data[1],
+                    let mat = crate::kernels::q6_k::Matrix {
+                        rows: shape_data[0],
+                        cols: shape_data[1],
                         blocks: crate::kernels::q6_k::blocks_from_bytes(raw),
                     };
-                    (Tensor::from_q6_k_only(q6, shape_gguf.clone()), false)
+                    if std::env::var("LEAFCUTTER_PROFILE_BLOCKS").is_ok() {
+                        eprintln!(
+                            "[BLOCKS] Q6_K {}: rows={} cols={} blocks={}",
+                            gguf_name,
+                            shape_data[0],
+                            shape_data[1],
+                            mat.blocks.len()
+                        );
+                    }
+                    (Tensor::from_q6_k_only(mat, shape_gguf.clone()), false)
                 }
                 _ => {
-                    // Fallback: dequantize to f32, still needs transpose
-                    (Self::dequantize(raw, info.typ, shape_data.clone())?, true)
+                    let t = Self::dequantize(raw, info.typ, shape_data.clone())?;
+                    (t, true)
                 }
             };
             if is_2d && needs_transpose {
