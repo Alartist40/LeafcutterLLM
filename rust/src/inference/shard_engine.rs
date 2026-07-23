@@ -12,7 +12,7 @@ use crate::model::tensor::Tensor;
 use crate::cache::KVCache;
 use crate::inference::attention::{attention_forward, AttentionParams};
 use crate::inference::sampler::sample_top_p;
-use crate::shard::{Manifest, ShardLoader};
+use crate::shard::{CachePolicy, CacheStats, Manifest, ShardLoader};
 use std::collections::HashMap;
 
 pub struct ShardEngine {
@@ -23,18 +23,49 @@ pub struct ShardEngine {
 }
 
 impl ShardEngine {
-    /// Load a model from a shard manifest.
+    /// Load a model from a shard manifest. Cache is disabled (0 slots).
     pub fn load(manifest_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         Self::load_with_cache(manifest_path, 0)
     }
 
-    /// Load with a layer cache.  `cache_slots` = number of recently-used
-    /// layers to keep in RAM.  Set to `num_layers` to cache everything
-    /// (fastest decode, highest RAM usage).
-    pub fn load_with_cache(manifest_path: &str, cache_slots: usize) -> Result<Self, Box<dyn std::error::Error>> {
+    /// Load with a layer cache of `cache_slots` (FIFO policy by default;
+    /// env var `LEAFCUTTER_CACHE` may override).
+    pub fn load_with_cache(
+        manifest_path: &str,
+        cache_slots: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_with_cache_and_policy_impl(
+            manifest_path,
+            None, // use env / default
+            cache_slots,
+        )
+    }
+
+    /// Load with explicit cache policy + size.
+    pub fn load_with_cache_and_policy(
+        manifest_path: &str,
+        policy: CachePolicy,
+        cache_slots: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::load_with_cache_and_policy_impl(
+            manifest_path,
+            Some(policy),
+            cache_slots,
+        )
+    }
+
+    fn load_with_cache_and_policy_impl(
+        manifest_path: &str,
+        explicit_policy: Option<CachePolicy>,
+        cache_slots: usize,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let manifest = Manifest::load(manifest_path)?;
-        let loader = ShardLoader::from_manifest(manifest.clone())
-            .with_cache_capacity(cache_slots);
+        let mut loader = ShardLoader::from_manifest(manifest.clone());
+        if let Some(p) = explicit_policy {
+            loader = loader.with_cache(p, cache_slots);
+        } else {
+            loader = loader.with_cache_capacity(cache_slots);
+        }
 
         // Load special weights (kept permanently in RAM)
         let special_weights = loader.load_special()?;
@@ -71,6 +102,29 @@ impl ShardEngine {
     /// Report KV cache memory usage in megabytes.
     pub fn kv_cache_memory_mb(&self) -> f64 {
         self.kv_cache.memory_bytes() as f64 / (1024.0 * 1024.0)
+    }
+
+    /// Active cache policy (Fifo / Lfru / None).
+    pub fn policy(&self) -> CachePolicy {
+        self.loader.policy()
+    }
+
+    /// Snapshot of LFRU cache stats. `None` if a non-LFRU policy is active.
+    pub fn cache_stats(&self) -> Option<CacheStats> {
+        // We need the underlying cache for stats; access via loader
+        // (ShardLoader caches ShardCache privately behind Mutex; we
+        // add a stats accessor there if needed).
+        self.loader.lfru_stats()
+    }
+
+    /// Number of currently-resident layers in the cache.
+    pub fn cache_resident(&self) -> usize {
+        self.loader.cache_resident()
+    }
+
+    /// Total cache slot capacity.
+    pub fn cache_capacity(&self) -> usize {
+        self.loader.cache_capacity()
     }
 
     /// Autoregressive generation.

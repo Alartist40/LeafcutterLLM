@@ -3,6 +3,7 @@
 use crate::model::tensor::Tensor;
 use crate::kernels::q8_0::Matrix as Q8Matrix;
 use super::format::{ShardHeader, ShardTensorMeta};
+use super::lfru_cache::{LfruCache, CacheStats};
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -103,6 +104,92 @@ pub struct MmapShard {
     pub tensors: HashMap<String, Tensor>,
 }
 
+/// Cache policy used by `ShardLoader`. Selected at construction time via
+/// the `LEAFCUTTER_CACHE` environment variable:
+///   `LEAFCUTTER_CACHE=fifo` (default): pure insertion-order eviction.
+///   `LEAFCUTTER_CACHE=lfru`: LFU + LRU hybrid with 25%+4 frequency hysteresis.
+///   `LEAFCUTTER_CACHE=none`: disable caching entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePolicy {
+    Fifo,
+    Lfru,
+    None,
+}
+
+impl CachePolicy {
+    pub fn from_env() -> Self {
+        match std::env::var("LEAFCUTTER_CACHE").ok().as_deref() {
+            Some("lfru") | Some("LFRU") => CachePolicy::Lfru,
+            Some("none") | Some("off") => CachePolicy::None,
+            _ => CachePolicy::Fifo,
+        }
+    }
+}
+
+/// Unified cache backing so the loader can switch policy without changing
+/// the call sites. Internally dispatches to FIFO, LFRU, or no-op.
+///
+/// Each variant holds the same `HashMap<String, Tensor>` payload keyed by
+/// a layer `usize` index. Method API mirrors the original `LayerCache`
+/// so no engine module needs to change.
+#[derive(Debug)]
+pub enum ShardCache {
+    Fifo(LayerCache),
+    Lfru(LfruCache),
+    None,
+}
+
+impl ShardCache {
+    fn new(policy: CachePolicy, max_slots: usize) -> Self {
+        match policy {
+            CachePolicy::Fifo => ShardCache::Fifo(LayerCache::new(max_slots)),
+            CachePolicy::Lfru => ShardCache::Lfru(LfruCache::new(max_slots)),
+            CachePolicy::None => ShardCache::None,
+        }
+    }
+
+    pub fn get(&mut self, idx: usize) -> Option<HashMap<String, Tensor>> {
+        match self {
+            ShardCache::Fifo(c) => c.get(idx),
+            ShardCache::Lfru(c) => c.get(idx),
+            ShardCache::None => None,
+        }
+    }
+
+    pub fn put(&mut self, idx: usize, weights: HashMap<String, Tensor>) {
+        match self {
+            ShardCache::Fifo(c) => c.put(idx, weights),
+            ShardCache::Lfru(c) => c.put(idx, weights),
+            ShardCache::None => {}
+        }
+    }
+
+    pub fn clear(&mut self) {
+        match self {
+            ShardCache::Fifo(c) => c.clear(),
+            ShardCache::Lfru(c) => c.clear(),
+            ShardCache::None => {}
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            ShardCache::Fifo(c) => c.len(),
+            ShardCache::Lfru(c) => c.len(),
+            ShardCache::None => 0,
+        }
+    }
+
+    /// Returns a snapshot of LFRU stats if the LFRU policy is active;
+    /// otherwise `None`. Used by the profiling harness.
+    pub fn lfru_stats(&self) -> Option<CacheStats> {
+        match self {
+            ShardCache::Lfru(c) => Some(c.stats()),
+            _ => None,
+        }
+    }
+}
+
 /// Loads model layers from disk shards.  Only one layer is resident
 /// in RAM at any time (plus cached layers and whatever the kernel
 /// keeps in page cache).
@@ -111,18 +198,26 @@ pub struct ShardLoader {
     shard_dir: String,
     /// Optional prefetch handle for the next layer
     prefetch: Arc<Mutex<Option<HashMap<String, Tensor>>>>,
-    /// Layer cache — configurable size
-    cache: Arc<Mutex<LayerCache>>,
+    /// Layer cache — policy chosen at construction
+    cache: Arc<Mutex<ShardCache>>,
+    /// Policy in use (for diagnostics)
+    policy: CachePolicy,
+    /// Slot capacity, kept alongside policy so external callers can
+    /// query capacity without unlocking the cache and draining stats.
+    max_slots: usize,
 }
 
 impl ShardLoader {
     pub fn from_manifest(manifest: Manifest) -> Self {
         let shard_dir = manifest.shard_dir.clone();
+        let policy = CachePolicy::from_env();
         Self {
             manifest,
             shard_dir,
             prefetch: Arc::new(Mutex::new(None)),
-            cache: Arc::new(Mutex::new(LayerCache::new(0))),
+            cache: Arc::new(Mutex::new(ShardCache::new(policy, 0))),
+            policy,
+            max_slots: 0,
         }
     }
 
@@ -130,8 +225,23 @@ impl ShardLoader {
     /// `max_slots = num_layers` caches everything (useful for decode
     /// on systems with enough RAM).
     pub fn with_cache_capacity(mut self, max_slots: usize) -> Self {
-        self.cache = Arc::new(Mutex::new(LayerCache::new(max_slots)));
+        // Re-use the policy already selected by env var
+        self.cache = Arc::new(Mutex::new(ShardCache::new(self.policy, max_slots)));
+        self.max_slots = max_slots;
         self
+    }
+
+    /// Explicitly select a policy and slot count.
+    pub fn with_cache(mut self, policy: CachePolicy, max_slots: usize) -> Self {
+        self.policy = policy;
+        self.cache = Arc::new(Mutex::new(ShardCache::new(policy, max_slots)));
+        self.max_slots = max_slots;
+        self
+    }
+
+    /// Active policy (read-only).
+    pub fn policy(&self) -> CachePolicy {
+        self.policy
     }
 
     /// Load a layer's weights by index, checking cache first.
@@ -142,7 +252,7 @@ impl ShardLoader {
         }
 
         // Check cache first
-        if let Ok(cache) = self.cache.lock() {
+        if let Ok(mut cache) = self.cache.lock() {
             if let Some(weights) = cache.get(idx) {
                 return Ok(weights);
             }
@@ -238,9 +348,24 @@ impl ShardLoader {
         }
     }
 
-    /// Report cache stats.
+    /// Report stats (read-only).
     pub fn cache_stats(&self) -> usize {
         self.cache.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// LFRU hit/miss/evict snapshot. None if LFRU not active.
+    pub fn lfru_stats(&self) -> Option<CacheStats> {
+        self.cache.lock().ok().and_then(|c| c.lfru_stats())
+    }
+
+    /// Number of currently-resident cache entries.
+    pub fn cache_resident(&self) -> usize {
+        self.cache.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Total cache slot capacity.
+    pub fn cache_capacity(&self) -> usize {
+        self.max_slots
     }
 }
 
