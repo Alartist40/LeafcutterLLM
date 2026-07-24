@@ -615,104 +615,159 @@ impl Engine {
                 );
             }
         }
-        for layer_idx in 0..self.config.num_hidden_layers {
-            // Load current layer (dequantizes on demand, drops after use)
-            let _lt0 = if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
-                Some(std::time::Instant::now())
-            } else { None };
-            let mut layer_weights = self
-                .model
-                .load_layer(layer_idx)
-                .map_err(|e| format!("layer {} load: {}", layer_idx, e))?;
-            if let Some(lt0) = _lt0 {
-                eprintln!("[PROFILE] load_layer {}: {:.3} ms",
-                    layer_idx, lt0.elapsed().as_secs_f64() * 1000.0);
-            }
+        // Phase 2: per-layer async prefetch via std::thread::scope.
+        //
+        // load_layer() dequantizes Q4_K/Q6_K weights from mmap; on the 3B
+        // model that's ~12 ms per layer / ~310 ms per pass / ~40% of wall.
+        // We spawn `load_layer(layer_idx+1)` on a worker thread while the
+        // main thread runs layer `layer_idx`'s matmul, so the next layer is
+        // ready when we ask for it.
+        //
+        // Borrow mechanics:
+        //   - `model_ref = &self.model` is a SHARED borrow of `self.model`.
+        //   - In the scope body we still mutably touch `self.kv_cache`, etc.
+        //   - These compile because Rust allows disjoint-field borrows:
+        //     `self.model` and `self.kv_cache` are different fields, so the
+        //     worker can hold `&self.model` while main borrows `&mut
+        //     self.kv_cache` simultaneously.
+        let model_ref = &self.model;
+        let num_layers = self.config.num_hidden_layers;
+        // Phase 2: per-layer async prefetch via std::thread::scope.
+        //
+        // load_layer() dequantizes Q4_K/Q6_K weights from mmap; on the 3B
+        // model that's ~12 ms per layer / ~310 ms per pass / ~40% of wall.
+        // We spawn `load_layer(layer_idx+1)` on a worker thread while the
+        // main thread runs layer `layer_idx`'s matmul, so the next layer is
+        // ready when we ask for it.
+        //
+        // Borrow mechanics:
+        //   - `model_ref = &self.model` is a SHARED borrow of `self.model`.
+        //   - In the scope body we still mutably touch `self.kv_cache`, etc.
+        //   - These compile because Rust allows disjoint-field borrows:
+        //     `self.model` and `self.kv_cache` are different fields, so the
+        //     worker can hold `&self.model` while main borrows `&mut
+        //     self.kv_cache` simultaneously.
+        let model_ref = &self.model;
+        let num_layers = self.config.num_hidden_layers;
+        // Phase 2: per-layer async prefetch via std::thread::scope.
+        //
+        // load_layer() dequantizes Q4_K/Q6_K weights from mmap; on the 3B
+        // model that's ~12 ms per layer / ~310 ms per pass / ~40% of wall.
+        // We overlap `load_layer(layer_idx+1)` on a worker while the main
+        // thread runs layer `layer_idx`'s matmul.  Same-correctness as the
+        // sequential version; on N-layer models we issue N+1 loads (one for
+        // layer 0 before the loop, one for layers 1..N on workers during
+        // iterations 0..N-1).
+        let model_ref = &self.model;
+        let num_layers = self.config.num_hidden_layers;
+        std::thread::scope(|scope| -> Result<(), String> {
+            // Initial layer 0 (sync) + prefetch kick-off for layer 1.
+            let mut layer_weights: HashMap<String, Tensor> = model_ref
+                .load_layer(0)
+                .map_err(|e| format!("layer 0 load: {}", e))?;
+            let use_prefetch = std::env::var("LEAFCUTTER_PREFETCH").is_ok();
+            let mut prefetch: Option<std::thread::ScopedJoinHandle<'_, Result<HashMap<String, Tensor>, String>>> =
+                if use_prefetch && num_layers > 1 {
+                    Some(scope.spawn(move || {
+                        model_ref.load_layer(1).map_err(|e| format!("layer 1 load: {}", e))
+                    }))
+                } else { None };
 
-            // ── Gemma 3/4 fast path ── every layer is 4 RMSNorms + attention +
-            // GeGLU + per-layer residual scale.  Skip all per-layer type routing.
-            if is_gemma {
-                let cfg = &self.gemma_layouts[layer_idx];
-                let new_hidden = crate::inference::gemma::gemma_layer_forward(
-                    &hidden,
-                    &mut layer_weights,
-                    cfg,
-                    &self.attn_params,
-                    &mut self.kv_cache,
-                    layer_idx,
-                    self.seq_offset,
-                    self.gemma_norm_eps,
-                )?;
-                hidden = new_hidden;
-                // Drop mmap pages — keep RSS bounded
+            for layer_idx in 0..num_layers {
+                if is_gemma {
+                    let cfg = &self.gemma_layouts[layer_idx];
+                    let new_hidden = crate::inference::gemma::gemma_layer_forward(
+                        &hidden,
+                        &mut layer_weights,
+                        cfg,
+                        &self.attn_params,
+                        &mut self.kv_cache,
+                        layer_idx,
+                        self.seq_offset,
+                        self.gemma_norm_eps,
+                    )?;
+                    hidden = new_hidden;
+                } else {
+                    // Detect layer type from actual tensor contents (most robust)
+                    let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight")
+                        || layer_weights.contains_key("attn_q.weight");
+                    let has_deltanet = layer_weights.contains_key("ssm_alpha.weight")
+                        || layer_weights.contains_key("self_attn.qkv_proj.weight");
+                    let has_ssm = layer_weights.contains_key("ssm_out.weight")
+                        && !has_deltanet;
+                    let has_mla = layer_weights.contains_key("attn_q_a.weight")
+                        && layer_weights.contains_key("attn_kv_a_mqa.weight")
+                        && layer_weights.contains_key("attn_q_b.weight")
+                        && layer_weights.contains_key("attn_k_b.weight")
+                        && layer_weights.contains_key("attn_v_b.weight");
+                    let has_moe = layer_weights.contains_key("ffn_gate_inp.weight")
+                        || layer_weights.contains_key("mlp.expert_gate.weight");
+                    let has_shared_expert = layer_weights.contains_key("ffn_gate_shexp.weight")
+                        || layer_weights.contains_key("mlp.shared_expert_gate.weight");
+
+                    let pre_norm_weight = layer_weights
+                        .get("input_layernorm.weight")
+                        .or_else(|| layer_weights.get("attn_norm.weight"))
+                        .ok_or_else(|| format!("layer {}: missing pre-norm (input_layernorm/attn_norm)", layer_idx))?;
+                    let normed = hidden.rms_norm(pre_norm_weight, self.config.norm_eps);
+
+                    if has_standard_attn {
+                        let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
+                        hidden = hidden.add(&attn_out);
+                    } else if has_deltanet {
+                        let deltanet_out = deltanet_forward(&normed, &layer_weights, &self.deltanet_params, &mut self.deltanet_cache, layer_idx);
+                        hidden = hidden.add(&deltanet_out);
+                    } else if has_ssm {
+                        let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
+                        hidden = hidden.add(&ssm_out);
+                    } else if has_mla {
+                        let mla_out = mla_forward(&normed, &layer_weights, &self.mla_params, &mut self.kv_cache, layer_idx, self.seq_offset);
+                        hidden = hidden.add(&mla_out);
+                    }
+
+                    let post_norm_weight = layer_weights
+                        .get("post_attention_layernorm.weight")
+                        .or_else(|| layer_weights.get("post_attention_norm.weight"))
+                        .or_else(|| layer_weights.get("ffn_norm.weight"))
+                        .ok_or_else(|| format!("layer {}: missing post-norm (post_attention_layernorm/_norm/ffn_norm)", layer_idx))?;
+                    let normed = hidden.rms_norm(post_norm_weight, self.config.norm_eps);
+                    let ffn_out = if has_moe {
+                        Self::ffn_moe_forward(&normed, &layer_weights, &self.moe_params, has_shared_expert)?
+                    } else {
+                        Self::ffn_forward(&normed, &layer_weights)?
+                    };
+                    hidden = hidden.add(&ffn_out);
+                }
+
+                // ── Common tail: free current, swap to prefetched next (if any).
+                layer_weights = HashMap::new(); // drop in place
                 self.model.file.drop_pages_from_cache();
-                continue;
+
+                if let Some(h) = prefetch.take() {
+                    layer_weights = h.join()
+                        .map_err(|_| "worker panicked".to_string())
+                        .and_then(|r| r)?;
+
+                    // Schedule the layer after next (2 ahead of the once
+                    // we're about to enter).  Iteration N will use this.
+                    let next_layer_idx = layer_idx + 2;
+                    if next_layer_idx < num_layers {
+                        prefetch = Some(scope.spawn(move || {
+                            model_ref.load_layer(next_layer_idx)
+                                .map_err(|e| format!("layer {} load: {}", next_layer_idx, e))
+                        }));
+                    }
+                } else if layer_idx + 1 < num_layers {
+                    // No prefetch available: load synchronously (env var NOT set
+                    // path).  The `else if` matches single-layer models.
+                    layer_weights = model_ref
+                        .load_layer(layer_idx + 1)
+                        .map_err(|e| format!("layer {} load: {}", layer_idx + 1, e))?;
+                }
             }
-
-            // Detect layer type from actual tensor contents (most robust)
-            let has_standard_attn = layer_weights.contains_key("self_attn.q_proj.weight")
-                || layer_weights.contains_key("attn_q.weight");
-            let has_deltanet = layer_weights.contains_key("ssm_alpha.weight")
-                || layer_weights.contains_key("self_attn.qkv_proj.weight");
-            let has_ssm = layer_weights.contains_key("ssm_out.weight")
-                && !has_deltanet;
-            // MLA + MoE detection — DeepSeek-2 / GLM-DSA family.
-            // `has_mla` is set when the tensor set has any of the MLA
-            // decomposition weights; `has_moe` when at least one routed
-            // expert block is present.
-            let has_mla = layer_weights.contains_key("attn_q_a.weight")
-                && layer_weights.contains_key("attn_kv_a_mqa.weight")
-                && layer_weights.contains_key("attn_q_b.weight")
-                && layer_weights.contains_key("attn_k_b.weight")
-                && layer_weights.contains_key("attn_v_b.weight");
-            let has_moe = layer_weights.contains_key("ffn_gate_inp.weight")
-                || layer_weights.contains_key("mlp.expert_gate.weight");
-            let has_shared_expert = layer_weights.contains_key("ffn_gate_shexp.weight")
-                || layer_weights.contains_key("mlp.shared_expert_gate.weight");
-
-            // Pre-norm
-            let pre_norm_weight = layer_weights
-                .get("input_layernorm.weight")
-                .or_else(|| layer_weights.get("attn_norm.weight"))
-                .ok_or_else(|| format!("layer {}: missing pre-norm (input_layernorm/attn_norm)", layer_idx))?;
-            let normed = hidden.rms_norm(pre_norm_weight, self.config.norm_eps);
-
-            if has_standard_attn {
-                let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
-                hidden = hidden.add(&attn_out);
-            } else if has_deltanet {
-                let deltanet_out = deltanet_forward(&normed, &layer_weights, &self.deltanet_params, &mut self.deltanet_cache, layer_idx);
-                hidden = hidden.add(&deltanet_out);
-            } else if has_ssm {
-                let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
-                hidden = hidden.add(&ssm_out);
-            } else if has_mla {
-                let mla_out = mla_forward(&normed, &layer_weights, &self.mla_params, &mut self.kv_cache, layer_idx, self.seq_offset);
-                hidden = hidden.add(&mla_out);
-            }
-            // (Unknown attention branch — fall through to dense FFN later.
-            //  Currently no engine layer silently does this; it's logged.)
-
-            // Post-attention/SSM norm + FFN
-            let post_norm_weight = layer_weights
-                .get("post_attention_layernorm.weight")
-                .or_else(|| layer_weights.get("post_attention_norm.weight")) // Qwen 3.5 GGUF name
-                .or_else(|| layer_weights.get("ffn_norm.weight"))
-                .ok_or_else(|| format!("layer {}: missing post-norm (post_attention_layernorm/_norm/ffn_norm)", layer_idx))?;
-            let normed = hidden.rms_norm(post_norm_weight, self.config.norm_eps);
-            let ffn_out = if has_moe {
-                Self::ffn_moe_forward(&normed, &layer_weights, &self.moe_params, has_shared_expert)?
-            } else {
-                Self::ffn_forward(&normed, &layer_weights)?
-            };
-            hidden = hidden.add(&ffn_out);
-
-            // layer_weights goes out of scope here — memory freed immediately
-            // Drop mmap pages from OS cache so RSS stays bounded to ~1 layer
-            self.model.file.drop_pages_from_cache();
-        }
-
-        // Final norm
+            Ok(())
+        })?;
+        // Final norm        // Final norm        // Final norm
         let final_norm = self
             .special_weights
             .get("model.norm.weight")
