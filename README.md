@@ -25,6 +25,8 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 | **HTTP API** | ✅ Built-in (Axum) | ❌ Library only | ❌ CLI only | ✅ Separate binary |
 | **OpenAI API** | ✅ `/v1/chat/completions` | ❌ Not supported | ❌ Not supported | ❌ Not supported |
 | **70B on 4GB** | ✅ **Validated: 1,145 MB peak** with layer streaming + `madvise` | ✅ Yes (PyTorch quantized ops) | ❌ BitNet only | ⚠️ With `--mmap` + aggressive quantization |
+| **Async layer prefetch** | ✅ `LEAFCUTTER_PREFETCH=1` (1.68× warm-cache speedup on 3B via `std::thread::scope`) | ❌ No | ❌ No | ❌ No |
+| **Anti-doom loop guard** | ✅ Inference-time detector (`LEAFCUTTER_ANTIDOOM=1`) — byte-level + token n-gram loops suppressed at sampler | ❌ No | ❌ No | ❌ No |
 | **Auto-Fallback** | ✅ Unsupported quants → llama.cpp FFI | ❌ No | ❌ No | N/A |
 
 **Key advantage:** Leafcutter is the only open-source engine combining Rust memory safety, **automatic backend routing** (native → FFI fallback), native quantized weight loading with transposed-B GEMM, BitNet quantization, and a built-in OpenAI-compatible HTTP API in a single binary.

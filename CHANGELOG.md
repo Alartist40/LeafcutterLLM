@@ -5,6 +5,70 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-07-24 (Phase 2 + anti-doom)
+
+### Added — Anti-doom loop detector (rust/src/inference/anti_doom.rs)
+
+Inference-time sampler hook that detects doom loops in the generated text
+and suppresses the offending continuation tokens before the next sample.
+Directly addresses the "every token counts when tok/s is slow" property
+that distinguishes Leafcutter from Colibri (which is pure dumb-pipe
+inference).
+
+- **Two-stage detector**:
+  1. Byte-level (Rust port ofLiquid4All/antidoom `repetition.py`) —
+     scans generated text for byte-aligned repeated patterns via
+     16-char fingerprints at every 16-char position.
+  2. Token-id n-gram detector (new) — counts every k-gram (k=2..6) in
+     the last 48 tokens and fires when any k-gram repeats >= 3 times
+     with the most recent occurrence within 2k tokens of the tail.
+     Catches Ministral-3B's "scattered cyclic" loops that the
+     byte-level one misses (e.g. "of the Republic × 3" surrounded by
+     non-cyclic filler tokens).
+- **Sampler hook** in `engine.rs:generate_native`: calls `detect()` after
+  each forward pass; if a loop is found, zeroes the continuation-token
+  logits to -inf. 16-step cooldown after each intervention to let the
+  sampler escape naturally.
+- **Gating**: `LEAFCUTTER_ANTIDOOM=1` enables; `LEAFCUTTER_ANTIDOOM_DEBUG=1`
+  logs every intervention.
+- **Cost**: 0.02-0.6 ms cumulative across 80 decode steps on 3B
+  (`detection_time` counter in debug output).  Negligible vs ~770 ms/tok.
+- **Tokenizer**: added `GgufTokenizer::vocab()` getter so the engine
+  can translate detected continuation prefixes into suppressible token
+  ids.  No encryption needed to add it explicitly.
+
+### Performance — Async layer prefetch (Phase 2)
+
+`forward_native` in `engine.rs` now wraps the layer loop in
+`std::thread::scope`.  A worker thread runs `load_layer(N+1)` while
+the main thread does matmul on layer N, so the Q4_K/Q6_K parse cost
+- 22-27 ms on 70B, ~12 ms on 3B per layer - overlaps with useful
+compute instead of gating each iteration.
+
+- **Gating**: `LEAFCUTTER_PREFETCH=1` (default off until 70B
+  measurement confirms no regression on cold cache reads).  Off path
+  is functionally identical to the old sequential flow - no spawns
+  filed when the env var is unset.
+- **Bench (Ministral-3B Q4_K_M, 8 tok gen, warm OS cache)**:
+  - Sequential: 0.74 tok/s (10.85 s)
+  - Prefetch:   1.24 tok/s (6.43 s) -> 1.68x speedup
+- **Borrow mechanics**: `let model_ref = &self.model;` outside the
+  scope; worker threads capture it via `s.spawn(|| model_ref.load_layer(...))`
+  while the main thread mutates `self.kv_cache` etc.  Compiles because
+  Rust allows disjoint-field borrows on a struct - no Arc/Mutex
+  needed since `std::thread::scope` ensures all workers complete before
+  the closure returns.
+
+### Performance — per-tensor profiling (LEAFCUTTER_PROFILE_BLOCKS=1)
+
+- New `LEAFCUTTER_PROFILE_BLOCKS=1` env flag prints per-tensor parse
+  timings for Q4_K and Q6_K tensors during every `load_layer` call.
+  Reveals that `ffn_gate`/`ffn_up` parse ~16-21 ms and `ffn_down`
+  (Q6_K) parses ~22-27 ms on Ministral-3B - those three define the
+  majority of `load_layer` wall time (~70ms per layer on 3B).
+
+---
+
 ## [Unreleased] — 2026-07-23 (CPU% pegging fix: SIMD dot in LM head)
 
 ### Fixed

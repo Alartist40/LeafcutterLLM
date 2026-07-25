@@ -1,9 +1,9 @@
 # LeafcutterLLM Handoff Document
 
-**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward), **2026-07-09 (pre-release audit hardening — 20 findings routed)**.
-**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward; **ruthless pre-release audit + 16 fix areas**.
-**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3; **audit-era: 1ed554a, 5d735a9, e95c624, 115fbdb**, plus 6 additional critical/high/medium hardening commits).
-**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / Qwen 3.5 / Ornith / **pre-release audit hardening** work by m3 (Nvidia).
+**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward), **2026-07-09 (pre-release audit hardening — 20 findings routed)**, **2026-07-24 (Phase 2 async layer prefetch + anti-doom loop detector)**.
+**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward; pre-release audit + 16 fix areas; **Phase 2 + anti-doom runtime guard**.
+**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3; audit-era: 1ed554a, 5d735a9, e95c624, 115fbdb; modern-era: 991e481, 528f620, 16bcef8, a1c2f67, **5aa6154 Phase 2 prefetch, aaec49d anti-doom**).
+**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / Qwen 3.5 / Ornith / pre-release audit hardening work by m3 (Nvidia); Phase 2 + anti-doom work by m3 (Nvidia).
 
 ---
 
@@ -11,7 +11,15 @@
 
 Transform LeafcutterLLM from a failing prototype into a production-ready LLM inference engine that runs standard transformers (Llama, Mistral, Qwen2, Yi, Gemma, Phi) natively in Rust, with full K-quant/IQ-quant support, layer-wise streaming, and a built-in OpenAI-compatible HTTP API.
 
-The ultimate vision is to surpass airllm in speed and capability, leveraging Rust's memory safety and SIMD performance.
+**Tripolar mission (re-aligned 2026-07-24):**
+1. **Lighter than airllm**: 1,145 MB peak RSS on 70B via layer streaming + `madvise`. AirLLM needs 16+ GB for the same model. Reference: `/home/xander/Documents/reference/airllm/`.
+2. **Faster than colibri**: layer-streaming + async layer prefetch (commit 5aa6154, 1.68× warm-cache on 3B) + per-architecture SIMD paths. Reference: `/home/xander/Documents/reference/colibri/`.
+3. **Smarter than colibri**: inference-time anti-doom loop detector (commit aaec49d), per-architecture fast paths for Gemma 3/4 / Qwen 3.5 / BitNet / MoE, "every token counts" runtime guards. Colibri is pure dumb-pipe inference; Leafcutter's defensible differential is the Smart primitive. Reference: `/home/xander/Documents/reference/antidoom/`.
+
+Stack policy:
+- Rust for the inference engine and any inference-time runtime logic (anti-doom, sampler hooks, K/V cache strategies).
+- Go ONLY when we need to orchestrate many concurrent multi-model-serving tasks (`/home/xander/Documents/portfolio/cynapse` is the example).
+- Avoid Python — antidoom itself is Python+PyTorch, but we ported the IDEA to Rust as a sampler hook; the Python training pipeline is NOT a target.
 
 ---
 
@@ -749,13 +757,27 @@ with the full layout, dimension math, and per-layer metadata for Gemma 4
 `~/.hermes/skills/leafcutter-quantized-tensor-matmul` for the empty-data
 dequant pattern itself.
 
-### Honest current state (as of commit `ef5e278`, pushed to origin/main)
+### Honest current state (as of commits 5aa6154 + aaec49d, 2026-07-24)
 
-End-to-end Gemma 4 12B forward pass runs **all 48 layers** without
-panics and emits tokens through the native `Engine::forward_native`
-path. Test count: 137 passed (1 pre-existing failure unchanged, 3
-ignored). No regressions on previously-validated models (Llama-3,
-Qwen3.5, Ministral).
+**New since prior handoff:**
+- **Phase 2 async layer prefetch** (`5aa6154`): `forward_native` wraps
+  the layer loop in `std::thread::scope`. A worker thread runs
+  `load_layer(N+1)` while the main thread does matmul on N.  Measured
+  warm-cache gain on Ministral-3B Q4_K_M: 0.74 → 1.24 tok/s (1.68×).
+  Gated behind `LEAFCUTTER_PREFETCH=1` (off by default).
+- **Anti-doom loop detector** (`aaec49d`): pure-Rust port of
+  antidoom's `repetition.py` plus a token-id n-gram detector. Both
+  feed into a sampler hook in `generate_native` that suppresses the
+  continuation-token logits before the next sample.  Gated behind
+  `LEAFCUTTER_ANTIDOOM=1`. Detection cost: 0.02-0.6 ms per
+  80-token decode (negligible).
+- **Per-tensor profiling** (`a1c2f67`): added
+  `LEAFCUTTER_PROFILE_BLOCKS=1` to `model::loader::load_layer` to
+  print per-tensor rows/cols/block counts/elapsed time.
+
+End-to-end Gemma 4 12B forward pass still runs **all 48 layers**
+without panics and emits tokens through the native `Engine::forward_native`.
+Test count: 150 passed (1 pre-existing Q4_0 failure unchanged, 3 ignored).
 
 **What works:**
 

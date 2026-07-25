@@ -1,8 +1,30 @@
 # LeafcutterLLM — Milestones & Testing Record
 
-**Last updated:** 2026-06-16 (audit-pass refresh)
+**Last updated:** 2026-07-24 (Phase 2 prefetch + anti-doom)
 **Git commit:** To be pushed
-**Total tests:** **123 passed**, **1 pre-existing failure** (`kernels::tests::test_q4_0_roundtrip` — hand-crafted raw-byte test, predates 2026-06-16 audit; no production path affected), **3 ignored** (GPU tests)
+**Total tests:** **150 passed**, **1 pre-existing failure** (`kernels::tests::test_q4_0_roundtrip` — hand-crafted raw-byte test, predates 2026-06-16 audit; no production path affected), **3 ignored** (GPU tests)
+
+---
+
+## 2026-07-24 — Phase 2 async layer prefetch + anti-doom detector
+
+- **5aa6154** Phase 2: `std::thread::scope` wrapping `forward_native`
+  layer loop; worker thread runs `load_layer(N+1)` while main does N's
+  matmul. Gated `LEAFCUTTER_PREFETCH=1`. Bench (Ministral-3B warm):
+  0.74 → 1.24 tok/s (1.68×). Borrow trick documented in commit + skill.
+
+- **aaec49d** Anti-doom: `rust/src/inference/anti_doom.rs` (pure Rust,
+  4 unit tests). Two-stage detector — byte-fingerprint repetition
+  (port of antidoom `repetition.py`) + token-id n-gram repetition.
+  Wired into `generate_native` as a sampler hook that suppresses
+  continuation-token logits to -inf before the next sample. Gated
+  `LEAFCUTTER_ANTIDOOM=1`. Detection cost: 0.02-0.6 ms per 80-token
+  decode (negligible).
+
+- **Test count**: tracked by `cargo test --release --lib --no-default-features`.
+  Currently **150 passed**, 1 pre-existing failure (unrelated `test_q4_0_roundtrip`).
+  Anti-doom brings 4 of those (`anti_doom::tests::*`); the rest accumulated
+  across SIMD lm_head, decoder fixes, and cleanups between Q3 sessions.
 
 ---
 

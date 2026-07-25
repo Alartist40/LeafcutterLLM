@@ -2,6 +2,7 @@
 
 **Date:** 2026-07-22
 **Status:** Strategy rewrite after ground-truth measurement.
+**Last updated:** 2026-07-24 (Phase 2 prefetch + anti-doom ship)
 **Source path:** `/home/xander/Documents/portfolio/LeafcutterLLM/`
 
 ---
@@ -42,7 +43,8 @@ is real but it targets an 800× larger model.
 |---|---|---|---|---|
 | **G0** | Don't regress 9B dense | 1.2 GB peak | stay < 1.5 GB | now |
 | **G1** | 70B dense | 1.08 GB peak | keep < 2 GB | now (✓) |
-| **G2** | 70B faster (CPU throughput) | 0.01 tok/s | 0.5–1 tok/s | 2–4 weeks |
+| **G2** | 70B faster (CPU throughput) | 0.01 tok/s cold; 1.24 tok/s @ 3B warm with prefetch | 0.5–1 tok/s | 2–4 weeks |
+| **G2a** | Smarter inference (anti-doom) | ✅ shipped `LEAFCUTTER_ANTIDOOM=1` (commit aaec49d) | 100% loop suppression on Ministral-3B greedy | DONE |
 | **G3** | MoE streaming for Kimi K2.6 / GLM-5.2 | not yet | ~3 GB peak (Pi 5 8GB) | 4–8 weeks |
 | **G4** | MLA cached conversation resume | partial | full `.kv` persist | 1–2 weeks |
 
