@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod anti_doom;
 pub mod deltanet;
 pub mod engine;
 pub mod gemma;

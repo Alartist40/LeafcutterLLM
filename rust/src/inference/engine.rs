@@ -483,6 +483,12 @@ impl Engine {
         self.deltanet_cache.clear();
         self.seq_offset = 0;
 
+        // Anti-doom setup (gated by LEAFCUTTER_ANTIDOOM=1)
+        let anti_doom_enabled = crate::inference::anti_doom::is_enabled();
+        let mut anti_doom = if anti_doom_enabled {
+            Some(crate::inference::anti_doom::AntiDoomState::new())
+        } else { None };
+
         // Prefill
         let logits = match self.forward_native(tokens) {
             Ok(l) => l,
@@ -495,13 +501,20 @@ impl Engine {
         let mut next_token = sample_top_p(&logits, temperature, top_p);
         let mut generated = vec![next_token];
 
+        if anti_doom_enabled {
+            if let Some(state) = anti_doom.as_mut() {
+                let decoded = self.decode(&[next_token]);
+                state.record(next_token, &decoded);
+            }
+        }
+
         if next_token == self.config.eos_token {
             return generated;
         }
 
         // Decode loop
         for _ in 0..max_tokens - 1 {
-            let logits = match self.forward_native(&[next_token]) {
+            let mut logits = match self.forward_native(&[next_token]) {
                 Ok(l) => l,
                 Err(e) => {
                     eprintln!("Forward pass failed: {}", e);
@@ -509,11 +522,58 @@ impl Engine {
                 }
             };
             self.seq_offset += 1;
+
+            // Anti-doom guard: scan generated text for a doom loop, and if
+            // detected, suppress the loop-continuation token ids in the
+            // logits before sampling.  Only fires on the native path.
+            if let Some(state) = anti_doom.as_mut() {
+                // The detector needs the per-token surface strings (vocab)
+                // to construct the continuation-token suppression set.
+                // We pull the GGUF tokenizer vocab once and reuse it.
+                if let Some(vocab) = self.cached_tokenizer_vocab() {
+                    if let Some(intervention) = state.detect(&vocab) {
+                        if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
+                            eprintln!(
+                                "[ANTIDOOM] step={} period={} repeats={} prefix=\"{}\" suppress={}",
+                                state.interventions(),
+                                intervention.hit.period,
+                                intervention.hit.repeats,
+                                intervention.next_prefix,
+                                intervention.suppress_ids.len()
+                            );
+                        }
+                        crate::inference::anti_doom::suppress_in_logits(
+                            &mut logits,
+                            &intervention.suppress_ids,
+                        );
+                    }
+                }
+            }
+
             next_token = sample_top_p(&logits, temperature, top_p);
             generated.push(next_token);
 
+            if anti_doom_enabled {
+                if let Some(state) = anti_doom.as_mut() {
+                    let decoded = self.decode(&[next_token]);
+                    state.record(next_token, &decoded);
+                }
+            }
+
             if next_token == self.config.eos_token {
                 break;
+            }
+        }
+
+        if anti_doom_enabled {
+            if let Some(state) = anti_doom {
+                if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
+                    eprintln!(
+                        "[ANTIDOOM] total interventions={} detection_time={:.3}ms",
+                        state.interventions(),
+                        state.detection_time_ns() as f64 / 1e6
+                    );
+                }
             }
         }
 
@@ -1082,6 +1142,18 @@ impl Engine {
             *guard = Some(built.clone());
         }
         Some(built)
+    }
+
+    /// Return the GGUF tokenizer's per-token surface strings as a Vec.  Used
+    /// by the anti-doom sampler hook to translate detected repetition
+    /// continuation prefixes into token ids that should be suppressed.
+    ///
+    /// Returns None when no tokenizer is available (e.g. FFI-only path or
+    /// a model ship without tokenizer metadata).  The caller treats None
+    /// as "anti-doom cannot act at this step."
+    fn cached_tokenizer_vocab(&self) -> Option<Vec<String>> {
+        let tok = self.tokenizer_from_model()?;
+        Some(tok.vocab().to_vec())
     }
 
     fn build_tokenizer_from_model(&self) -> Option<GgufTokenizer> {

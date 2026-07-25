@@ -169,6 +169,13 @@ impl GgufTokenizer {
         self.vocab.len()
     }
 
+    /// Read-only access to the vocab Vec (token_id to surface string).
+    /// Used by the anti-doom sampler hook to look up which token ids would
+    /// continue a detected repetition cycle.
+    pub fn vocab(&self) -> &[String] {
+        &self.vocab
+    }
+
     pub fn bos_id(&self) -> Option<usize> { self.bos_id }
     pub fn eos_id(&self) -> Option<usize> { self.eos_id }
 
