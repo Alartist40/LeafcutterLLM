@@ -45,10 +45,11 @@ the main thread does matmul on layer N, so the Q4_K/Q6_K parse cost
 - 22-27 ms on 70B, ~12 ms on 3B per layer - overlaps with useful
 compute instead of gating each iteration.
 
-- **Gating**: `LEAFCUTTER_PREFETCH=1` (default off until 70B
-  measurement confirms no regression on cold cache reads).  Off path
-  is functionally identical to the old sequential flow - no spawns
-  filed when the env var is unset.
+- **Gating**: `LEAFCUTTER_PREFETCH` — defaults ON as of 2026-07-25.
+  Measured median 1.16× speedup on 70B (Llama-3.3 Q4_K_M, 3 tok gen,
+  2-run median: 97.36 s → 83.93 s, ~13.4 s saved) and 1.53× on 3B
+  sequential-vs-default-on comparison (1.27 → 1.94 tok/s).  Opt-out
+  is `LEAFCUTTER_PREFETCH=0` or `=false`.
 - **Bench (Ministral-3B Q4_K_M, 8 tok gen, warm OS cache)**:
   - Sequential: 0.74 tok/s (10.85 s)
   - Prefetch:   1.24 tok/s (6.43 s) -> 1.68x speedup

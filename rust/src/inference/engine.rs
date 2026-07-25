@@ -725,7 +725,10 @@ impl Engine {
             let mut layer_weights: HashMap<String, Tensor> = model_ref
                 .load_layer(0)
                 .map_err(|e| format!("layer 0 load: {}", e))?;
-            let use_prefetch = std::env::var("LEAFCUTTER_PREFETCH").is_ok();
+            // Default-on as of 2026-07-25: measured 1.16× speedup on 70B
+            // (rust/PHASE2_70B_MEASUREMENT.md, commit 3db1df1).  Opt-out
+            // remains available via `LEAFCUTTER_PREFETCH=0`.
+            let use_prefetch = std::env::var("LEAFCUTTER_PREFETCH").map(|v| v != "0" && v != "false").unwrap_or(true);
             let mut prefetch: Option<std::thread::ScopedJoinHandle<'_, Result<HashMap<String, Tensor>, String>>> =
                 if use_prefetch && num_layers > 1 {
                     Some(scope.spawn(move || {
