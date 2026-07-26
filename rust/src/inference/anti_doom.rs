@@ -301,6 +301,128 @@ pub fn is_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Normalize text for repetition detection: lowercase + keep only ASCII
+/// letters and spaces.  Strips digits, punctuation, garbage replacement
+/// characters, and other non-alphabetic noise that the broken-BPE
+/// tokenizer occasionally injects.  This lets us catch *semantic* loops
+/// ("Here;s" vs "Here's") even when the underlying tokens don't match.
+///
+/// Returns a String and a Vec<usize> mapping each alpha-space char back
+/// to its byte position in the ORIGINAL text (for use with vocab prefix
+/// matching).
+fn normalize_for_repetition(text: &str) -> (String, Vec<usize>) {
+    let mut normalized = String::with_capacity(text.len());
+    let mut byte_positions = Vec::with_capacity(text.len());
+    for (i, ch) in text.char_indices() {
+        let lc = ch.to_ascii_lowercase();
+        if lc.is_ascii_alphabetic() || lc == ' ' {
+            normalized.push(lc);
+            byte_positions.push(i);
+        }
+        // Skip digits, punctuation, garbage chars entirely
+    }
+    (normalized, byte_positions)
+}
+
+/// Scan normalized text for semantic loops.  Returns the same shape as
+/// `find_inner_repetition` but indices refer to BYTE OFFSETS in the
+/// ORIGINAL text (via the byte_positions map).
+///
+/// Algorithm:
+///   1. Normalize the text (lowercase letters + spaces only).
+///   2. Sample fingerprints from normalized text.
+///   3. If the normalized text has a repeated k-gram where k >= 6 alpha
+///      chars and the pattern appears 3+ times recently, return the
+///      period and a CONFIDENCE score.
+///
+/// This catches "Here;s the thing. Here;s the thing. Here;s the thing."
+/// that the literal `find_inner_repetition` misses because the bytes
+/// inside `Here;s` vary slightly across iterations under the broken
+/// encoder.
+pub fn find_normalized_text_loop(text: &str) -> Option<RepeatHit> {
+    const NORM_MIN_K: usize = 8;       // min normalized sample length
+    const NORM_MIN_REPEATS: usize = 3; // min occurrences in the recent tail
+    const NORM_WINDOW: usize = 200;    // how far back to look
+
+    let (norm, byte_pos) = normalize_for_repetition(text);
+    if norm.len() < 48 {
+        return None;
+    }
+    let n = norm.len();
+    let n_chars = byte_pos.len();
+
+    // We sample at offsets 0,8,16,...; fingerprint = 8 normalized chars.
+    // For each fingerprint, count occurrences in the last NORM_WINDOW
+    // chars and check if the most recent occurrence is near the tail.
+    let mut pos = 0;
+    while pos + NORM_MIN_K < n {
+        // Ensure char boundary in normalized text
+        let mut end = pos + NORM_MIN_K;
+        while end < n && !norm.is_char_boundary(end) {
+            end += 1;
+        }
+        if end >= n {
+            break;
+        }
+        let fingerprint = &norm[pos..end];
+        if fingerprint.trim().len() < NORM_MIN_K {
+            // Skip fingerprints that are mostly spaces
+            pos += 4;
+            continue;
+        }
+
+        // Search backward from the tail for prior occurrences
+        let tail_start = n.saturating_sub(NORM_WINDOW).max(pos + 1);
+        let mut count = 1;
+        let mut last_found = pos;
+        let mut search_from = n.saturating_sub(NORM_MIN_K);
+        while search_from > tail_start {
+            // find the LAST occurrence of the fingerprint ending at <= search_from
+            if let Some(relative) = norm[tail_start..search_from].rfind(fingerprint) {
+                let absolute = tail_start + relative;
+                if absolute == pos {
+                    // Skip the current position itself
+                    if relative == 0 {
+                        break;
+                    }
+                    search_from = absolute;
+                    continue;
+                }
+                if absolute + NORM_MIN_K > n_chars {
+                    // Out of bounds in original text — fingerprint crosses bad chars
+                    break;
+                }
+                count += 1;
+                last_found = absolute;
+                search_from = absolute + NORM_MIN_K;
+                if count >= NORM_MIN_REPEATS {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        if count >= NORM_MIN_REPEATS {
+            // Found a loop.  Return the ORIGINAL byte position of the
+            // pattern start and the period in original bytes.
+            let orig_start = byte_pos[pos];
+            let orig_last = byte_pos.get(last_found).copied().unwrap_or(orig_start);
+            let period = (orig_last - orig_start).max(1);
+            return Some(RepeatHit {
+                start: orig_start,
+                end: text.len(),
+                period,
+                repeats: count,
+                snippet: fingerprint.chars().take(40).collect(),
+            });
+        }
+
+        pos += 4;
+    }
+    None
+}
+
 /// Inner state for the anti-doom guard during one generation.
 ///
 /// Holds the decoded text accumulated across the decode loop so the
@@ -364,16 +486,31 @@ impl AntiDoomState {
         // catches loops that the byte fingerprint misses.
         let byte_hit = find_inner_repetition(&self.generated_text);
         let token_hit = find_token_ngram_loop(&self.token_ids);
+        // Semantic-drift loop detector: catches "Here;s" / "Here's" /
+        // "Here s" patterns that look different at the byte level but
+        // are clearly the same repeated phrase.  Activated only when
+        // the byte and token detectors missed.
+        let normalized_hit = if byte_hit.is_none() && token_hit.is_none() {
+            find_normalized_text_loop(&self.generated_text)
+        } else {
+            None
+        };
         self.detection_ns += t0.elapsed().as_nanos();
 
         // Prefer the byte-level hit — it gives a real text prefix we can
         // match in the vocab.  Fall back to the token-ngram hit if it
-        // exists and the byte-level didn't fire.
+        // exists and the byte-level didn't fire.  Last resort is the
+        // semantic-drift hit; its suppressions are based on the
+        // normalized prefix so we still kill the loop.
         let is_token_hit = byte_hit.is_none() && token_hit.is_some();
-        let hit = byte_hit.or(token_hit)?;
-        // Only intervene once per ~16 tokens — gives the sampler room to
-        // escape via natural noise after we punish the loop.
-        if (self.step as isize) - self.last_intervention_step < 16 {
+        let is_normalized_hit =
+            byte_hit.is_none() && token_hit.is_none() && normalized_hit.is_some();
+        let hit = byte_hit.or(token_hit).or(normalized_hit)?;
+        // Only intervene once per ~8 tokens — gives the sampler room to
+        // escape via natural noise after we punish the loop.  We tightened
+        // this from 16 → 8 because semantic-drift loops are tighter than
+        // exact repeats and need more frequent suppression.
+        if (self.step as isize) - self.last_intervention_step < 8 {
             return None;
         }
 
@@ -421,6 +558,48 @@ impl AntiDoomState {
                 suppress_ids,
                 next_prefix: continuation_surface,
             });
+        }
+
+        // ── Normalized (semantic-drift) hit path ──
+        // The hit.start/peroid are byte offsets in the ORIGINAL text.
+        // Use the hit's snippet (a 40-char alpha-only fingerprint that
+        // survived normalization) as the prefix for vocab suppression.
+        if is_normalized_hit {
+            let prefix_chars: String = hit
+                .snippet
+                .chars()
+                .filter(|c| c.is_ascii_alphabetic())
+                .take(8)
+                .collect();
+            if !prefix_chars.is_empty() {
+                let mut suppress_ids: Vec<usize> = Vec::new();
+                for (i, surface) in vocab.iter().enumerate() {
+                    // Match lowercase alphabetic prefix in vocab
+                    let surface_norm: String = surface
+                        .chars()
+                        .filter(|c| c.is_ascii_alphabetic() || *c == ' ')
+                        .collect::<String>()
+                        .to_ascii_lowercase();
+                    if surface_norm.starts_with(&prefix_chars.to_ascii_lowercase()) {
+                        suppress_ids.push(i);
+                        if suppress_ids.len() >= 96 {
+                            break;
+                        }
+                    }
+                }
+                if !suppress_ids.is_empty() {
+                    self.last_intervention_step = self.step as isize;
+                    self.interventions += 1;
+                    return Some(DoomIntervention {
+                        hit,
+                        suppress_ids,
+                        next_prefix: prefix_chars,
+                    });
+                }
+            }
+            // No vocab match — try interrupting the loop differently
+            // by advancing the seq_offset slightly.  Falls through to the
+            // byte-level code path next.
         }
 
         // ── Byte-level hit path: vocab prefix matching ──
