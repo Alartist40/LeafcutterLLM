@@ -25,8 +25,8 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 | **HTTP API** | ✅ Built-in (Axum) | ❌ Library only | ❌ CLI only | ✅ Separate binary |
 | **OpenAI API** | ✅ `/v1/chat/completions` | ❌ Not supported | ❌ Not supported | ❌ Not supported |
 | **70B on 4GB** | ✅ **Validated: 1,145 MB peak** with layer streaming + `madvise` | ✅ Yes (PyTorch quantized ops) | ❌ BitNet only | ⚠️ With `--mmap` + aggressive quantization |
-| **Async layer prefetch** | ✅ `LEAFCUTTER_PREFETCH=1` (1.68× warm-cache speedup on 3B via `std::thread::scope`) | ❌ No | ❌ No | ❌ No |
-| **Anti-doom loop guard** | ✅ Inference-time detector (`LEAFCUTTER_ANTIDOOM=1`) — byte-level + token n-gram loops suppressed at sampler | ❌ No | ❌ No | ❌ No |
+| **Async layer prefetch** | ✅ Default ON (1.68× warm-cache speedup on 3B via `std::thread::scope`); opt-out via `LEAFCUTTER_PREFETCH=0` |
+| **Anti-doom loop guard** | ✅ Default ON — byte-level + token n-gram loops suppressed at sampler; opt-out via `LEAFCUTTER_ANTIDOOM=0` |
 | **Auto-Fallback** | ✅ Unsupported quants → llama.cpp FFI | ❌ No | ❌ No | N/A |
 
 **Key advantage:** Leafcutter is the only open-source engine combining Rust memory safety, **automatic backend routing** (native → FFI fallback), native quantized weight loading with transposed-B GEMM, BitNet quantization, and a built-in OpenAI-compatible HTTP API in a single binary.
@@ -181,6 +181,35 @@ Download any GGUF or Safetensors model and place it in the `models/` directory. 
 LD_LIBRARY_PATH=$LLAMA_CPP_BUILD/bin ./target/release/leafcutter server
 ```
 LeafcutterLLM will automatically detect your model's architecture, check quantization compatibility, and route to the appropriate backend (native or FFI).
+
+### 3b. Chat in the terminal (Ollama-style `leaf` REPL)
+
+The `leaf` binary is a streaming chat REPL — like `ollama run`:
+```bash
+# Build it
+cd rust && cargo build --release --no-default-features --bin leaf
+
+# List models in ./models or ~/Downloads/models
+./target/release/leaf list
+
+# Start chatting (model name is a fuzzy match against .gguf filenames)
+./target/release/leaf run Ministral-3-3B
+./target/release/leaf run Llama-70B --temp 0.7 --max-tokens 200
+
+# Or pass a direct path
+./target/release/leaf run /path/to/model.gguf
+```
+
+In the REPL:
+- Type normally, press Enter to send
+- `/bye` or `/quit` to exit
+- `/clear` to reset conversation context
+- `/temp 0.5` to change temperature mid-session
+- `/help` for all commands
+
+Set `LEAF_MODELS_DIR` to override the models directory (default: `./models`, then `~/Downloads/models`).
+
+All engine optimizations carry through: async layer prefetch, anti-doom loop detection, zero-copy mmap, SIMD matmul.
 
 ### 4. Check Compatibility Only
 ```bash
@@ -519,10 +548,24 @@ cargo test --release --features llama-ffi
 
 ## Container Deployment
 
-### Build image
+LeafcutterLLM ships with a multi-stage Dockerfile and a GitHub Actions
+workflow (`.github/workflows/container.yml`) that auto-builds and pushes
+a container image to `ghcr.io` on every push to `main`.
+
+### Pull the pre-built image (if CI has run)
+
+```bash
+docker pull ghcr.io/alartist40/leafcutterllm:latest
+docker run -it -v ~/Downloads/models:/models ghcr.io/alartist40/leafcutterllm:latest leaf list
+docker run -it -v ~/Downloads/models:/models ghcr.io/alartist40/leafcutterllm:latest leaf run Ministral-3-3B
+```
+
+### Build image locally
 
 ```bash
 podman build --network=host -t leafcutter:latest .
+# or
+docker build -t leafcutter:latest .
 ```
 
 ### Run container

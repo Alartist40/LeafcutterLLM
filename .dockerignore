@@ -1,0 +1,11 @@
+# .dockerignore — keep the build context small
+.git
+target
+*.md
+*.gguf
+*.bin
+*.safetensors
+node_modules
+__pycache__
+*.pyc
+.cache

@@ -130,7 +130,18 @@ pub fn find_inner_repetition(text: &str) -> Option<RepeatHit> {
     let n = text.len();
     let mut pos = 0;
     while pos + SAMPLE_LEN < n {
-        let fingerprint = &text[pos..pos + SAMPLE_LEN];
+        // Clamp to char boundary to avoid panicking on multi-byte
+        // BPE tokens (e.g. Ġ = U+0120 is 2 bytes).
+        let end = match text.is_char_boundary(pos + SAMPLE_LEN) {
+            true => pos + SAMPLE_LEN,
+            false => {
+                // Skip ahead to the next char boundary.
+                let next = pos + SAMPLE_LEN + 1;
+                if next >= n { break; }
+                next
+            }
+        };
+        let fingerprint = &text[pos..end];
 
         // Forward search
         if let Some(other_pos) = text[pos + SAMPLE_LEN..].find(fingerprint) {
@@ -246,8 +257,14 @@ pub fn find_token_ngram_loop(token_ids: &[usize]) -> Option<RepeatHit> {
 }
 
 /// Is the anti-doom runtime gate enabled?
+///
+/// Defaults ON as of 2026-07-25: temp=0.7 verification on Ministral-3B
+/// showed divergent non-loop output (commit aaec49d + 0b1ec36
+/// measurement).  Opt-out via `LEAFCUTTER_ANTIDOOM=0` or `=false`.
 pub fn is_enabled() -> bool {
-    env::var("LEAFCUTTER_ANTIDOOM").is_ok()
+    env::var("LEAFCUTTER_ANTIDOOM")
+        .map(|v| v != "0" && v != "false")
+        .unwrap_or(true)
 }
 
 /// Inner state for the anti-doom guard during one generation.

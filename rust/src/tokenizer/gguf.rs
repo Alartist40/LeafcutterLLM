@@ -133,6 +133,7 @@ impl GgufTokenizer {
     /// Decode token IDs back to a string.
     ///
     /// Handles byte tokens (`<0xXX>`) and skips other special tokens.
+    /// Converts BPE space convention: Ġ (U+0120) → space, Ċ (U+010A) → newline.
     pub fn decode(&self, tokens: &[usize]) -> String {
         let mut result = String::new();
         for &id in tokens {
@@ -160,7 +161,16 @@ impl GgufTokenizer {
                 continue;
             }
 
-            result.push_str(piece);
+            // Convert BPE control chars to their ASCII equivalents.
+            // Ġ (U+0120) = space,  Ċ (U+010A) = newline,  Š (U+0160) = backslash
+            if piece.contains('Ġ') || piece.contains('Ċ') {
+                let cleaned = piece
+                    .replace('Ġ', " ")
+                    .replace('Ċ', "\n");
+                result.push_str(&cleaned);
+            } else {
+                result.push_str(piece);
+            }
         }
         result
     }

@@ -377,19 +377,22 @@ impl GGUFModel {
                 }
                 QuantType::Q4_K => {
                     let raw_bytes = raw.len();
+                    let profile_blocks = std::env::var("LEAFCUTTER_PROFILE_BLOCKS").is_ok();
+                    let t0 = if profile_blocks { Some(std::time::Instant::now()) } else { None };
                     let mat = crate::kernels::q4_k::Matrix {
                         rows: shape_data[0],
                         cols: shape_data[1],
                         blocks: crate::kernels::q4_k::blocks_from_bytes(raw),
                     };
-                    if std::env::var("LEAFCUTTER_PROFILE_BLOCKS").is_ok() {
+                    if let Some(t0) = t0 {
                         eprintln!(
-                            "[BLOCKS] Q4_K {}: rows={} cols={} blocks={} raw={}MB",
+                            "[BLOCKS] Q4_K {}: rows={} cols={} blocks={} raw={}MB parse={:.2}ms",
                             gguf_name,
                             shape_data[0],
                             shape_data[1],
                             mat.blocks.len(),
-                            raw_bytes / 1024 / 1024
+                            raw_bytes / 1024 / 1024,
+                            t0.elapsed().as_secs_f64() * 1000.0
                         );
                     }
                     (Tensor::from_q4_k_only(mat, shape_gguf.clone()), false)
@@ -403,26 +406,49 @@ impl GGUFModel {
                     (Tensor::from_iq4_nl_only(q4, shape_gguf.clone()), false)
                 }
                 QuantType::Q5_K => {
+                    let profile_blocks = std::env::var("LEAFCUTTER_PROFILE_BLOCKS").is_ok();
+                    let t0 = if profile_blocks {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let q5 = crate::kernels::q5_k::Matrix {
                         rows: shape_data[0],
                         cols: shape_data[1],
                         blocks: crate::kernels::q5_k::blocks_from_bytes(raw),
                     };
+                    if let Some(t0) = t0 {
+                        eprintln!(
+                            "[BLOCKS] Q5_K {}: rows={} cols={} blocks={} parse={:.2}ms",
+                            gguf_name,
+                            shape_data[0],
+                            shape_data[1],
+                            q5.blocks.len(),
+                            t0.elapsed().as_secs_f64() * 1000.0
+                        );
+                    }
                     (Tensor::from_q5_k_only(q5, shape_gguf.clone()), false)
                 }
                 QuantType::Q6_K => {
+                    let profile_blocks = std::env::var("LEAFCUTTER_PROFILE_BLOCKS").is_ok();
+                    let t0 = if profile_blocks {
+                        Some(std::time::Instant::now())
+                    } else {
+                        None
+                    };
                     let mat = crate::kernels::q6_k::Matrix {
                         rows: shape_data[0],
                         cols: shape_data[1],
                         blocks: crate::kernels::q6_k::blocks_from_bytes(raw),
                     };
-                    if std::env::var("LEAFCUTTER_PROFILE_BLOCKS").is_ok() {
+                    if let Some(t0) = t0 {
                         eprintln!(
-                            "[BLOCKS] Q6_K {}: rows={} cols={} blocks={}",
+                            "[BLOCKS] Q6_K {}: rows={} cols={} blocks={} parse={:.2}ms",
                             gguf_name,
                             shape_data[0],
                             shape_data[1],
-                            mat.blocks.len()
+                            mat.blocks.len(),
+                            t0.elapsed().as_secs_f64() * 1000.0
                         );
                     }
                     (Tensor::from_q6_k_only(mat, shape_gguf.clone()), false)

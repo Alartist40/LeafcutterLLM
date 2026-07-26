@@ -580,11 +580,148 @@ impl Engine {
         generated
     }
 
+    /// Streaming variant of `generate_native`.  Invokes the callback for each
+    /// sampled token (id + already-decoded surface string).  Generation
+    /// halts when the callback returns `false`, EOS is sampled, or
+    /// `max_tokens` is reached.  All engine optimizations carry over:
+    /// anti-doom loop suppression, async layer prefetch, etc.
+    ///
+    /// Used by the `leaf` chat REPL so tokens print as they're produced
+    /// rather than batched at the end.
+    pub fn generate_streaming_with<F>(
+        &mut self,
+        tokens: &[usize],
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        mut on_token: F,
+    ) -> Vec<usize>
+    where
+        F: FnMut(usize, &str) -> bool,
+    {
+        self.kv_cache.clear();
+        self.ssm_cache.clear();
+        self.deltanet_cache.clear();
+        self.seq_offset = 0;
+
+        let anti_doom_enabled = crate::inference::anti_doom::is_enabled();
+        let mut anti_doom = if anti_doom_enabled {
+            Some(crate::inference::anti_doom::AntiDoomState::new())
+        } else {
+            None
+        };
+
+        // Prefill
+        let logits = match self.forward_native(tokens) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("Forward pass failed: {}", e);
+                return vec![];
+            }
+        };
+        self.seq_offset = tokens.len();
+        let mut next_token = sample_top_p(&logits, temperature, top_p);
+        let mut generated = vec![next_token];
+
+        // First token — call the callback before recording into anti-doom
+        // so the detector sees the very first token in its history.
+        if !self.emit_stream_token(next_token, &mut on_token) {
+            return generated;
+        }
+        if anti_doom_enabled {
+            if let Some(state) = anti_doom.as_mut() {
+                let decoded = self.decode(&[next_token]);
+                state.record(next_token, &decoded);
+            }
+        }
+        if next_token == self.config.eos_token {
+            return generated;
+        }
+
+        for _ in 0..max_tokens - 1 {
+            let mut logits = match self.forward_native(&[next_token]) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!("Forward pass failed: {}", e);
+                    break;
+                }
+            };
+            self.seq_offset += 1;
+
+            if let Some(state) = anti_doom.as_mut() {
+                if let Some(vocab) = self.cached_tokenizer_vocab() {
+                    if let Some(intervention) = state.detect(&vocab) {
+                        if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
+                            eprintln!(
+                                "[ANTIDOOM] step={} period={} repeats={} prefix=\"{}\" suppress={}",
+                                state.interventions(),
+                                intervention.hit.period,
+                                intervention.hit.repeats,
+                                intervention.next_prefix,
+                                intervention.suppress_ids.len()
+                            );
+                        }
+                        crate::inference::anti_doom::suppress_in_logits(
+                            &mut logits,
+                            &intervention.suppress_ids,
+                        );
+                    }
+                }
+            }
+
+            next_token = sample_top_p(&logits, temperature, top_p);
+            generated.push(next_token);
+
+            if !self.emit_stream_token(next_token, &mut on_token) {
+                break;
+            }
+            if anti_doom_enabled {
+                if let Some(state) = anti_doom.as_mut() {
+                    let decoded = self.decode(&[next_token]);
+                    state.record(next_token, &decoded);
+                }
+            }
+            if next_token == self.config.eos_token {
+                break;
+            }
+        }
+
+        if anti_doom_enabled {
+            if let Some(state) = anti_doom {
+                if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
+                    eprintln!(
+                        "[ANTIDOOM] total interventions={} detection_time={:.3}ms",
+                        state.interventions(),
+                        state.detection_time_ns() as f64 / 1e6
+                    );
+                }
+            }
+        }
+
+        generated
+    }
+
+    /// Token-emit helper: decode one id to text, hand to the callback, and
+    /// return whether generation should continue (callback decides).
+    /// Token decoding swallows decode errors by returning empty string
+    /// so a missing decode path never breaks streaming output.
+    fn emit_stream_token<F>(&self, token_id: usize, cb: &mut F) -> bool
+    where
+        F: FnMut(usize, &str) -> bool,
+    {
+        let surface = self.decode(&[token_id]);
+        cb(token_id, &surface)
+    }
+
     /// Tokenize text using the model's native tokenizer (FFI path only).
     pub fn tokenize(&self, text: &str, add_special: bool) -> Vec<usize> {
         #[cfg(feature = "llama-ffi")]
         if let Some(ctx) = &self.ffi_context {
             return ctx.tokenize(text, add_special, true).into_iter().map(|t| t as usize).collect();
+        }
+        // Native fallback — use the GGUF tokenizer built from metadata.
+        if let Some(tok) = self.tokenizer_from_model() {
+            return tok.encode(text, add_special);
         }
         Vec::new()
     }
@@ -594,6 +731,10 @@ impl Engine {
         #[cfg(feature = "llama-ffi")]
         if let Some(ctx) = &self.ffi_context {
             return tokens.iter().map(|&t| ctx.token_to_piece(t as i32)).collect();
+        }
+        // Native fallback — use the GGUF tokenizer built from metadata.
+        if let Some(tok) = self.tokenizer_from_model() {
+            return tok.decode(tokens);
         }
         String::new()
     }

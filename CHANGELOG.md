@@ -5,7 +5,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [Unreleased] — 2026-07-24 (Phase 2 + anti-doom)
+## [Unreleased] — 2026-07-26 (leaf REPL + defaults-on + container)
+
+### Added — `leaf` chat REPL (rust/src/bin/leaf.rs)
+
+Ollama-style terminal chat for LeafcutterLLM. Streaming token output,
+auto-detects models in `./models` or `~/Downloads/models`, fuzzy name
+matching against `.gguf` filenames.
+
+- `leaf list` — list available GGUF models with sizes
+- `leaf run <name-or-path>` — start streaming chat session
+- `--temp`, `--top-p`, `--max-tokens` flags
+- In-session commands: `/bye`, `/clear`, `/temp <f>`, `/help`
+- `LEAF_MODELS_DIR` env var to override models directory
+- All engine optimizations carry through: prefetch, anti-doom, SIMD, mmap
+
+### Added — Engine::generate_streaming_with (engine.rs)
+
+Token-by-token streaming variant of `generate_native`. Closure callback
+`(token_id, decoded_str) -> bool` per token. Same anti-doom + prefetch
+wiring as the batch path. Used by `leaf` and available to any future
+streaming consumer.
+
+### Added — Native GGUF tokenizer for tokenize/decode (engine.rs)
+
+`Engine::tokenize` and `Engine::decode` now fall back to the built-in
+`GgufTokenizer` (from GGUF metadata) when the FFI path is unavailable.
+Previously they returned empty vecs without `llama-ffi`. The `leaf` REPL
+works without any llama.cpp dependency.
+
+### Added — BPE Ġ/Ċ → ASCII conversion in decode (tokenizer/gguf.rs)
+
+`GgufTokenizer::decode` now converts Ġ (U+0120) → space and Ċ (U+010A)
+→ newline, matching the standard BPE byte-encoding convention. Without
+this, streamed tokens print as `ĠHelloĠworld` instead of ` Hello world`.
+
+### Added — Dockerfile + GitHub Actions container workflow
+
+- `Dockerfile` — multi-stage build: `rust:1.97-slim` builder, `debian:bookworm-slim` runtime
+- `.github/workflows/container.yml` — auto-builds and pushes to `ghcr.io` on push to main
+- `.dockerignore` — keeps build context small
+- Container ships without models; mount at runtime: `-v ~/Downloads/models:/models`
+
+### Changed — Anti-doom default ON (anti_doom.rs)
+
+`is_enabled()` now returns true by default. Opt-out via `LEAFCUTTER_ANTIDOOM=0`.
+Same precedent as the prefetch flip (commit 0b1ec36).
+
+### Changed — Prefetch default ON (engine.rs, commit 0b1ec36)
+
+`LEAFCUTTER_PREFETCH` now defaults to true. Opt-out via `LEAFCUTTER_PREFETCH=0`.
+
+### Fixed — Anti-doom char boundary panic (anti_doom.rs)
+
+Byte-level fingerprint sampler now uses `is_char_boundary()` before slicing
+multi-byte BPE tokens (Ġ is 2 bytes). Previously panicked with
+"end byte index N is not a char boundary" when the fingerprint window
+landed inside a Ġ character.
+
+### Added — LEAFCUTTER_PROFILE_BLOCKS parse timing (loader.rs)
+
+Q4_K, Q5_K, and Q6_K tensor loading now prints `parse=Xms` alongside
+the existing `rows=`, `cols=`, `blocks=` info when
+`LEAFCUTTER_PROFILE_BLOCKS=1` is set. Previously only printed block
+counts without parse time.
+
+---
+
+## [Phase 2 + anti-doom] — 2026-07-24
 
 ### Added — Anti-doom loop detector (rust/src/inference/anti_doom.rs)
 
