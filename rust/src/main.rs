@@ -371,12 +371,23 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
             let parts: Vec<&str> = input.splitn(2, ' ').collect();
             match parts[0] {
                 "/bye" | "/quit" | "/exit" => {
-                    eprintln!("Goodbye!");
+                    // Explicit cleanup: clear conversation, drop caches
+                    conversation.clear();
+                    engine.kv_cache.clear();
+                    engine.ssm_cache.clear();
+                    engine.deltanet_cache.clear();
+                    engine.seq_offset = 0;
+                    eprintln!("[cache flushed] Goodbye!");
                     break;
                 }
                 "/clear" => {
                     conversation.clear();
-                    eprintln!("[context cleared]");
+                    // Clear engine internal caches so no stale KV/SSM state remains
+                    engine.kv_cache.clear();
+                    engine.ssm_cache.clear();
+                    engine.deltanet_cache.clear();
+                    engine.seq_offset = 0;
+                    eprintln!("[context cleared — cache flushed]");
                     continue;
                 }
                 "/help" => {
@@ -427,8 +438,9 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
         eprintln!();
         let _ = io::stdout().flush();
 
+        let gen_start = std::time::Instant::now();
         let mut generated_text = String::new();
-        let _ = engine.generate_streaming_with(
+        let generated_ids = engine.generate_streaming_with(
             &tokens,
             max_tokens,
             temp,
@@ -439,6 +451,25 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
                 generated_text.push_str(&chunk);
                 true
             },
+        );
+        let gen_elapsed = gen_start.elapsed();
+        let gen_tokens = generated_ids.len();
+        let tok_per_sec = if gen_tokens > 0 && gen_elapsed.as_secs_f64() > 0.0 {
+            gen_tokens as f64 / gen_elapsed.as_secs_f64()
+        } else { 0.0 };
+        eprintln!();
+
+        // Get peak RSS from /proc/self/status (Linux)
+        let peak_rss = get_peak_rss_mb();
+
+        // Stats line
+        eprintln!("─────────────────────────────────────────────────");
+        eprintln!("Model: {} | Tokens: {} | Time: {:.2}s | Speed: {:.2} tok/s | RAM: {}",
+            path.file_name().unwrap().to_string_lossy(),
+            gen_tokens,
+            gen_elapsed.as_secs_f64(),
+            tok_per_sec,
+            format_rss(peak_rss),
         );
         eprintln!();
         conversation.push(("assistant".into(), generated_text));
@@ -906,4 +937,38 @@ fn format_size(bytes: u64) -> String {
         unit_idx += 1;
     }
     format!("{:.2} {}", size, UNITS[unit_idx])
+}
+
+/// Get peak RSS in bytes from /proc/self/status (Linux only).
+/// Returns 0 on non-Linux or if /proc is unavailable.
+fn get_peak_rss_bytes() -> u64 {
+    // VmHWM is the peak resident set size ("high water mark")
+    if let Ok(contents) = std::fs::read_to_string("/proc/self/status") {
+        for line in contents.lines() {
+            if line.starts_with("VmHWM:") {
+                // Format: "VmHWM:\t   123 KB"
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<u64>() {
+                        return kb * 1024;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Get peak RSS, return as MB for display
+fn get_peak_rss_mb() -> u64 {
+    get_peak_rss_bytes() / (1024 * 1024)
+}
+
+/// Format RSS for the stats line — shows "123 MB" or "1.2 GB"
+fn format_rss(mb: u64) -> String {
+    if mb >= 1024 {
+        format!("{:.1} GB", mb as f64 / 1024.0)
+    } else {
+        format!("{} MB", mb)
+    }
 }

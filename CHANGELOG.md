@@ -5,6 +5,31 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-07-26 (stats line + cache cleanup on exit)
+
+### Added — Post-response stats line
+
+After each model response in the `leafcutter run` REPL, prints:
+```
+Model: Ministral-3-3B-Instruct-2512-Q4_K_M.gguf | Tokens: 15 | Time: 14.91s | Speed: 1.01 tok/s | RAM: 754 MB
+```
+- tokens/sec computed from actual generation
+- RAM measured from `/proc/self/status` VmHWM (peak RSS)
+- Makes Leafcutter a proper tech tool for benchmarking
+
+### Changed — /bye and /clear flush all caches
+
+`/bye` and `/clear` now explicitly clear:
+- conversation history
+- KV cache (`engine.kv_cache`)
+- SSM state cache (`engine.ssm_cache`)
+- DeltaNet state cache (`engine.deltanet_cache`)
+- sequence offset
+
+No accumulated cache or memory bloat between sessions.
+
+---
+
 ## [Unreleased] — 2026-07-26 (unified `leafcutter` CLI + one-line install)
 
 ### Changed — Merged `leaf` binary into `leafcutter` (main.rs)
