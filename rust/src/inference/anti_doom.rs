@@ -56,6 +56,13 @@ pub fn verify_repetition_at(
     if period < 1 || start_pos + period > text.len() {
         return None;
     }
+    // Ensure start_pos and start_pos + period are on char boundaries
+    if !text.is_char_boundary(start_pos) {
+        return None;
+    }
+    if !text.is_char_boundary(start_pos + period) {
+        return None;
+    }
 
     let pattern = &text[start_pos..start_pos + period];
 
@@ -87,7 +94,12 @@ pub fn verify_repetition_at(
         let snippet = if pattern.len() <= 100 {
             pattern.to_string()
         } else {
-            format!("{}...", &pattern[..100])
+            // Ensure char boundary for snippet
+            let mut snip_end = 100;
+            while snip_end < pattern.len() && !pattern.is_char_boundary(snip_end) {
+                snip_end += 1;
+            }
+            format!("{}...", &pattern[..snip_end])
         };
         Some(RepeatHit {
             start: actual_start,
@@ -130,17 +142,23 @@ pub fn find_inner_repetition(text: &str) -> Option<RepeatHit> {
     let n = text.len();
     let mut pos = 0;
     while pos + SAMPLE_LEN < n {
-        // Clamp to char boundary to avoid panicking on multi-byte
+        // Ensure pos is on a char boundary
+        while pos < n && !text.is_char_boundary(pos) {
+            pos += 1;
+        }
+        if pos + SAMPLE_LEN >= n {
+            break;
+        }
+
+        // Clamp end to char boundary to avoid panicking on multi-byte
         // BPE tokens (e.g. Ġ = U+0120 is 2 bytes).
-        let end = match text.is_char_boundary(pos + SAMPLE_LEN) {
-            true => pos + SAMPLE_LEN,
-            false => {
-                // Skip ahead to the next char boundary.
-                let next = pos + SAMPLE_LEN + 1;
-                if next >= n { break; }
-                next
-            }
-        };
+        let mut end = pos + SAMPLE_LEN;
+        while end < n && !text.is_char_boundary(end) {
+            end += 1;
+        }
+        if end >= n {
+            break;
+        }
         let fingerprint = &text[pos..end];
 
         // Ensure the search start is on a char boundary

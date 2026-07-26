@@ -534,11 +534,10 @@ impl Engine {
                     if let Some(intervention) = state.detect(&vocab) {
                         if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
                             eprintln!(
-                                "[ANTIDOOM] step={} period={} repeats={} prefix=\"{}\" suppress={}",
+                                "[ANTIDOOM] step={} period={} repeats={} suppress={}",
                                 state.interventions(),
                                 intervention.hit.period,
                                 intervention.hit.repeats,
-                                intervention.next_prefix,
                                 intervention.suppress_ids.len()
                             );
                         }
@@ -650,16 +649,16 @@ impl Engine {
 
             if let Some(state) = anti_doom.as_mut() {
                 if let Some(vocab) = self.cached_tokenizer_vocab() {
-                    if let Some(intervention) = state.detect(&vocab) {
+                    // Wrap detection in catch_unwind as a safety net against
+                    // any remaining char-boundary panics on malformed UTF-8.
+                    let intervention = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        state.detect(&vocab)
+                    }));
+                    if let Ok(Some(intervention)) = intervention {
                         if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
-                            eprintln!(
-                                "[ANTIDOOM] step={} period={} repeats={} prefix=\"{}\" suppress={}",
-                                state.interventions(),
-                                intervention.hit.period,
-                                intervention.hit.repeats,
-                                intervention.next_prefix,
-                                intervention.suppress_ids.len()
-                            );
+                            eprintln!("鉴 ANTIDOOM] step={} period={} repeats={} suppress={}",
+                                state.interventions(), intervention.hit.period,
+                                intervention.hit.repeats, intervention.suppress_ids.len());
                         }
                         crate::inference::anti_doom::suppress_in_logits(
                             &mut logits,
