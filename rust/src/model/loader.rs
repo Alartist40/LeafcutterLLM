@@ -426,8 +426,11 @@ impl GGUFModel {
             };
             let shape_data: Vec<usize> = if keep_shape_3d {
                 vec![kernel_rows, kernel_cols]
-            } else {
+            } else if is_2d {
                 vec![shape_gguf[1], shape_gguf[0]]
+            } else {
+                // 1-D (or >3-D) — use the kernel rows/cols already computed.
+                vec![kernel_rows, kernel_cols]
             };
 
             let (mut tensor, needs_transpose) = match qtype {
