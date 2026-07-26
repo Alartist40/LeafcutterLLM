@@ -277,10 +277,18 @@ fn find_model(name: &str) -> Option<PathBuf> {
     if p.exists() && p.extension().and_then(|s| s.to_str()) == Some("gguf") {
         return Some(p);
     }
-    // Scan models dir, fuzzy match
+    // Scan models dir
     let dir = resolve_models_dir();
-    let needle = name.to_lowercase();
     let models = scan_models(&dir);
+
+    // Index number (e.g. "0", "1", "2")
+    if let Ok(idx) = name.parse::<usize>() {
+        if idx < models.len() {
+            return Some(models[idx].0.clone());
+        }
+    }
+
+    let needle = name.to_lowercase();
     // Exact match first
     for (path, _) in &models {
         if path.file_name().unwrap().to_str().unwrap().to_lowercase() == needle {

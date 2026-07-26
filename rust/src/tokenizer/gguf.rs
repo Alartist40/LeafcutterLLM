@@ -69,13 +69,11 @@ impl GgufTokenizer {
         }
     }
 
-    /// Greedy longest-match tokenization.
+    /// Encode text to token IDs using GPT-2 byte mapping + greedy longest-match.
     ///
-    /// Tries the longest possible prefix at each position. Falls back to
-    /// byte-level encoding when no vocab token matches.
-    ///
-    /// Whitespace is preserved as-is (unlike `split_whitespace` approaches
-    /// that collapse all runs of whitespace to a single boundary).
+    /// Each byte of the input is first converted to its GPT-2-mapped Unicode
+    /// char (space → Ġ, newline → Ċ, other non-printable → chr(byte + 256)),
+    /// then greedy longest-match is applied against the vocab.
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<usize> {
         let mut tokens = Vec::new();
 
@@ -85,7 +83,26 @@ impl GgufTokenizer {
             }
         }
 
-        let mut remaining = text;
+        if text.is_empty() {
+            return tokens;
+        }
+
+        // Convert input bytes to GPT-2-mapped Unicode chars.
+        // GPT-2 byte-to-unicode: printable ASCII (33-126) stays as-is,
+        // everything else (0-32, 127-255) → chr(byte + 256).
+        // So space (0x20) → chr(288) = 'Ġ', newline (0x0A) → chr(266) = 'Ċ'.
+        let mut converted = String::with_capacity(text.len() * 2);
+        for &byte in text.as_bytes() {
+            let c = if byte >= 33 && byte <= 126 {
+                byte as char
+            } else {
+                char::from_u32(byte as u32 + 256).unwrap_or(byte as char)
+            };
+            converted.push(c);
+        }
+
+        // Greedy longest-match on the converted string
+        let mut remaining = &converted[..];
 
         while !remaining.is_empty() {
             let mut matched = false;
@@ -93,7 +110,6 @@ impl GgufTokenizer {
             // Try longest match first (up to 64 chars or remaining len)
             let max_len = remaining.len().min(64);
             for len in (1..=max_len).rev() {
-                // Safe slicing: iterate to char boundary
                 if let Some(prefix) = remaining.get(..len) {
                     if let Some(&id) = self.token_to_id.get(prefix) {
                         tokens.push(id);
@@ -105,25 +121,30 @@ impl GgufTokenizer {
             }
 
             if !matched {
-                // Character-level fallback: emit one byte at a time using
-                // the byte-token convention `<0xXX>`.  This preserves
-                // whitespace as a real byte instead of silently dropping it.
-                let bytes = remaining.as_bytes();
-                let first_byte = bytes[0];
-                let byte_token = format!("<0x{:02X}>", first_byte);
-                let step = if let Some(first_char) = remaining.chars().next() {
-                    first_char.len_utf8()
+                // Fallback: emit a single char (it's a GPT-2 mapped char or ASCII)
+                if let Some(first_char) = remaining.chars().next() {
+                    let char_str = first_char.to_string();
+                    if let Some(&id) = self.token_to_id.get(&char_str) {
+                        tokens.push(id);
+                    } else {
+                        // Last-resort: find the byte token for this char's underlying byte
+                        let byte = if first_char as u32 >= 256 {
+                            (first_char as u32 - 256) as u8
+                        } else {
+                            first_char as u8
+                        };
+                        let byte_token = format!("<0x{:02X}>", byte);
+                        if let Some(&id) = self.token_to_id.get(&byte_token) {
+                            tokens.push(id);
+                        } else {
+                            // Absolute last resort
+                            tokens.push(byte as usize);
+                        }
+                    }
+                    remaining = &remaining[first_char.len_utf8()..];
                 } else {
-                    1
-                };
-                if let Some(&id) = self.token_to_id.get(&byte_token) {
-                    tokens.push(id);
-                } else {
-                    // Last-resort: emit raw byte value as a token id.
-                    // This is non-standard but ensures we never panic.
-                    tokens.push(first_byte as usize);
+                    break;
                 }
-                remaining = &remaining[step..];
             }
         }
 
@@ -133,9 +154,12 @@ impl GgufTokenizer {
     /// Decode token IDs back to a string.
     ///
     /// Handles byte tokens (`<0xXX>`) and skips other special tokens.
-    /// Converts BPE space convention: Ġ (U+0120) → space, Ċ (U+010A) → newline.
+    /// Reverses the GPT-2 byte-to-unicode mapping: chars in 0x100-0x1FF are
+    /// converted back to their original bytes (Ġ U+0120 → 0x20 space, etc.).
+    /// All output is accumulated as raw bytes then decoded as UTF-8 (lossy).
     pub fn decode(&self, tokens: &[usize]) -> String {
-        let mut result = String::new();
+        let mut bytes: Vec<u8> = Vec::new();
+
         for &id in tokens {
             if id >= self.vocab.len() {
                 continue;
@@ -143,16 +167,10 @@ impl GgufTokenizer {
             let piece = &self.vocab[id];
 
             // Byte token: <0xXX>
-            if piece.starts_with("<0x") && piece.len() == 6 && piece.ends_with(">") {
+            if piece.starts_with("<0x") && piece.len() == 6 && piece.ends_with('>') {
                 if let Ok(byte) = u8::from_str_radix(&piece[3..5], 16) {
-                    result.push(byte as char);
+                    bytes.push(byte);
                 }
-                continue;
-            }
-
-            // Known newline byte token used by Llama
-            if piece == "<0x0A>" {
-                result.push('\n');
                 continue;
             }
 
@@ -161,18 +179,29 @@ impl GgufTokenizer {
                 continue;
             }
 
-            // Convert BPE control chars to their ASCII equivalents.
-            // Ġ (U+0120) = space,  Ċ (U+010A) = newline,  Š (U+0160) = backslash
-            if piece.contains('Ġ') || piece.contains('Ċ') {
-                let cleaned = piece
-                    .replace('Ġ', " ")
-                    .replace('Ċ', "\n");
-                result.push_str(&cleaned);
-            } else {
-                result.push_str(piece);
+            // Reverse GPT-2 byte-to-unicode mapping for each char in the piece.
+            // GPT-2 maps: printable ASCII (33-126) stays as-is,
+            // everything else (0-32, 127-255) → chr(byte + 256).
+            // So chars >= 0x100 need to be reversed: byte = codepoint - 256.
+            // Chars < 0x100 are the raw byte value directly.
+            for c in piece.chars() {
+                let cp = c as u32;
+                if cp >= 0x100 && cp <= 0x1FF {
+                    // GPT-2 mapped byte
+                    bytes.push((cp - 256) as u8);
+                } else if cp <= 0xFF {
+                    // Raw byte stored as Unicode codepoint
+                    bytes.push(cp as u8);
+                } else {
+                    // Regular Unicode char — encode as UTF-8
+                    let mut buf = [0u8; 4];
+                    let s = c.encode_utf8(&mut buf);
+                    bytes.extend_from_slice(s.as_bytes());
+                }
             }
         }
-        result
+
+        String::from_utf8_lossy(&bytes).to_string()
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -343,10 +372,9 @@ impl GgufBpeTokenizer {
     }
 
     /// Decode token IDs back to text.
-    /// Handles BPE space markers (Ġ → literal space) and newline markers (Ċ → \n).
+    /// Reverses GPT-2 byte-to-unicode mapping, accumulates as raw bytes, decodes as UTF-8.
     pub fn decode(&self, tokens: &[usize]) -> String {
-        let mut result = String::new();
-        let space_marker = '\u{0120}';
+        let mut bytes: Vec<u8> = Vec::new();
 
         for &token_id in tokens {
             // Skip special tokens
@@ -358,12 +386,12 @@ impl GgufBpeTokenizer {
                 // Skip other special tokens
                 if token_str.starts_with('<') && token_str.ends_with('>') {
                     if token_str == "<0x0A>" {
-                        result.push('\n');
+                        bytes.push(b'\n');
                         continue;
                     }
                     if token_str.starts_with("<0x") {
                         if let Ok(byte) = u8::from_str_radix(&token_str[3..token_str.len()-1], 16) {
-                            result.push(byte as char);
+                            bytes.push(byte);
                         }
                         continue;
                     }
@@ -373,18 +401,23 @@ impl GgufBpeTokenizer {
                     }
                 }
 
-                if token_str.starts_with(space_marker) {
-                    // Ġ prefix → add space before
-                    result.push(' ');
-                    result.push_str(&token_str[space_marker.len_utf8()..]);
-                } else {
-                    // Replace BPE newline markers (Ċ = U+010A = byte 0x0A)
-                    let cleaned = token_str.replace('\u{010A}', "\n");
-                    result.push_str(&cleaned);
+                // Reverse GPT-2 byte-to-unicode mapping for each char
+                for c in token_str.chars() {
+                    let cp = c as u32;
+                    if cp >= 0x100 && cp <= 0x1FF {
+                        bytes.push((cp - 256) as u8);
+                    } else if cp <= 0xFF {
+                        bytes.push(cp as u8);
+                    } else {
+                        let mut buf = [0u8; 4];
+                        let s = c.encode_utf8(&mut buf);
+                        bytes.extend_from_slice(s.as_bytes());
+                    }
                 }
             }
         }
-        result
+
+        String::from_utf8_lossy(&bytes).to_string()
     }
 }
 
@@ -394,17 +427,18 @@ mod tests {
 
     #[test]
     fn test_basic_tokenize() {
+        // Vocab entries use GPT-2 byte mapping: space → Ġ (U+0120)
         let vocab = vec![
             "<s>".to_string(),
             "</s>".to_string(),
             "The".to_string(),
-            " cat".to_string(),
-            " sat".to_string(),
-            " on".to_string(),
-            " the".to_string(),
-            " mat".to_string(),
+            "Ġcat".to_string(),   // " cat" → Ġcat
+            "Ġsat".to_string(),   // " sat" → Ġsat
+            "Ġon".to_string(),    // " on" → Ġon
+            "Ġthe".to_string(),   // " the" → Ġthe
+            "Ġmat".to_string(),   // " mat" → Ġmat
             ".".to_string(),
-            " T".to_string(),
+            "ĠT".to_string(),
             "h".to_string(),
             "e".to_string(),
         ];
@@ -412,22 +446,23 @@ mod tests {
         let ids = tok.encode("The cat sat.", true);
         assert_eq!(ids[0], 0); // <s>
         assert_eq!(ids[1], 2); // The
-        assert_eq!(ids[2], 3); // " cat"
-        assert_eq!(ids[3], 4); // " sat"
+        assert_eq!(ids[2], 3); // "Ġcat" (was " cat")
+        assert_eq!(ids[3], 4); // "Ġsat" (was " sat")
         assert_eq!(ids[4], 8); // "."
     }
 
     #[test]
     fn test_decode() {
+        // Vocab entries use GPT-2 byte mapping: space → Ġ (U+0120)
         let vocab = vec![
             "<s>".to_string(),
             "</s>".to_string(),
             "The".to_string(),
-            " cat".to_string(),
+            "Ġcat".to_string(),   // " cat" → Ġcat
         ];
         let tok = GgufTokenizer::from_vocab(vocab);
         let text = tok.decode(&[0, 2, 3]);
-        assert_eq!(text, "The cat");
+        assert_eq!(text, "The cat");  // Ġ → space in decode
     }
 
     #[test]
