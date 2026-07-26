@@ -143,9 +143,20 @@ pub fn find_inner_repetition(text: &str) -> Option<RepeatHit> {
         };
         let fingerprint = &text[pos..end];
 
+        // Ensure the search start is on a char boundary
+        let search_start = pos + SAMPLE_LEN;
+        let search_start = {
+            let mut s = search_start;
+            while s < n && !text.is_char_boundary(s) {
+                s += 1;
+            }
+            s
+        };
+        if search_start >= n { pos += SAMPLE_LEN.max(1); continue; }
+
         // Forward search
-        if let Some(other_pos) = text[pos + SAMPLE_LEN..].find(fingerprint) {
-            let absolute_other = pos + SAMPLE_LEN + other_pos;
+        if let Some(other_pos) = text[search_start..].find(fingerprint) {
+            let absolute_other = search_start + other_pos;
             let candidate_period = absolute_other - pos;
             if (MIN_PERIOD..=MAX_PERIOD).contains(&candidate_period) {
                 if let Some(hit) =
@@ -157,7 +168,7 @@ pub fn find_inner_repetition(text: &str) -> Option<RepeatHit> {
         }
 
         // Backward search
-        if pos > 0 {
+        if pos > 0 && text.is_char_boundary(pos) {
             if let Some(other_pos) = text[..pos].rfind(fingerprint) {
                 let candidate_period = pos - other_pos;
                 if (MIN_PERIOD..=MAX_PERIOD).contains(&candidate_period) {
@@ -174,7 +185,12 @@ pub fn find_inner_repetition(text: &str) -> Option<RepeatHit> {
             }
         }
 
-        pos += SAMPLE_INTERVAL;
+        // Advance to next sample position on a char boundary
+        let mut next_pos = pos + SAMPLE_INTERVAL;
+        while next_pos < n && !text.is_char_boundary(next_pos) {
+            next_pos += 1;
+        }
+        pos = next_pos;
     }
 
     None

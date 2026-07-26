@@ -1,6 +1,5 @@
 //! LeafcutterLLM — Memory-safe LLM inference engine
 
-#[cfg(feature = "llama-ffi")]
 pub mod api;
 pub mod backend;
 pub mod bridge;

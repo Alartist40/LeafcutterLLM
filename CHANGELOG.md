@@ -5,6 +5,49 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-07-26 (unified `leafcutter` CLI + one-line install)
+
+### Changed — Merged `leaf` binary into `leafcutter` (main.rs)
+
+The standalone `leaf.rs` binary is gone. All functionality is now in the
+unified `leafcutter` binary (main.rs). One command, like `ollama`:
+
+- `leafcutter list` — list available GGUF models (auto-detects dir)
+- `leafcutter run <model>` — streaming chat REPL (native, no FFI needed)
+- `leafcutter serve` — HTTP API server (OpenAI-compatible, for integration)
+- `leafcutter generate` — one-shot generation
+- `leafcutter chat` — interactive chat (FFI)
+- `leafcutter help` — show all commands
+
+### Added — One-line install (install.sh)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Alartist40/LeafcutterLLM/main/install.sh | sh
+```
+
+Clones, builds, installs `leafcutter` to `/usr/local/bin` (or `~/.local/bin`).
+
+### Added — `serve` subcommand works without FFI
+
+`api` module is no longer gated behind `llama-ffi`. `NativeStreamingEngine`
+and `run_server` work with pure Rust. Only `FfiEngine` requires the feature.
+
+### Fixed — Anti-doom char boundary panics (round 2)
+
+Three more char-boundary bugs in `anti_doom.rs::find_inner_repetition`:
+- Forward search start (`pos + SAMPLE_LEN`) could land inside a multi-byte
+  char — now advances to next char boundary before slicing.
+- Backward search `text[..pos]` could slice at a non-boundary — now guarded
+  with `is_char_boundary(pos)`.
+- Loop increment `pos + SAMPLE_INTERVAL` could also land inside a char —
+  now advances to next boundary.
+
+### Removed — `rust/src/bin/leaf.rs`
+
+Merged into `main.rs`. No separate binary needed.
+
+---
+
 ## [Unreleased] — 2026-07-26 (leaf REPL + defaults-on + container)
 
 ### Added — `leaf` chat REPL (rust/src/bin/leaf.rs)

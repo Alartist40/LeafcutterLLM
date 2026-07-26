@@ -136,26 +136,62 @@ See [`CYNAPSE_INTEGRATION.md`](CYNAPSE_INTEGRATION.md) for full details.
 
 ## Quick Start
 
-### 1. Build the server
+### One-line install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Alartist40/LeafcutterLLM/main/install.sh | sh
+```
+
+This clones the repo, builds the `leafcutter` binary, and installs it to `/usr/local/bin` (or `~/.local/bin` as fallback). After that, `leafcutter` is available system-wide.
+
+### Using Leafcutter
+
+```bash
+# List available models (leaves) — auto-detects ./models or ~/Downloads/models
+leafcutter list
+
+# Start chatting (Ollama-style, streaming token output)
+leafcutter run Ministral-3-3B
+leafcutter run Llama-70B --temp 0.7 --max-tokens 200
+
+# Or pass a direct path
+leafcutter run /path/to/model.gguf
+
+# Start HTTP API server (OpenAI-compatible — for Cynapse/Hermes/OpenCode integration)
+leafcutter serve --model /path/to/model.gguf --port 8081
+```
+
+In the chat REPL:
+- Type normally, press Enter to send
+- `/bye` or `/quit` to exit
+- `/clear` to reset conversation context
+- `/temp 0.5` to change temperature mid-session
+- `/help` for all commands
+
+Put your `.gguf` models in `./models/` or `~/Downloads/models/`, or set `LEAF_MODELS_DIR=/path/to/models`.
+
+All engine optimizations carry through: async layer prefetch (default ON), anti-doom loop detection (default ON), zero-copy mmap, SIMD matmul.
+
+### Building from source
+
+If you prefer to build manually:
 
 **Pure native (no llama.cpp FFI):**
 ```bash
-cd rust
-cargo build --release
+git clone https://github.com/Alartist40/LeafcutterLLM.git
+cd LeafcutterLLM/rust
+cargo build --release --no-default-features --bin leafcutter
+# Binary at target/release/leafcutter
 ```
 
 **With llama.cpp FFI (for Qwen3.5/3.6 and auto-fallback support):**
 ```bash
 export LLAMA_CPP_BUILD=/path/to/llama.cpp/build
-cd rust
+cd LeafcutterLLM/rust
 cargo build --release --features llama-ffi
 ```
 
-The `llama-ffi` feature links against `libllama.so` and enables the dual-backend engine. Without it, only native Rust inference is available.
-
 > **Do I need llama.cpp?** No — for most models you don't. The native Rust path is fully self-contained and works without any external dependencies. You only need llama.cpp if you want to run Qwen3.5/3.6 or models with unsupported quantization formats.
-
-### What Works Without llama.cpp (Native Rust Only)
 
 | Model Family | Examples | Status |
 |-------------|----------|--------|
@@ -168,56 +204,6 @@ The `llama-ffi` feature links against `libllama.so` and enables the dual-backend
 | **Qwen3.5/3.6** | Qwen3.5-0.8B through 27B | ❌ Requires FFI |
 | **DeepSeek** | DeepSeek-V3 | ❌ Requires FFI |
 | **Exotic quants** | IQ1_M, Q2_K, etc. | ❌ Requires FFI |
-
-### 2. Download a model
-Download any GGUF or Safetensors model and place it in the `models/` directory. See `models/README.md` for recommendations.
-
-### 3. Run with Auto-Detection
-```bash
-# Native only
-./target/release/leafcutter server
-
-# With FFI fallback
-LD_LIBRARY_PATH=$LLAMA_CPP_BUILD/bin ./target/release/leafcutter server
-```
-LeafcutterLLM will automatically detect your model's architecture, check quantization compatibility, and route to the appropriate backend (native or FFI).
-
-### 3b. Chat in the terminal (Ollama-style `leaf` REPL)
-
-The `leaf` binary is a streaming chat REPL — like `ollama run`:
-```bash
-# Build it
-cd rust && cargo build --release --no-default-features --bin leaf
-
-# List models in ./models or ~/Downloads/models
-./target/release/leaf list
-
-# Start chatting (model name is a fuzzy match against .gguf filenames)
-./target/release/leaf run Ministral-3-3B
-./target/release/leaf run Llama-70B --temp 0.7 --max-tokens 200
-
-# Or pass a direct path
-./target/release/leaf run /path/to/model.gguf
-```
-
-In the REPL:
-- Type normally, press Enter to send
-- `/bye` or `/quit` to exit
-- `/clear` to reset conversation context
-- `/temp 0.5` to change temperature mid-session
-- `/help` for all commands
-
-Set `LEAF_MODELS_DIR` to override the models directory (default: `./models`, then `~/Downloads/models`).
-
-All engine optimizations carry through: async layer prefetch, anti-doom loop detection, zero-copy mmap, SIMD matmul.
-
-### 4. Check Compatibility Only
-```bash
-./leafcutter --check-only
-```
-See the **LeafcutterLLM Advantage** report showing how much RAM we save you.
-
-### Automated Testing
 
 LeafcutterLLM includes a comprehensive progressive testing framework to validate performance across different model sizes.
 

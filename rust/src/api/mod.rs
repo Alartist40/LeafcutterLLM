@@ -1,8 +1,6 @@
 //! HTTP API server using Axum — Direct llama.cpp FFI backend OR Native Streaming
 //!
-//! Only compiled when the `llama-ffi` feature is enabled.
-
-#![cfg(feature = "llama-ffi")]
+//! Native Streaming works without any FFI. FfiEngine requires llama-ffi.
 
 use axum::{
     middleware,
@@ -16,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Instant;
 
+#[cfg(feature = "llama-ffi")]
 use crate::llama_ffi::{backend_init, LlamaModel, LlamaContext};
 use crate::inference::engine::Engine as NativeEngine;
 use crate::tokenizer::GgufBpeTokenizer;
@@ -108,12 +107,14 @@ pub trait LeafcutterEngine: Send + Sync {
 // FFI Engine (Standard llama.cpp behavior)
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "llama-ffi")]
 pub struct FfiEngine {
     model: LlamaModel,
     ctx_size: u32,
     threads: i32,
 }
 
+#[cfg(feature = "llama-ffi")]
 impl FfiEngine {
     pub fn load(path: &str) -> Result<Self, String> {
         backend_init();
@@ -126,6 +127,7 @@ impl FfiEngine {
     }
 }
 
+#[cfg(feature = "llama-ffi")]
 impl LeafcutterEngine for FfiEngine {
     fn name(&self) -> &str { "llama-ffi" }
     fn max_seq_len(&self) -> usize {
