@@ -50,15 +50,19 @@ pub fn deltanet_forward(
 ) -> Tensor {
     let seq_len = hidden_states.shape[0];
     let hidden_size = hidden_states.shape[1];
-
     // 1. attn_qkv projection: hidden → [Q, K, V]
-    let qkv_weight = weights.get("self_attn.qkv_proj.weight")
+    let qkv_weight = weights
+        .get("self_attn.qkv_proj.weight")
         .or_else(|| weights.get("attn_qkv.weight"))
         .expect("DeltaNet requires attn_qkv.weight");
     let qkv_proj = hidden_states.matmul(qkv_weight);
-    eprintln!("  [deltanet] qkv_proj max={:.4} mean_abs={:.4}", 
-        qkv_proj.data.iter().cloned().fold(0.0f32, f32::max),
-        qkv_proj.data.iter().map(|x| x.abs()).sum::<f32>() / qkv_proj.data.len() as f32);
+    if std::env::var("LEAFCUTTER_DELTANET_DEBUG").is_ok() {
+        eprintln!(
+            "  [deltanet] qkv_proj max={:.4} mean_abs={:.4}",
+            qkv_proj.data.iter().cloned().fold(0.0f32, f32::max),
+            qkv_proj.data.iter().map(|x| x.abs()).sum::<f32>() / qkv_proj.data.len() as f32
+        );
+    }
     assert_eq!(
         qkv_proj.shape[1], params.conv_dim,
         "attn_qkv output dim {} != expected conv_dim {}",
@@ -80,10 +84,13 @@ pub fn deltanet_forward(
     } else {
         qkv_proj.clone()
     };
-
-    eprintln!("  [deltanet] conv_out max={:.4} mean_abs={:.4}",
-        conv_out.data.iter().cloned().fold(0.0f32, f32::max),
-        conv_out.data.iter().map(|x| x.abs()).sum::<f32>() / conv_out.data.len() as f32);
+    if std::env::var("LEAFCUTTER_DELTANET_DEBUG").is_ok() {
+        eprintln!(
+            "  [deltanet] conv_out max={:.4} mean_abs={:.4}",
+            conv_out.data.iter().cloned().fold(0.0f32, f32::max),
+            conv_out.data.iter().map(|x| x.abs()).sum::<f32>() / conv_out.data.len() as f32
+        );
+    }
     // 3. Split conv output into Q, K, V
     let q_total = params.num_qk_heads * params.head_k_dim;
     let k_total = params.num_qk_heads * params.head_k_dim;
@@ -116,12 +123,14 @@ pub fn deltanet_forward(
     for val in q.data.iter_mut() {
         *val *= scale;
     }
-
-    eprintln!("  [deltanet] q_max={:.4} k_max={:.4} v_max={:.4}",
-        q.data.iter().cloned().fold(0.0f32, f32::max),
-        k.data.iter().cloned().fold(0.0f32, f32::max),
-        v.data.iter().cloned().fold(0.0f32, f32::max));
-    // 5. Per-head decay rates: decay = exp( softplus(alpha + dt_bias) * ssm_a )
+    if std::env::var("LEAFCUTTER_DELTANET_DEBUG").is_ok() {
+        eprintln!(
+            "  [deltanet] q_max={:.4} k_max={:.4} v_max={:.4}",
+            q.data.iter().cloned().fold(0.0f32, f32::max),
+            k.data.iter().cloned().fold(0.0f32, f32::max),
+            v.data.iter().cloned().fold(0.0f32, f32::max)
+        );
+    }
     let decay = compute_decay_rates(hidden_states, weights, params, seq_len);
     // decay shape: [seq_len, num_qk_heads]
 

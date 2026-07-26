@@ -37,7 +37,7 @@ impl ModelArchitecture {
                 "llama"    => ModelArchitecture::Llama,
                 "qwen2" | "qwen3" => ModelArchitecture::Qwen2,
                 "qwen35"   => ModelArchitecture::Qwen35,
-                "qwen36"   => ModelArchitecture::Qwen36,
+                "qwen35moe" | "qwen36" | "ornith" => ModelArchitecture::Qwen36,
                 "mistral"  => ModelArchitecture::Mistral,
                 "mistral3" => ModelArchitecture::Mistral,
                 "phi" | "phi3" | "phi4" => ModelArchitecture::Phi,

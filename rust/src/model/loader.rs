@@ -88,29 +88,83 @@ impl GGUFModel {
             for (gguf_suffix, _engine_name) in mappings.iter() {
                 let name = format!("{}.{}", prefix, gguf_suffix);
                 if self.file.get_tensor_info(&name).is_none() {
-                    // For hybrid models, don't flag missing attention tensors on SSM layers
-                    if self.architecture == ModelArchitecture::Qwen35 {
-                        if has_ssm && (gguf_suffix.starts_with("attn_q.weight")
-                            || gguf_suffix.starts_with("attn_k.weight")
-                            || gguf_suffix.starts_with("attn_v.weight")
-                            || gguf_suffix.starts_with("attn_output.weight")
-                            || gguf_suffix.starts_with("attn_q_norm")
-                            || gguf_suffix.starts_with("attn_k_norm")) {
+                    // For hybrid architectures (Qwen3.5/3.6), each layer is
+                    // EITHER full-attention OR DeltaNet/SSM.  Don't flag
+                    // missing tensors that legitimately don't exist on a
+                    // different layer type.
+                    if matches!(
+                        self.architecture,
+                        ModelArchitecture::Qwen35 | ModelArchitecture::Qwen36
+                    ) {
+                        // DeltaNet/SSM layers lack separate Q/K/V/O projections
+                        if has_ssm
+                            && (gguf_suffix.starts_with("attn_q.weight")
+                                || gguf_suffix.starts_with("attn_k.weight")
+                                || gguf_suffix.starts_with("attn_v.weight")
+                                || gguf_suffix.starts_with("attn_output.weight")
+                                || gguf_suffix.starts_with("attn_q_norm")
+                                || gguf_suffix.starts_with("attn_k_norm"))
+                        {
                             continue;
                         }
-                        if has_separate_attn && (*gguf_suffix == "attn_qkv.weight"
-                            || *gguf_suffix == "attn_gate.weight") {
+                        // Full-attention layers lack the fused QKV (and use
+                        // separate post_attention_norm instead)
+                        if has_separate_attn
+                            && (*gguf_suffix == "attn_qkv.weight"
+                                || *gguf_suffix == "attn_gate.weight")
+                        {
                             continue;
                         }
+                        // Full-attention layers lack SSM-related tensors
+                        if has_separate_attn && gguf_suffix.starts_with("ssm_") {
+                            continue;
+                        }
+                        // ssm_a may not have .weight suffix
                         if has_ssm && *gguf_suffix == "ssm_a" {
-                            // ssm_a may not have .weight suffix; check with just prefix
-                            if self.file.get_tensor_info(&format!("{}.ssm_a", prefix)).is_some() {
+                            if self
+                                .file
+                                .get_tensor_info(&format!("{}.ssm_a", prefix))
+                                .is_some()
+                            {
                                 continue;
                             }
                         }
-                        // SSM tensors are optional on attention layers
-                        if has_separate_attn && gguf_suffix.starts_with("ssm_") {
-                            continue;
+                        // Qwen3.6 MoE layers lack the dense ffn_* projections
+                        // (they use ffn_*_exps for routed experts instead)
+                        if self.architecture == ModelArchitecture::Qwen36 {
+                            let is_moe_layer = self
+                                .file
+                                .get_tensor_info(&format!("{}.ffn_gate_inp.weight", prefix))
+                                .is_some()
+                                || self
+                                    .file
+                                    .get_tensor_info(&format!("{}.ffn_gate_exps.weight", prefix))
+                                    .is_some();
+                            if is_moe_layer
+                                && (*gguf_suffix == "ffn_gate.weight"
+                                    || *gguf_suffix == "ffn_up.weight"
+                                    || *gguf_suffix == "ffn_down.weight"
+                                    || *gguf_suffix == "ffn_norm.weight")
+                            {
+                                continue;
+                            }
+                            // Dense attention layers lack the expert tensors
+                            let is_dense_layer = self
+                                .file
+                                .get_tensor_info(&format!("{}.ffn_gate.weight", prefix))
+                                .is_some();
+                            if is_dense_layer && gguf_suffix.contains("_exps") {
+                                continue;
+                            }
+                            // shared expert gates are optional
+                            if gguf_suffix.contains("shexp")
+                                || *gguf_suffix == "ffn_state.weight"
+                                || *gguf_suffix == "ssm_state.weight"
+                                || *gguf_suffix == "ssm_gate.weight"
+                                || *gguf_suffix == "ffn_norm.weight"
+                            {
+                                continue;
+                            }
                         }
                     }
                     missing.push(name);
@@ -328,6 +382,7 @@ impl GGUFModel {
                             | "ssm_a" | "ssm_state.weight" | "ssm_gate.weight"
                             | "attn_q_norm.weight" | "attn_k_norm.weight" | "attn_v_norm.weight"
                             | "attn_q.weight" | "attn_k.weight" | "attn_v.weight"
+                            | "attn_output.weight" // absent on DeltaNet layers
                             | "attn_qkv.weight" | "attn_gate.weight"
                             | "ffn_gate.weight" | "ffn_up.weight" | "ffn_down.weight"
                             | "ffn_gate_inp.weight" | "ffn_gate_exps.weight"
