@@ -258,13 +258,15 @@ pub fn slice_experts(
     //       loader or engine pre-sliced).  Pass through unchanged.
     if let Some(parent) = weights_in.get(src_engine_name) {
         if parent.shape.len() == 3 {
-            // [out_dim, in_dim, num_experts]
+            // [out_dim, in_dim, num_experts] — the loader permutes 3-D GGUF
+            // expert tensors (stored as `[E, O, I]`) into this `[O, I, E]`
+            // layout before passing in, so the original simple indexing
+            // works.  Each expert e is a [O, I] slice with index
+            // `o * (I*E) + i * E + e` (row-major over the O and I axes, with
+            // E being the contiguous innermost stride).
             let num_experts = parent.shape[2];
             let out_dim = parent.shape[0];
             let in_dim = parent.shape[1];
-            // Cache the flat data inside one tall linear access — the
-            // underlying data is f32 (post-dequant) for plain-decoder
-            // tensors, so this is a simple Vec copy.
             for e in 0..num_experts {
                 let mut sub = Vec::with_capacity(out_dim * in_dim);
                 for o in 0..out_dim {
@@ -274,10 +276,7 @@ pub fn slice_experts(
                     }
                 }
                 let key = format!("{}.{}", moe_q_name, e);
-                weights_out.insert(
-                    key,
-                    Tensor::from_vec(sub, vec![out_dim, in_dim]),
-                );
+                weights_out.insert(key, Tensor::from_vec(sub, vec![out_dim, in_dim]));
             }
         } else if parent.shape.len() == 2 {
             // Treat the 2-D tensor as a single-expert "wrap".

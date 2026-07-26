@@ -79,7 +79,7 @@ impl ModelArchitecture {
             ModelArchitecture::Llama   => "llama",
             ModelArchitecture::Qwen2   => "qwen2",
             ModelArchitecture::Qwen35  => "qwen35",
-            ModelArchitecture::Qwen36  => "qwen36",
+            ModelArchitecture::Qwen36  => "qwen35moe",
             ModelArchitecture::Mistral => "llama", // Mistral uses llama.* keys
             ModelArchitecture::Phi     => "phi",
             ModelArchitecture::Gemma   => "gemma",

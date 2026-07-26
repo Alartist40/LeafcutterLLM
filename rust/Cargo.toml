@@ -106,6 +106,10 @@ name = "test_deltanet_accumulation"
 path = "src/bin/test_deltanet_accumulation.rs"
 
 [[bin]]
+name = "inspect_ornith"
+path = "src/bin/inspect_ornith.rs"
+
+[[bin]]
 name = "test_qwen_ffi"
 path = "src/bin/test_qwen_ffi.rs"
 

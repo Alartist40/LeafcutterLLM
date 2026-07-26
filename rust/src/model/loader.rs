@@ -407,10 +407,27 @@ impl GGUFModel {
 
             let shape_gguf: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
             let is_2d = shape_gguf.len() == 2;
-            let shape_data: Vec<usize> = if is_2d {
-                vec![shape_gguf[1], shape_gguf[0]]
+            // For 3-D MoE expert tensors (e.g. ffn_gate_exps.weight stored as
+            // `[O, I, E]` — experts last/innermost, row-major), the quantized
+            // block stream is a flat byte array with total size O*I*E.  We
+            // collapse the leading dims so the kernel sees a 2-D `[O*I, E]`
+            // matrix: rows*cols == total element count, and E must be a
+            // multiple of the quant block size (256 for K-quants).  The
+            // Tensor's metadata shape stays 3-D so `moe::slice_experts` can
+            // split it per-expert with `o*(I*E) + i*E + e` indexing.
+            let (kernel_rows, kernel_cols, keep_shape_3d) = if is_2d {
+                (shape_gguf[1], shape_gguf[0], false)
+            } else if shape_gguf.len() == 3 {
+                let leading: usize = shape_gguf[..shape_gguf.len() - 1].iter().product();
+                let trailing = *shape_gguf.last().unwrap();
+                (leading, trailing, true)
             } else {
-                shape_gguf.clone()
+                (shape_gguf[0], shape_gguf.get(1).copied().unwrap_or(1), false)
+            };
+            let shape_data: Vec<usize> = if keep_shape_3d {
+                vec![kernel_rows, kernel_cols]
+            } else {
+                vec![shape_gguf[1], shape_gguf[0]]
             };
 
             let (mut tensor, needs_transpose) = match qtype {

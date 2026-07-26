@@ -78,6 +78,96 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Build the MoE config from the model's GGUF metadata.
+    ///
+    /// Reads `*.expert_count`, `*.expert_used_count`, `*.expert_feed_forward_length`,
+    /// `*.expert_shared_feed_forward_length`, and gating function hints
+    /// (`*.expert_gating_func`, `*.norm_topk_prob`, `*.routed_scaling_factor`).
+    ///
+    /// Falls back to `MoeConfig::default()` when metadata is missing, which
+    /// works for DeepSeek-3 / Kimi-K2.6 style MoE.
+    fn build_moe_config(
+        model: &GGUFModel,
+        config: &ModelConfig,
+    ) -> MoeConfig {
+        let get_int = |keys: &[&str]| -> usize {
+            for key in keys {
+                if let Some(v) = model.file.get_metadata_int(key) {
+                    return v as usize;
+                }
+            }
+            0
+        };
+        let get_f32 = |keys: &[&str], default: f32| -> f32 {
+            for key in keys {
+                if let Some(v) = model.file.get_metadata_f32(key) {
+                    return v;
+                }
+            }
+            default
+        };
+
+        let arch_prefix = match model.architecture {
+            ModelArchitecture::Qwen36 => "qwen35moe",
+            ModelArchitecture::Qwen35 => "qwen35",
+            _ => "llama", // DeepSeek-2 uses "llama.expert_count"
+        };
+
+        let prefix = format!("{}.", arch_prefix);
+        let num_experts = get_int(&[
+            &format!("{}expert_count", prefix),
+            "llama.expert_count",
+        ]);
+        let num_experts_used = get_int(&[
+            &format!("{}expert_used_count", prefix),
+            "llama.expert_used_count",
+        ]);
+        let expert_ffn = get_int(&[
+            &format!("{}expert_feed_forward_length", prefix),
+            "llama.expert_feed_forward_length",
+        ]);
+
+        if num_experts == 0 || num_experts_used == 0 || expert_ffn == 0 {
+            // No MoE metadata → likely a dense-only model.  Return defaults
+            // so dispatch still works (dispatcher won't actually use MoE).
+            return MoeConfig {
+                num_experts: 0,
+                num_experts_used: 0,
+                expert_ffn: config.intermediate_size,
+                gating_func: 1,
+                norm_topk_prob: false,
+                routed_scaling_factor: 1.0,
+                norm_eps: config.norm_eps,
+            };
+        }
+
+        let gating_func = get_int(&[
+            &format!("{}expert_gating_func", prefix),
+            "llama.expert_gating_func",
+        ]) as u32;
+        let norm_topk_prob = get_int(&[
+            &format!("{}norm_topk_prob", prefix),
+            "llama.norm_topk_prob",
+        ]) != 0;
+        let routed_scaling_factor = get_f32(
+            &[
+                &format!("{}routed_scaling_factor", prefix),
+                "llama.routed_scaling_factor",
+            ],
+            1.0,
+        );
+
+        MoeConfig {
+            num_experts,
+            num_experts_used,
+            expert_ffn,
+            gating_func: if gating_func == 2 { 2 } else { 1 },
+            norm_topk_prob,
+            routed_scaling_factor,
+            norm_eps: config.norm_eps,
+        }
+    }
+
     #[cfg(feature = "llama-ffi")]
     fn load_ffi(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let model = LlamaModel::load(Path::new(path), 0)
@@ -189,6 +279,10 @@ impl Engine {
             DeltaNetParams::default()
         };
 
+        // Build MoE config from model metadata (must happen before
+        // model/config are moved into the Engine struct).
+        let moe_params = Self::build_moe_config(&model, &config);
+
         // Build SSM config for hybrid architectures from model metadata
         let ssm_config = if report.uses_ssm {
             let get_meta = |keys: &[&str]| -> Option<i64> {
@@ -274,7 +368,7 @@ impl Engine {
             ssm_config,
             deltanet_params,
             mla_params: crate::inference::mla::MlaParams::default(),
-            moe_params: crate::inference::moe::MoeConfig::default(),
+            moe_params,
             gemma_layouts,
             gemma_norm_eps,
             gemma_logit_softcap,

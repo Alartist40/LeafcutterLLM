@@ -5,6 +5,10 @@ pub mod backend;
 pub mod bridge;
 pub mod cache;
 
+/// Background safety monitor — observes CPU temp/RSS and prints warnings
+/// to stderr.  Never throttles execution; pure advisory.
+pub mod cpu_monitor;
+
 pub mod init;
 
 pub mod inference;

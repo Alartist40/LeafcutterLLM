@@ -360,6 +360,11 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
     let gguf = GGUFile::open(&path_str).ok();
     let mut conversation: Vec<(String, String)> = Vec::new();
 
+    // Start the background CPU/thermal/RSS safety monitor.
+    // Pure advisory — never throttles or blocks execution.  Disable with
+    // LEAFCUTTER_CPU_MONITOR=0.
+    leafcutter::cpu_monitor::start();
+
     loop {
         print!("\n> ");
         io::stdout().flush().ok();
