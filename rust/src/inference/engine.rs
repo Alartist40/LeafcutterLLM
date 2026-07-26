@@ -654,16 +654,39 @@ impl Engine {
                     let intervention = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         state.detect(&vocab)
                     }));
-                    if let Ok(Some(intervention)) = intervention {
-                        if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
-                            eprintln!("鉴 ANTIDOOM] step={} period={} repeats={} suppress={}",
-                                state.interventions(), intervention.hit.period,
-                                intervention.hit.repeats, intervention.suppress_ids.len());
+                    match &intervention {
+                        Ok(Some(intervention)) => {
+                            if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
+                                eprintln!(
+                                    "[ANTIDOOM] step={} period={} repeats={} suppress={}",
+                                    state.interventions(),
+                                    intervention.hit.period,
+                                    intervention.hit.repeats,
+                                    intervention.suppress_ids.len()
+                                );
+                            }
+                            crate::inference::anti_doom::suppress_in_logits(
+                                &mut logits,
+                                &intervention.suppress_ids,
+                            );
                         }
-                        crate::inference::anti_doom::suppress_in_logits(
-                            &mut logits,
-                            &intervention.suppress_ids,
-                        );
+                        Ok(None) => {
+                            if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
+                                if state.step % 10 == 0 {
+                                    eprintln!(
+                                        "[ANTIDOOM] step={} tokens={} text_len={} no loop detected",
+                                        state.step,
+                                        state.token_ids.len(),
+                                        state.generated_text.len()
+                                    );
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            if std::env::var("LEAFCUTTER_ANTIDOOM_DEBUG").is_ok() {
+                                eprintln!("[ANTIDOOM] PANIC in detect — swallowed by catch_unwind");
+                            }
+                        }
                     }
                 }
             }

@@ -307,23 +307,23 @@ pub fn is_enabled() -> bool {
 /// repetition detector can see history, plus a per-step working buffer.
 pub struct AntiDoomState {
     /// Decoded text appended so far (post-prompt).
-    generated_text: String,
+    pub(crate) generated_text: String,
     /// Token boundary byte offsets — `decoded_lens[i]` is the byte length
     /// of token `i` after decoding.  Used to map char positions back to
     /// token ids (when needed for chosen/rejected pair extraction).
-    decoded_lens: Vec<usize>,
+    pub(crate) decoded_lens: Vec<usize>,
     /// Token ids in decode order (post-prompt).
-    token_ids: Vec<usize>,
+    pub(crate) token_ids: Vec<usize>,
     /// Whether we have already intervened once this generation.  We back
     /// off after one intervention per loop to avoid overcorrecting and
     /// forcing weird tokens.
-    last_intervention_step: isize,
+    pub(crate) last_intervention_step: isize,
     /// Count of interventions this generation.
-    interventions: usize,
+    pub(crate) interventions: usize,
     /// Cumulative time spent in detection (for logging).
-    detection_ns: u128,
+    pub(crate) detection_ns: u128,
     /// Step counter (incremented per sampled token).
-    step: usize,
+    pub(crate) step: usize,
 }
 
 impl AntiDoomState {
