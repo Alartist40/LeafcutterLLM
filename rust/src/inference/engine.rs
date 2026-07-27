@@ -541,6 +541,9 @@ impl Engine {
             .or_else(|| model.file.get_metadata_int("llama.rope.freq_base"))
             .map(|v| v as f32)
             .unwrap_or(config.rope_theta);
+        if std::env::var("LEAFCUTTER_ROPE_DEBUG").is_ok() {
+            eprintln!("[rope] theta={} (cfg default={})", rope_theta, config.rope_theta);
+        }
 
         AttentionParams {
             num_heads,

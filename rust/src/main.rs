@@ -497,24 +497,35 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
             .collect();
         let mut in_thinking = profile.opens_with_thinking;
         let mut thinking_done = false;
+        let debug_chunks = std::env::var("LEAFCUTTER_CHUNK_DEBUG").is_ok();
         let generated_ids = engine.generate_streaming_with_stops(
             &tokens,
             max_tokens,
             temp,
             top_p,
             &stop_token_ids,
-            |_id, chunk| {
-                // Stream the thinking block visibly like Ollama does —
-                // prefix `` so the user sees the model's reasoning
-                // stream by, then the actual response.
-                if profile.opens_with_thinking && !thinking_done {
-                    if chunk.contains("</think>") {
+            |id, chunk| {
+                if debug_chunks {
+                    eprintln!("[chunk] id={} surface={:?} in_thinking={} thinking_done={}", id, chunk, in_thinking, thinking_done);
+                }
+                // Ornith thinking-stream protocol (matching Ollama):
+                //   id=248068  →  (opens thinking block — emitted by model)
+                //   id=248069  →  (closes thinking block — emitted by model)
+                // Both are control tokens; never print them as text.
+                match id {
+                    248068 => { in_thinking = true; return true; }   // swallow opener
+                    248069 => {                                       // swallow closer
+                        in_thinking = false;
                         thinking_done = true;
-                    } else if in_thinking {
-                        eprint!("💭{}", chunk);
                         let _ = io::stdout().flush();
                         return true;
                     }
+                    _ => {}
+                }
+                if in_thinking && !thinking_done {
+                    eprint!("💭{}", chunk);
+                    let _ = io::stdout().flush();
+                    return true;
                 }
                 eprint!("{}", chunk);
                 let _ = io::stdout().flush();

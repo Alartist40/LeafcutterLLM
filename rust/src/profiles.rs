@@ -264,14 +264,12 @@ pub fn render_prompt(
     match profile.name {
         "ornith" | "qwen-chat" | "qwen3-thinking" => {
             // ChatML: <|im_start|>{role}\n{content}<|im_end|>\n
-            let think_suffix = if profile.opens_with_thinking {
-                "\n<think>\n"
-            } else {
-                ""
-            };
+            // Do NOT pre-inject the thinking opener — the model emits
+            // `` itself at the start of its response (verified via
+            // Ollama prompt context comparison, 2026-07-28).
             format!(
-                "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n{}",
-                sys, user, think_suffix
+                "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+                sys, user
             )
         }
         "llama3" => format!(
