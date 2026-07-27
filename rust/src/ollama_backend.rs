@@ -24,13 +24,12 @@ struct ChatRequest<'a> {
     model: &'a str,
     messages: &'a [ChatMessage],
     stream: bool,
+    /// Enable thinking/reasoning stream for Ornith, Qwen3 thinking,
+    /// DeepSeek-R1, etc.  When true, Ollama splits the response into
+    /// `content` (final answer) and `thinking` (reasoning trace).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    think: Option<bool>,
     options: ChatOptions<'a>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ChatMessage {
-    pub role: String,
-    pub content: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -42,12 +41,21 @@ struct ChatOptions<'a> {
     stop: &'a [String],
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+    /// Per-token thinking/reasoning stream.  Ollama sends this as a
+    /// delta — each chunk has only the NEW token, not the accumulated
+    /// thinking text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     model: String,
     message: ChatMessage,
-    #[serde(default)]
-    thinking: Option<String>,
     done: bool,
     #[serde(default)]
     done_reason: Option<String>,
@@ -79,6 +87,7 @@ impl OllamaClient {
             model: &self.model,
             messages,
             stream: false,
+            think: Some(true),
             options: ChatOptions {
                 temperature,
                 top_p,
@@ -100,6 +109,11 @@ impl OllamaClient {
 
     /// Generate with streaming output.  Calls `on_token` for each streamed
     /// content chunk (decoded JSON messages from `/api/chat`).
+    ///
+    /// Implementation: Ollama sends newline-delimited JSON.  We buffer
+    /// the entire NDJSON stream into a String and then split it into
+    /// lines — simpler than chunked parsing and ureq's stream parsing
+    /// has been flaky in older versions.
     pub fn chat_streaming<F>(
         &self,
         messages: &[ChatMessage],
@@ -117,6 +131,7 @@ impl OllamaClient {
             model: &self.model,
             messages,
             stream: true,
+            think: Some(true),
             options: ChatOptions {
                 temperature,
                 top_p,
@@ -132,25 +147,37 @@ impl OllamaClient {
             .set("Content-Type", "application/json")
             .send_json(&req)
             .map_err(|e| format!("HTTP error: {e}"))?;
-        let reader = resp.into_reader();
-        let buf = BufReader::new(reader);
-        for line in buf.lines() {
-            let line = line.map_err(|e| e.to_string())?;
+        // Buffer the whole NDJSON body — Ollama streams token-by-token
+        // but the body is small (a few KB) for typical max_predict.
+        let body = resp.into_string().map_err(|e| e.to_string())?;
+        if std::env::var("LEAFCUTTER_OLLAMA_DEBUG").is_ok() {
+            eprintln!("[ollama-debug] body bytes: {}", body.len());
+            eprintln!("[ollama-debug] first line: {}", body.lines().next().unwrap_or(""));
+        }
+        for line in body.lines() {
+            let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            match serde_json::from_str::<ChatResponse>(&line) {
+            match serde_json::from_str::<ChatResponse>(line) {
                 Ok(r) => {
+                    if std::env::var("LEAFCUTTER_OLLAMA_DEBUG").is_ok() {
+                        eprintln!(
+                            "[ollama-debug] chunk: done={} content={:?} thinking={:?}",
+                            r.done, r.message.content, r.message.thinking
+                        );
+                    }
                     if r.done {
                         return Ok(());
                     }
-                    let continue_emit = on_token(&r.message.content, r.thinking.as_deref());
+                    let continue_emit =
+                        on_token(&r.message.content, r.message.thinking.as_deref());
                     if !continue_emit {
                         return Ok(());
                     }
                 }
                 Err(e) => {
-                    eprintln!("[ollama-stream] parse error: {e} on line: {line}");
+                    eprintln!("[ollama-stream] parse error: {e} on line: {}", &line[..line.len().min(80)]);
                 }
             }
         }

@@ -598,6 +598,7 @@ fn cmd_run_ollama(
         conversation.push(ChatMessage {
             role: "user".into(),
             content: input.into(),
+            thinking: None,
         });
 
         let stop: Vec<String> = vec!["<|im_end|>".into()];
@@ -614,20 +615,22 @@ fn cmd_run_ollama(
             max_tokens as i32,
             &stop,
             |content, thinking| {
+                // Stream the thinking block first, then the response.
+                // Both go to stdout so they interleave naturally.
                 if let Some(t) = thinking {
                     if !saw_thinking && !t.is_empty() {
-                        eprint!("💭 ");
+                        print!("\n💭 ");
                         saw_thinking = true;
                     }
                     if !t.is_empty() {
-                        eprint!("{}", t);
-                        let _ = io::stderr().flush();
+                        print!("{}", t);
+                        let _ = io::stdout().flush();
                     }
                 }
                 if !content.is_empty() {
                     if saw_thinking && !thinking_done {
-                        eprintln!();
-                        eprintln!();
+                        println!();
+                        println!();
                         thinking_done = true;
                     }
                     print!("{}", content);
