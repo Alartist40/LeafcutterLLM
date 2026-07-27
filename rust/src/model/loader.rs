@@ -537,6 +537,11 @@ impl GGUFModel {
                 tensor = tensor.transpose();
                 sanitize_weights(&mut tensor);
             }
+            // 3-D MoE expert tensors are stored as quantized blocks (q_data)
+            // and need eager dequantization so slice_experts can index .data.
+            if keep_shape_3d {
+                tensor.materialize_data();
+            }
             weights.insert(engine_name.to_string(), tensor);
         }
 

@@ -692,6 +692,40 @@ impl Engine {
     where
         F: FnMut(usize, &str) -> bool,
     {
+        // No stop_tokens parameter → use the engine's default eos_token.
+        self.generate_streaming_with_stops(
+            tokens,
+            max_tokens,
+            temperature,
+            top_p,
+            &[],
+            &mut on_token,
+        )
+    }
+
+    /// Streaming generation with explicit stop tokens.
+    ///
+    /// When `stop_tokens` is non-empty, generation stops only when the
+    /// model emits one of those tokens.  When empty, falls back to the
+    /// engine's `config.eos_token` (the GGUF metadata's EOS id).
+    ///
+    /// This is important for reasoning models like Ornith / Qwen3.5 where
+    /// `<|im_end|>` (the GGUF EOS) appears BOTH after the thinking block
+    /// AND after the final response — stopping on the first EOS would
+    /// truncate the answer.  The caller passes the profile's stop_tokens
+    /// (which may be empty to disable early stopping entirely).
+    pub fn generate_streaming_with_stops<F>(
+        &mut self,
+        tokens: &[usize],
+        max_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        stop_tokens: &[usize],
+        mut on_token: F,
+    ) -> Vec<usize>
+    where
+        F: FnMut(usize, &str) -> bool,
+    {
         self.kv_cache.clear();
         self.ssm_cache.clear();
         self.deltanet_cache.clear();
@@ -727,7 +761,14 @@ impl Engine {
                 state.record(next_token, &decoded);
             }
         }
-        if next_token == self.config.eos_token {
+        // Stop-token check: use the caller's stop_tokens if provided,
+        // otherwise fall back to the engine's config.eos_token.
+        let is_stop = if stop_tokens.is_empty() {
+            next_token == self.config.eos_token
+        } else {
+            stop_tokens.contains(&next_token)
+        };
+        if is_stop {
             return generated;
         }
 
@@ -797,7 +838,14 @@ impl Engine {
                     state.record(next_token, &decoded);
                 }
             }
-            if next_token == self.config.eos_token {
+            // Stop-token check: same as above — use caller's stop_tokens
+            // when provided, else fall back to config.eos_token.
+            let is_stop = if stop_tokens.is_empty() {
+                next_token == self.config.eos_token
+            } else {
+                stop_tokens.contains(&next_token)
+            };
+            if is_stop {
                 break;
             }
         }
@@ -1419,8 +1467,26 @@ impl Engine {
     fn build_tokenizer_from_model(&self) -> Option<GgufTokenizer> {
         let file = &self.model.file;
         let tokens = file.metadata.get("tokenizer.ggml.tokens")?;
-        if let crate::model::gguf::GGUFValue::Array(arr) = tokens {
-            let vocab: Vec<String> = arr
+        let vocab: Vec<String> = if let crate::model::gguf::GGUFValue::Array(arr) = tokens {
+            arr.iter()
+                .filter_map(|v| {
+                    if let crate::model::gguf::GGUFValue::String(s) = v {
+                        Some(s.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        } else {
+            return None;
+        };
+        if vocab.is_empty() {
+            return None;
+        }
+
+        // Read BPE merge rules if available
+        let merges: Vec<String> = match file.metadata.get("tokenizer.ggml.merges") {
+            Some(crate::model::gguf::GGUFValue::Array(arr)) => arr
                 .iter()
                 .filter_map(|v| {
                     if let crate::model::gguf::GGUFValue::String(s) = v {
@@ -1429,13 +1495,11 @@ impl Engine {
                         None
                     }
                 })
-                .collect();
-            if !vocab.is_empty() {
-                return Some(GgufTokenizer::from_vocab(vocab));
-            }
-        }
-        // Fallback: try the file path on disk (works for native FFI-less path too)
-        GgufTokenizer::from_gguf(self.gguf_path.as_str())
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        Some(GgufTokenizer::from_vocab_and_merges(vocab, merges))
     }
     /// Generate text from a string prompt using the embedded GGUF tokenizer.
     pub fn generate_text(&mut self, prompt: &str, max_tokens: usize, temperature: f32, top_p: f32) -> Option<String> {
@@ -1524,19 +1588,19 @@ impl Engine {
         crate::inference::moe::slice_experts(
             weights,
             &mut sliced,
-            "mlp.expert_gate",
+            "mlp.expert_gate.weight",
             "ffn_gate_exps",
         );
         crate::inference::moe::slice_experts(
             weights,
             &mut sliced,
-            "mlp.expert_up",
+            "mlp.expert_up.weight",
             "ffn_up_exps",
         );
         crate::inference::moe::slice_experts(
             weights,
             &mut sliced,
-            "mlp.expert_down",
+            "mlp.expert_down.weight",
             "ffn_down_exps",
         );
 

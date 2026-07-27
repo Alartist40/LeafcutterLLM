@@ -136,10 +136,8 @@ fn read_cpu_temp() -> Option<u64> {
             || ztype.contains("pkg")
             || ztype.contains("acpi")
         {
-            // temp is in millidegrees C on most Linux systems, or 1/100000 °C
-            // on some newer kernels.  Check the type and scale.
-            let scale = if ztype == "acpitz" { 1 } else { 1000 };
-            return Some((v / scale) as u64);
+            // Linux thermal zones report in millidegrees Celsius (e.g. 71000 = 71.0°C).
+            return Some((v / 1000) as u64);
         }
     }
     None

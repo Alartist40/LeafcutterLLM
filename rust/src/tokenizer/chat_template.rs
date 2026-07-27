@@ -104,11 +104,31 @@ pub fn apply_chat_template_from_gguf(
         let family = TemplateFamily::detect(template);
         family.render(system, user)
     } else {
-        // No template in GGUF — plain fallback
-        if system.is_empty() {
-            user.to_string()
-        } else {
-            format!("{system}\n\n{user}")
+        // No template in GGUF — detect architecture and use a sensible default.
+        let arch = metadata
+            .get("general.architecture")
+            .and_then(|v| if let GGUFValue::String(s) = v { Some(s.as_str()) } else { None })
+            .unwrap_or("");
+        match arch {
+            "qwen2" | "qwen3" | "qwen35" | "qwen35moe" | "qwen36" | "ornith" => {
+                // ChatML — used by all Qwen-family models.
+                format!(
+                    "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+                )
+            }
+            "llama" | "mistral" | "mistral3" => {
+                // Llama-3 / Mistral instruction format.
+                format!(
+                    "<|start_header_id|>system<|end_header_id|>\n\n{system}<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n{user}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+                )
+            }
+            _ => {
+                if system.is_empty() {
+                    user.to_string()
+                } else {
+                    format!("{system}\n\n{user}")
+                }
+            }
         }
     }
 }

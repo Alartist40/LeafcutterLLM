@@ -1,8 +1,9 @@
-//! Simple tokenizer using GGUF vocab (no external dependencies)
+//! BPE tokenizer using GGUF vocab + merge rules.
 //!
-//! Reads `tokenizer.ggml.tokens` from the GGUF file and does greedy
-//! longest-match tokenization. This is a pragmatic fallback when a
-//! full HuggingFace `tokenizer.json` is not available.
+//! Reads `tokenizer.ggml.tokens` and `tokenizer.ggml.merges` from the GGUF
+//! file and applies proper GPT-2 style byte-level BPE tokenization. This
+//! replaces the earlier greedy longest-match approach which produced wrong
+//! token IDs for BPE models (Qwen, Llama, Mistral, etc.).
 
 use crate::model::gguf::{GGUFile, GGUFValue};
 use std::collections::HashMap;
@@ -12,19 +13,20 @@ pub struct GgufTokenizer {
     vocab: Vec<String>,
     /// token_string -> token_id
     pub token_to_id: HashMap<String, usize>,
+    /// BPE merge rules: "left right" -> merge rank (lower = higher priority)
+    merge_ranks: HashMap<String, usize>,
     /// BOS token ID
     bos_id: Option<usize>,
     /// EOS token ID
     eos_id: Option<usize>,
 }
 
-// Cheap to clone — only four fields, the HashMap is the biggest but copy-on-write
-// semantics are fine for the cached-tokenizer use case.
 impl Clone for GgufTokenizer {
     fn clone(&self) -> Self {
         Self {
             vocab: self.vocab.clone(),
             token_to_id: self.token_to_id.clone(),
+            merge_ranks: self.merge_ranks.clone(),
             bos_id: self.bos_id,
             eos_id: self.eos_id,
         }
@@ -33,29 +35,47 @@ impl Clone for GgufTokenizer {
 
 impl GgufTokenizer {
     /// Build tokenizer from a list of vocab strings (extracted from GGUF).
+    /// Without merge rules — falls back to character-level encoding.
     pub fn from_vocab(vocab_tokens: Vec<String>) -> Self {
+        Self::from_vocab_and_merges(vocab_tokens, Vec::new())
+    }
+
+    /// Build tokenizer from vocab strings and BPE merge rules.
+    /// Each merge rule is a "left right" string (space-separated).
+    pub fn from_vocab_and_merges(vocab_tokens: Vec<String>, merges: Vec<String>) -> Self {
         let mut token_to_id = HashMap::with_capacity(vocab_tokens.len());
         for (i, tok) in vocab_tokens.iter().enumerate() {
             token_to_id.insert(tok.clone(), i);
         }
 
-        // Detect common special-token names
-        let bos_id = [
-            "<s>",
-            "<|begin_of_text|>",
-            "<|startoftext|>",
-            "<|im_start|>",
-            "[BOS]",
-        ]
-        .iter()
-        .find_map(|&s| token_to_id.get(s).copied());
+        // Build merge rank map: "left right" -> rank (index in merge list)
+        let mut merge_ranks = HashMap::with_capacity(merges.len());
+        for (rank, merge) in merges.iter().enumerate() {
+            merge_ranks.insert(merge.clone(), rank);
+        }
+
+        // Detect common special-token names.  We prefer the explicit
+        // GGUF metadata (`tokenizer.ggml.bos_token_id` /
+        // `tokenizer.ggml.eos_token_id`) when present, otherwise we
+        // auto-detect by looking for known marker tokens in the vocab.
+        //
+        // Important: for models that use ChatML (`<|im_start|>` /
+        // `<|im_end|>`) as turn markers — Qwen, Ornith, Llama-3 — these
+        // tokens are NOT BOS/EOS for generation.  The real BOS is
+        // usually absent (the prompt starts with `<|im_start|>` directly)
+        // or is `<|begin_of_text|>` for Llama-3.  We therefore do NOT
+        // auto-detect `<|im_start|>` as BOS — leaving it `None` means
+        // `encode(..., add_bos=true)` will not add an unwanted prefix
+        // token before the user's prompt.
+        let bos_id = ["<s>", "<|begin_of_text|>", "<|startoftext|>", "[BOS]"]
+            .iter()
+            .find_map(|&s| token_to_id.get(s).copied());
 
         let eos_id = [
             "</s>",
             "<|end_of_text|>",
-            "<|endoftext|>",
-            "<|im_end|>",
             "<|eot_id|>",
+            "<|im_end|>",
             "[EOS]",
         ]
         .iter()
@@ -64,17 +84,26 @@ impl GgufTokenizer {
         Self {
             vocab: vocab_tokens,
             token_to_id,
+            merge_ranks,
             bos_id,
             eos_id,
         }
     }
 
-    /// Encode text to token IDs using GPT-2 byte mapping + greedy longest-match.
+    /// Encode text to token IDs using GPT-2 byte mapping + BPE merges.
     ///
-    /// Each byte of the input is first converted to its GPT-2-mapped Unicode
-    /// char (space → Ġ, newline → Ċ, other non-printable → chr(byte + 256)),
-    /// then greedy longest-match is applied against the vocab.
+    /// Steps:
+    /// 1. Convert input bytes to GPT-2 byte-mapped Unicode chars
+    /// 2. Pre-tokenize: split on whitespace boundaries (Ġ prefix convention)
+    /// 3. For each pre-token, apply BPE merges in rank order
+    /// 4. Look up each resulting subword in the vocab
     pub fn encode(&self, text: &str, add_bos: bool) -> Vec<usize> {
+        if std::env::var("LEAFCUTTER_TOKENIZER_DEBUG").is_ok() {
+            eprintln!(
+                "[TOKENIZER] encode called: text={:?}, add_bos={}, merge_ranks={}, vocab={}",
+                text, add_bos, self.merge_ranks.len(), self.token_to_id.len()
+            );
+        }
         let mut tokens = Vec::new();
 
         if add_bos {
@@ -87,10 +116,9 @@ impl GgufTokenizer {
             return tokens;
         }
 
-        // Convert input bytes to GPT-2-mapped Unicode chars.
+        // Step 1: Convert input bytes to GPT-2 byte-mapped Unicode chars.
         // GPT-2 byte-to-unicode: printable ASCII (33-126) stays as-is,
         // everything else (0-32, 127-255) → chr(byte + 256).
-        // So space (0x20) → chr(288) = 'Ġ', newline (0x0A) → chr(266) = 'Ċ'.
         let mut converted = String::with_capacity(text.len() * 2);
         for &byte in text.as_bytes() {
             let c = if byte >= 33 && byte <= 126 {
@@ -101,13 +129,203 @@ impl GgufTokenizer {
             converted.push(c);
         }
 
-        // Greedy longest-match on the converted string
-        let mut remaining = &converted[..];
+        // Step 2: If we have merge rules, use proper BPE.
+        // Otherwise fall back to greedy longest-match.
+        if self.merge_ranks.is_empty() {
+            tokens.extend(self.greedy_encode(&converted));
+            return tokens;
+        }
+
+        // Step 3: Pre-tokenize. GPT-2 BPE splits on whitespace boundaries.
+        // Words are: sequences of non-whitespace chars. The whitespace itself
+        // becomes a Ġ-prefixed word (GPT-2 convention: space before word).
+        // We split the converted string into pre-tokens by finding Ġ boundaries.
+        //
+        // SPECIAL TOKENS: Qwen/Llama/Ornith embed ChatML markers like
+        // `<|im_start|>`, `<|im_end|>`, `<|endoftext|>`, ``, etc.
+        // These are stored as single-token entries in the vocab and must
+        // NEVER be BPE-encoded — the literal `<`, `|`, `_` characters would
+        // otherwise explode into 6-8 separate tokens and corrupt the model's
+        // understanding.  We split on `<|...|>` boundaries as well.
+        let pre_tokens = self.pretokenize(&converted);
+        if std::env::var("LEAFCUTTER_TOKENIZER_DEBUG").is_ok() {
+            eprintln!("[TOKENIZER] pre_tokens: {:?}", pre_tokens);
+        }
+
+        // Step 4: Apply BPE to each pre-token and collect token IDs.
+        //
+        // If a pre-token IS a special token (matches a vocab entry like
+        // `<|im_start|>` or ``), emit it directly — BPE would otherwise
+        // shatter it into 6-12 subword IDs that don't mean anything to the
+        // model.  This matches how HuggingFace's GPT-2 tokenizer treats
+        // added special tokens.
+        for word in &pre_tokens {
+            // Special-token fast path: if the whole pre-token is in the
+            // vocab, emit it as a single ID.  This handles `<|im_start|>`,
+            // ``, `<|endoftext|>`, etc.  We check using the byte-mapped
+            // form (with Ġ/Ċ) so leading-whitespace words still match.
+            let normalized = word.clone();
+            if let Some(&id) = self.token_to_id.get(&normalized) {
+                tokens.push(id);
+                continue;
+            }
+            // Otherwise apply BPE.
+            let word_tokens = self.bpe_apply(word);
+            for tok_str in word_tokens {
+                if let Some(&id) = self.token_to_id.get(&tok_str) {
+                    tokens.push(id);
+                } else {
+                    // Fallback: try individual chars
+                    for c in tok_str.chars() {
+                        let char_str = c.to_string();
+                        if let Some(&id) = self.token_to_id.get(&char_str) {
+                            tokens.push(id);
+                        } else {
+                            let byte = if c as u32 >= 256 {
+                                (c as u32 - 256) as u8
+                            } else {
+                                c as u8
+                            };
+                            let byte_token = format!("<0x{:02X}>", byte);
+                            if let Some(&id) = self.token_to_id.get(&byte_token) {
+                                tokens.push(id);
+                            } else {
+                                tokens.push(byte as usize);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        tokens
+    }
+
+    /// Pre-tokenize: split the GPT-2 byte-mapped string into word-level pieces.
+    ///
+    /// GPT-2 convention: spaces are part of the following word (Ġ prefix).
+    /// So "Hello world" → ["Hello", "Ġworld"] in byte-mapped form.
+    /// We split at every Ġ (U+0120, represents space) boundary, keeping the Ġ
+    /// with the following word. Newlines (Ċ, U+010A) also start a new word.
+    ///
+    /// Additionally, we split on special-token boundaries of the form
+    /// `<|...|>` (Qwen ChatML markers, Llama-3 header markers, etc.)
+    /// so each special token is a separate pre-token and won't be
+    /// BPE-encoded into its constituent characters.
+    fn pretokenize(&self, text: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut current = String::new();
+        let chars: Vec<char> = text.chars().collect();
+        let n = chars.len();
+        let mut i = 0;
+        while i < n {
+            let c = chars[i];
+            // Whitespace boundary
+            if c == '\u{0120}' || c == '\u{010A}' || c == '\u{0109}' {
+                if !current.is_empty() {
+                    result.push(std::mem::take(&mut current));
+                }
+                current.push(c);
+                i += 1;
+                continue;
+            }
+            // Special-token boundary: <|...|> where ... is non-empty and
+            // contains no `<` or `|`.  The whole token (including the
+            // wrapping `<|...|>`) must be one pre-token so it ends up in
+            // the vocab as a single ID.
+            if c == '<' && i + 2 < n && chars[i + 1] == '|' {
+                // Flush any accumulated word first.
+                if !current.is_empty() {
+                    result.push(std::mem::take(&mut current));
+                }
+                // Scan forward to find the closing `|>`.
+                let mut j = i + 2;
+                while j < n - 1 && !(chars[j] == '|' && chars[j + 1] == '>') {
+                    j += 1;
+                }
+                if j < n - 1 {
+                    // Found `|>`.  The whole marker is chars[i..=j+1].
+                    let token: String = chars[i..=j + 1].iter().collect();
+                    result.push(token);
+                    i = j + 2;
+                    continue;
+                }
+                // No closing `|>` found — treat `<` as a normal character.
+            }
+            current.push(c);
+            i += 1;
+        }
+        if !current.is_empty() {
+            result.push(current);
+        }
+        result
+    }
+
+    /// Apply BPE merges to a single pre-token (word).
+    ///
+    /// Algorithm:
+    /// 1. Start with the word split into individual characters
+    /// 2. Repeatedly find the adjacent pair with the lowest merge rank
+    /// 3. Merge that pair and repeat until no more merges apply
+    /// 4. Return the resulting subwords
+    fn bpe_apply(&self, word: &str) -> Vec<String> {
+        // Start with individual characters as tokens
+        let mut symbols: Vec<String> = word.chars().map(|c| c.to_string()).collect();
+        if symbols.len() < 2 {
+            return symbols;
+        }
+
+        loop {
+            // Find the pair with the lowest merge rank
+            let mut min_rank: Option<usize> = None;
+            let mut merge_idx: usize = 0;
+
+            for i in 0..symbols.len() - 1 {
+                let pair = format!("{} {}", symbols[i], symbols[i + 1]);
+                if let Some(&rank) = self.merge_ranks.get(&pair) {
+                    match min_rank {
+                        None => {
+                            min_rank = Some(rank);
+                            merge_idx = i;
+                        }
+                        Some(r) if rank < r => {
+                            min_rank = Some(rank);
+                            merge_idx = i;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+
+            // No more merges to apply
+            let min_rank = match min_rank {
+                Some(r) => r,
+                None => break,
+            };
+
+            // Merge the pair at merge_idx
+            let merged = format!("{}{}", symbols[merge_idx], symbols[merge_idx + 1]);
+            symbols[merge_idx] = merged;
+            symbols.remove(merge_idx + 1);
+
+            // Safety: if we somehow get into an infinite loop, break
+            // (shouldn't happen with proper merge rules, but guards against
+            // malformed merge data that merges to the same string)
+            if min_rank > self.merge_ranks.len() {
+                break;
+            }
+        }
+
+        symbols
+    }
+
+    /// Greedy longest-match encoding (fallback when no merge rules available).
+    fn greedy_encode(&self, text: &str) -> Vec<usize> {
+        let mut tokens = Vec::new();
+        let mut remaining = text;
 
         while !remaining.is_empty() {
             let mut matched = false;
-
-            // Try longest match first (up to 64 chars or remaining len)
             let max_len = remaining.len().min(64);
             for len in (1..=max_len).rev() {
                 if let Some(prefix) = remaining.get(..len) {
@@ -121,13 +339,11 @@ impl GgufTokenizer {
             }
 
             if !matched {
-                // Fallback: emit a single char (it's a GPT-2 mapped char or ASCII)
                 if let Some(first_char) = remaining.chars().next() {
                     let char_str = first_char.to_string();
                     if let Some(&id) = self.token_to_id.get(&char_str) {
                         tokens.push(id);
                     } else {
-                        // Last-resort: find the byte token for this char's underlying byte
                         let byte = if first_char as u32 >= 256 {
                             (first_char as u32 - 256) as u8
                         } else {
@@ -137,7 +353,6 @@ impl GgufTokenizer {
                         if let Some(&id) = self.token_to_id.get(&byte_token) {
                             tokens.push(id);
                         } else {
-                            // Absolute last resort
                             tokens.push(byte as usize);
                         }
                     }
@@ -147,7 +362,6 @@ impl GgufTokenizer {
                 }
             }
         }
-
         tokens
     }
 
@@ -215,30 +429,68 @@ impl GgufTokenizer {
         &self.vocab
     }
 
-    pub fn bos_id(&self) -> Option<usize> { self.bos_id }
-    pub fn eos_id(&self) -> Option<usize> { self.eos_id }
+    pub fn bos_id(&self) -> Option<usize> {
+        self.bos_id
+    }
+    pub fn eos_id(&self) -> Option<usize> {
+        self.eos_id
+    }
 
-    /// Load tokenizer vocabulary directly from a GGUF file.
+    /// Load tokenizer vocabulary and merge rules directly from a GGUF file.
     pub fn from_gguf(path: &str) -> Option<Self> {
         let file = GGUFile::open(path).ok()?;
         let vocab: Vec<String> = match file.metadata.get("tokenizer.ggml.tokens") {
-            Some(GGUFValue::Array(arr)) => {
-                arr.iter()
-                    .map(|v| match v {
-                        GGUFValue::String(s) => s.clone(),
-                        _ => String::new(),
-                    })
-                    .collect()
-            }
+            Some(GGUFValue::Array(arr)) => arr
+                .iter()
+                .map(|v| match v {
+                    GGUFValue::String(s) => s.clone(),
+                    _ => String::new(),
+                })
+                .collect(),
             _ => return None,
         };
         if vocab.is_empty() {
             return None;
         }
-        Some(Self::from_vocab(vocab))
+
+        // Read BPE merge rules if available
+        let merges: Vec<String> = match file.metadata.get("tokenizer.ggml.merges") {
+            Some(GGUFValue::Array(arr)) => arr
+                .iter()
+                .map(|v| match v {
+                    GGUFValue::String(s) => s.clone(),
+                    _ => String::new(),
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let mut tok = Self::from_vocab_and_merges(vocab, merges);
+
+        // Override auto-detected BOS/EOS with explicit metadata when
+        // present.  This is important for Ornith where the GGUF does NOT
+        // include `bos_token_id` (the prompt starts with `<|im_start|>`
+        // directly) and where `<|im_end|>` is the EOS.
+        if let Some(bos) = file
+            .get_metadata_int("tokenizer.ggml.bos_token_id")
+            .map(|v| v as usize)
+        {
+            if bos < tok.vocab.len() {
+                tok.bos_id = Some(bos);
+            }
+        }
+        if let Some(eos) = file
+            .get_metadata_int("tokenizer.ggml.eos_token_id")
+            .map(|v| v as usize)
+        {
+            if eos < tok.vocab.len() {
+                tok.eos_id = Some(eos);
+            }
+        }
+
+        Some(tok)
     }
 }
-
 /// BPE-aware tokenizer using GGUF vocab.
 ///
 /// Handles the BPE space convention (Ġ prefix for words after whitespace)

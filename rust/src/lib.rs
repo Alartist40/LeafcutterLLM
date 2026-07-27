@@ -63,5 +63,6 @@ pub mod llama_ffi {
 }
 
 pub mod model;
+pub mod profiles;
 pub mod shard;
 pub mod tokenizer;

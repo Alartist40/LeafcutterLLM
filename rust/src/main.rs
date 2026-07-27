@@ -28,6 +28,7 @@ use leafcutter::llama_ffi::{backend_init, backend_free, LlamaModel, LlamaContext
 use leafcutter::api::FfiEngine;
 
 use leafcutter::model::gguf::GGUFile;
+use leafcutter::profiles::{render_prompt, resolve_profile};
 use leafcutter::tokenizer::chat_template::apply_chat_template_from_gguf;
 
 #[derive(Parser)]
@@ -353,6 +354,19 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
     eprintln!("Leaf: {}", path.file_name().unwrap().to_string_lossy());
     eprintln!("Arch: {}  Layers: {}  Hidden: {}", info.architecture, info.total_layers, info.hidden_size);
     eprintln!("Temp: {:.1}  Max tokens: {}", temp, max_tokens);
+
+    // Resolve the per-architecture profile (Ollama Modelfile-style) and
+    // announce it so the user can see which template + defaults are
+    // being used.
+    let gguf_for_profile = GGUFile::open(&path_str).ok();
+    let profile = resolve_profile(
+        &gguf_for_profile.as_ref().map(|f| &f.metadata).cloned().unwrap_or_default(),
+        None,
+    );
+    eprintln!(
+        "Profile: {} ({})",
+        profile.name, profile.description
+    );
     eprintln!();
     eprintln!("Type /bye to exit, /clear to reset context, /help for commands.");
     eprintln!("─────────────────────────────────────────────────");
@@ -434,10 +448,13 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
         // Build prompt from conversation history
         conversation.push(("user".into(), input.clone()));
 
-        let system = "You are a helpful assistant.";
+        let system = ""; // empty → profile supplies its default
         let prompt_text = if let Some(ref file) = gguf {
-            // Build a single-turn prompt from the latest message
-            apply_chat_template_from_gguf(&file.metadata, system, &input)
+            // Profile-based rendering: each architecture has its own
+            // template family, default system prompt, sampling, and
+            // stop tokens.  This is what Ollama does with Modelfiles.
+            let profile = resolve_profile(&file.metadata, None);
+            render_prompt(&profile, system, &input)
         } else {
             input.clone()
         };
@@ -449,19 +466,49 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
         }
 
         eprintln!();
+        if std::env::var("LEAFCUTTER_DEBUG_PROMPT").is_ok() {
+            eprintln!("[DEBUG prompt, {} tokens]\n{}\n[END prompt]",
+                tokens.len(), prompt_text);
+        }
         let _ = io::stdout().flush();
 
         let gen_start = std::time::Instant::now();
         let mut generated_text = String::new();
-        let generated_ids = engine.generate_streaming_with(
+        // Build stop-token list from the active profile so reasoning models
+        // (Ornith/Qwen3.5) don't get cut off by mid-stream `<|im_end|>`
+        // markers.  We use `` (the reasoning start tag) as the
+        // ONLY stop signal — that way generation continues through the
+        // full thinking block, the `` close, AND the response body,
+        // and only halts when the model emits the final response terminator.
+        let stop_token_ids: Vec<usize> = profile
+            .stop_tokens
+            .iter()
+            .map(|s| s.0)
+            .collect();
+        let mut in_thinking = profile.opens_with_thinking;
+        let mut thinking_done = false;
+        let generated_ids = engine.generate_streaming_with_stops(
             &tokens,
             max_tokens,
             temp,
             top_p,
+            &stop_token_ids,
             |_id, chunk| {
+                // Stream the thinking block visibly like Ollama does —
+                // prefix `` so the user sees the model's reasoning
+                // stream by, then the actual response.
+                if profile.opens_with_thinking && !thinking_done {
+                    if chunk.contains("</think>") {
+                        thinking_done = true;
+                    } else if in_thinking {
+                        eprint!("💭{}", chunk);
+                        let _ = io::stdout().flush();
+                        return true;
+                    }
+                }
                 eprint!("{}", chunk);
                 let _ = io::stdout().flush();
-                generated_text.push_str(&chunk);
+                generated_text.push_str(chunk);
                 true
             },
         );
