@@ -61,6 +61,12 @@ enum Commands {
         /// Max tokens per response
         #[arg(long, default_value_t = 256)]
         max_tokens: usize,
+        /// Engine backend: "native" (default) or "ollama" (HTTP API)
+        #[arg(long, default_value = "native")]
+        engine: String,
+        /// Ollama host (when --engine ollama is selected)
+        #[arg(long, default_value = "http://127.0.0.1:11434")]
+        ollama_host: String,
     },
     /// Start the HTTP API server (OpenAI-compatible, for Cynapse/Hermes/OpenCode integration)
     Serve {
@@ -194,8 +200,12 @@ async fn main() {
         Some(Commands::List) => {
             cmd_list_auto();
         }
-        Some(Commands::Run { model, temp, top_p, max_tokens }) => {
-            cmd_run(&model, temp, top_p, max_tokens);
+        Some(Commands::Run { model, temp, top_p, max_tokens, engine, ollama_host }) => {
+            if engine == "ollama" {
+                cmd_run_ollama(&model, temp, top_p, max_tokens, &ollama_host);
+            } else {
+                cmd_run(&model, temp, top_p, max_tokens);
+            }
         }
         Some(Commands::Serve { model, port, host, engine, benchmark }) => {
             cmd_serve(&model, port, &host, &engine, benchmark).await;
@@ -533,6 +543,112 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
         );
         eprintln!();
         conversation.push(("assistant".into(), generated_text));
+    }
+}
+
+/// Streaming chat via Ollama's HTTP API (`ollama serve`).
+///
+/// This is the "ground truth" backend: routes inference through Ollama
+/// directly, producing IDENTICAL output to `ollama run`.  Used to verify
+/// whether divergence from native Leafcutter output is due to forward-
+/// pass bugs or chat-template/sampling drift.
+fn cmd_run_ollama(
+    model_arg: &str,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    host: &str,
+) {
+    use leafcutter::ollama_backend::{ChatMessage, OllamaClient};
+    use std::io::{self, Write};
+
+    let model_name = model_arg.to_string();
+    let client = OllamaClient::new(host.to_string(), model_name.clone());
+
+    eprintln!(
+        "🌿 Leafcutter via Ollama (HTTP)\n   Model: {}\n   Host:  {}\n   Temp:  {:.2}  Top-p: {:.2}  Max tokens: {}\n─────────────────────────────────────────────────",
+        model_name,
+        host,
+        temp,
+        top_p,
+        max_tokens
+    );
+
+    let mut conversation: Vec<ChatMessage> = Vec::new();
+
+    loop {
+        print!("\n> ");
+        io::stdout().flush().ok();
+        let mut input = String::new();
+        if io::stdin().read_line(&mut input).is_err() {
+            break;
+        }
+        let input = input.trim();
+        if input == "/bye" {
+            break;
+        }
+        if input == "/clear" {
+            conversation.clear();
+            println!("[cache flushed]");
+            continue;
+        }
+        if input.is_empty() {
+            continue;
+        }
+        conversation.push(ChatMessage {
+            role: "user".into(),
+            content: input.into(),
+        });
+
+        let stop: Vec<String> = vec!["<|im_end|>".into()];
+
+        let gen_start = std::time::Instant::now();
+        let mut token_count = 0usize;
+        let mut saw_thinking = false;
+        let mut thinking_done = false;
+        let result = client.chat_streaming(
+            &conversation,
+            temp,
+            top_p,
+            20,
+            max_tokens as i32,
+            &stop,
+            |content, thinking| {
+                if let Some(t) = thinking {
+                    if !saw_thinking && !t.is_empty() {
+                        eprint!("💭 ");
+                        saw_thinking = true;
+                    }
+                    if !t.is_empty() {
+                        eprint!("{}", t);
+                        let _ = io::stderr().flush();
+                    }
+                }
+                if !content.is_empty() {
+                    if saw_thinking && !thinking_done {
+                        eprintln!();
+                        eprintln!();
+                        thinking_done = true;
+                    }
+                    print!("{}", content);
+                    let _ = io::stdout().flush();
+                    token_count += content.len();
+                }
+                true
+            },
+        );
+        if let Err(e) = result {
+            eprintln!("\n[ollama error] {}", e);
+            break;
+        }
+        let elapsed = gen_start.elapsed().as_secs_f64();
+        eprintln!();
+        eprintln!("─────────────────────────────────────────────────");
+        eprintln!(
+            "Model: {} | Tokens: {} chars | Time: {:.2}s",
+            model_name, token_count, elapsed
+        );
+        eprintln!();
     }
 }
 
