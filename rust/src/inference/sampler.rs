@@ -2,8 +2,22 @@
 
 use rand::Rng;
 
-/// Sample next token using temperature + top-p (nucleus sampling)
+/// Sample next token using temperature + top-k + top-p (nucleus) sampling.
+///
+/// Matches Ollama's sampler order: temperature scale → sort → top-k filter
+/// → top-p filter → renormalize → sample.  When `top_k == 0` the top-k
+/// stage is skipped (matching Ollama's `top_k: 0` semantics).
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> usize {
+    // Read top_k override from env (matches Ollama's top_k: 20 default for Ornith).
+    // 0 = disabled (preserve old behavior).  Set LEAFCUTTER_TOP_K=20 to enable.
+    let top_k: usize = std::env::var("LEAFCUTTER_TOP_K")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    sample_top_p_top_k(logits, temperature, top_p, top_k)
+}
+
+pub fn sample_top_p_top_k(logits: &[f32], temperature: f32, top_p: f32, top_k: usize) -> usize {
     if temperature <= 0.0 {
         // Greedy: pick highest logit (use total_cmp to handle NaN safely)
         return logits.iter().enumerate().max_by(|(_, a), (_, b)| a.total_cmp(b)).map(|(i, _)| i).unwrap_or(0);
@@ -23,6 +37,11 @@ pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> usize {
     probs.sort_by(|(_, a), (_, b)| {
         b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal)
     });
+
+    // Top-k filtering: keep only the k highest-probability tokens.
+    if top_k > 0 && top_k < probs.len() {
+        probs.truncate(top_k);
+    }
 
     // Top-p filtering
     let mut cumsum = 0.0f32;
