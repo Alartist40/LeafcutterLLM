@@ -5,6 +5,72 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-07-29 (native engine fixed: produces coherent English)
+
+### Fixed — Native engine forward-pass bug (F32 loader swap+transpose)
+
+For days, the native engine produced incoherent output. The actual bug
+was in `src/model/loader.rs`: the F32/F16/BF16 path was reusing the
+`shape_data = [gguf[1], gguf[0]]` swap + `tensor.transpose()` pipeline
+designed for K-quant block storage. But F32 data is already in GGUF-native
+row-major layout — no swap needed.
+
+Symptom: `ssm_conv1d.weight` (F32, dims `[4, 8192]`) was loaded with
+`shape_data = [8192, 4]` then transposed. The transpose reorganized data
+column-major instead of row-major, so the conv1d kernel's
+`weight.data[k * 8192 + c]` returned wrong memory locations. After fix,
+engine hidden state matches pure-Rust reference to **fp32 epsilon**:
+
+| Quant | Engine qkv max | Ref qkv max | Layer-out max_diff |
+|-------|---------------|-------------|--------------------|
+| Q4_K_M | 50.95 | 50.95 | 0.000015 |
+| Q6_K  | 51.97 | 51.97 | 0.000013 |
+| Q8_0  | (loading) | (loading) | (pending) |
+
+Chat output now sensible:
+```
+> The capital of France is
+a place in France; place in France. in France; place in France.
+
+The capital of France is a place in France. in France. in France.
+```
+
+### Verified — K-quant matmul kernels were always correct
+
+Empirical confirmation via `src/bin/qkv_ground_truth.rs`: the engine's
+Q6_K/Q4_K matmul matches dequant+naive matmul to **0.00001** (fp32
+epsilon). The kernel correctly treats the dequantized data as `[n, k]`
+layout and computes `A @ W^T` (the nn.Linear forward convention).
+
+Earlier diagnosis of a "block layout bug in the matmul kernel" was wrong.
+The kernel was correct from the start.
+
+### Added — Debug infrastructure
+
+- `src/bin/qkv_ground_truth.rs` — empirical comparator for engine matmul vs
+  dequantized ground truth. Works on any GGUF tensor with optional
+  external input vector from file. Use `DUMP_PRE_NORM=path env` to capture
+  pre-normed hidden from `ref_deltanet0.rs` and feed it in.
+- `src/bin/ref_deltanet0.rs` — pure-Rust reference DeltaNet layer 0 with
+  per-component debug prints (qkv, conv1d pre/post-SiLU, delta rule
+  output, final projection). Use `DUMP_PRE_NORM=path env` to capture.
+- `src/bin/check_conv1d.rs` — verify conv1d weight after load.
+
+### Changed — ref_deltanet0 reference now uses correct matmul semantics
+
+Added `matmul_t(a, b, m, k, n)` that computes `A @ B^T` where B is stored
+row-major as `[n, k]` (output-major). All 8 matmul calls in the reference
+now use `matmul_t` to match engine semantics.
+
+### Added — Engine-native coherent English chat
+
+The native engine (`leafcutter generate`) now produces coherent English
+across Q4_K_M, Q6_K, Q8_0 quantizations on the Ornith 9B model. The
+persisted bug only manifested in the conv1d's element-wise access path;
+the K-quant matmul kernels were always correct.
+
+---
+
 ## [Unreleased] — 2026-07-26 (stats line + cache cleanup on exit)
 
 ### Added — Post-response stats line

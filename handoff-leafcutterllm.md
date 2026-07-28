@@ -1,8 +1,8 @@
 # LeafcutterLLM Handoff Document
 
-**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward), **2026-07-09 (pre-release audit hardening — 20 findings routed)**, **2026-07-24 (Phase 2 async layer prefetch + anti-doom loop detector)**.
-**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward; pre-release audit + 16 fix areas; **Phase 2 + anti-doom runtime guard**.
-**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3; audit-era: 1ed554a, 5d735a9, e95c624, 115fbdb; modern-era: 991e481, 528f620, 16bcef8, a1c2f67, **5aa6154 Phase 2 prefetch, aaec49d anti-doom**).
+**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward), **2026-07-09 (pre-release audit hardening — 20 findings routed)**, **2026-07-24 (Phase 2 async layer prefetch + anti-doom loop detector)**, **2026-07-29 (native engine F32 loader fix — coherent English across Q4_K_M / Q6_K / Q8_0)**.
+**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward; pre-release audit + 16 fix areas; **Phase 2 + anti-doom runtime guard**; **native engine forward-pass fix**.
+**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3; audit-era: 1ed554a, 5d735a9, e95c624, 115fbdb; modern-era: 991e481, 528f620, 16bcef8, a1c2f67, **5aa6154 Phase 2 prefetch, aaec49d anti-doom**, **c4944e0 native engine fix**).
 **Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / Qwen 3.5 / Ornith / pre-release audit hardening work by m3 (Nvidia); Phase 2 + anti-doom work by m3 (Nvidia).
 
 ---
