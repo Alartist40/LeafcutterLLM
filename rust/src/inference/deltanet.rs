@@ -266,12 +266,19 @@ pub fn deltanet_forward(
 
         output_tensor = Tensor::from_vec(reshaped_data, vec![seq_len, output_dim_per_token]);
     }
-
     // 9. Output projection
-    let output = if let Some(out_w) = weights.get("ssm_out.weight")
+    let output = if let Some(out_w) = weights
+        .get("ssm_out.weight")
         .or_else(|| weights.get("ssm_out_proj.weight"))
     {
-        output_tensor.matmul(out_w)
+        let proj = output_tensor.matmul(out_w);
+        if std::env::var("LEAFCUTTER_DELTANET_DEBUG").is_ok() && layer_idx == 0 {
+            let mx = proj.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mn = proj.data.iter().cloned().fold(f32::INFINITY, f32::min);
+            let am: f32 = proj.data.iter().map(|v| v.abs()).sum::<f32>() / proj.data.len() as f32;
+            eprintln!("  [deltanet] final out: min={:.4} max={:.4} abs_mean={:.4}", mn, mx, am);
+        }
+        proj
     } else {
         adaptive_project(&output_tensor, hidden_size)
     };
@@ -453,11 +460,11 @@ fn causal_conv1d_cached(
             let global_t = state_len + t;
             for k in 0..kernel_size.min(global_t + 1) {
                 let x_val = full_input[(global_t - k) * channels + c];
-                // llama.cpp convention: causal conv1d weight is stored as
-                // w[k] directly (not reversed like PyTorch).
-                //   out[t] = sum_k x[t-k] * w[k]
-                // So for k=0 (current input) we use w[0], not w[kernel-1].
-                let w_idx = k;  // not (kernel_size - 1 - k)
+                // Empirical: `w_idx = k` matches conv_out magnitudes with
+                // the engine's K-quant matmul.  `kernel_size - 1 - k` makes
+                // the spike bigger (12 vs 6), so it's not just a sign issue.
+                // Need to check actual llama.cpp convention; for now keep `k`.
+                let w_idx = k;
                 let w_val = if weight.shape.len() == 1 {
                     weight.data[w_idx]
                 } else {

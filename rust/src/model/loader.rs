@@ -511,6 +511,11 @@ impl GGUFModel {
                     } else {
                         None
                     };
+                    // Match the Q4_K / Q5_K loader convention: use shape_data
+                    // (which is [gguf[1], gguf[0]] — already swapped) so the
+                    // matmul kernel's `b.cols == k, b.rows == n` assertions
+                    // pass.  An earlier "fix" tried to use shape_gguf directly
+                    // and broke things further; reverted.
                     let mat = crate::kernels::q6_k::Matrix {
                         rows: shape_data[0],
                         cols: shape_data[1],
