@@ -305,6 +305,134 @@ pub fn first_stop_token(profile: &ModelProfile) -> Option<usize> {
     profile.stop_tokens.first().map(|s| s.0)
 }
 
+/// Render a multi-turn chat prompt using a profile's template family.
+///
+/// `history` is a slice of (role, content) tuples in chronological order.
+/// Supported roles: "system" (inserted once at the top, replacing the
+/// profile default if also present), "user", "assistant", and "tool".
+///
+/// For reasoning models (opens_with_thinking=true), the FINAL assistant
+/// turn opens with `\n<think>\n` so the model can produce a thinking
+/// block.  Historical assistant turns are emitted verbatim, since the
+/// model already produced those tokens in earlier turns.
+pub fn render_chat_prompt(
+    profile: &ModelProfile,
+    system: &str,
+    history: &[(String, String)],
+) -> String {
+    if profile.raw_continuation {
+        // Raw continuation: just concatenate everything with blank
+        // lines.  No chat template.
+        let mut out = String::new();
+        if !system.is_empty() {
+            out.push_str(system);
+            out.push_str("\n\n");
+        }
+        for (_role, content) in history {
+            out.push_str(content);
+            out.push_str("\n\n");
+        }
+        return out;
+    }
+
+    let sys = if system.is_empty() {
+        profile.default_system
+    } else {
+        system
+    };
+
+    // Format each (role, content) into the chat template's per-turn
+    // wrapper.  The final assistant turn is rendered OPEN (no closing
+    // <|im_end|>) so the model can continue from it.
+    let (turn_open, turn_close, role_user, role_assistant, role_system, role_tool) = match profile.name {
+        "ornith" | "qwen-chat" | "qwen3-thinking" => (
+            "<|im_start|>", "<|im_end|>\n",
+            "user", "assistant", "system", "tool",
+        ),
+        "llama3" => (
+            "<|start_header_id|>", "<|eot_id|>",
+            "user", "assistant", "system", "tool",
+        ),
+        "gemma" => (
+            "<start_of_turn>", "<end_of_turn>\n",
+            "user", "model", "system", "tool",
+        ),
+        _ => ("", "\n", "user", "assistant", "system", "tool"),
+    };
+
+    // Special-case Ministral which uses [INST] / [/INST] tags.
+    if profile.name == "ministral" {
+        let mut out = String::new();
+        if !sys.is_empty() {
+            out.push_str(&format!("[INST] {}\n{} [/INST]", sys, history.iter().filter(|(r,_)|r=="user").map(|(_,c)|c.as_str()).collect::<Vec<_>>().join(" ")));
+        } else {
+            // Build a turn-by-turn Ministral prompt: each user turn is
+            // an [INST] block, each assistant turn is plain text after
+            // the previous [/INST] until the next [INST].
+            let mut in_inst = false;
+            for (role, content) in history {
+                match role.as_str() {
+                    "user" => {
+                        out.push_str(&format!("[INST] {} [/INST]", content));
+                        in_inst = true;
+                    }
+                    "assistant" => {
+                        out.push_str(&format!(" {}", content));
+                        in_inst = false;
+                    }
+                    "system" if !sys.is_empty() => {} // already injected via sys path above (or prepended)
+                    _ => {}
+                }
+            }
+        }
+        return out;
+    }
+
+    let mut out = String::new();
+
+    // System turn (inserted once at the top).
+    if !sys.is_empty() {
+        out.push_str(&format!("{}{}{}\n{}{}", turn_open, role_system, "\n", sys, turn_close));
+    }
+
+    // Walk the conversation history, emitting user/assistant/tool turns.
+    let mut next_is_assistant = false;
+    for (role, content) in history {
+        match role.as_str() {
+            "user" => {
+                out.push_str(&format!("{}{}{}\n{}{}", turn_open, role_user, "\n", content, turn_close));
+                next_is_assistant = true;
+            }
+            "assistant" => {
+                // Historical assistant turn — close it like any other turn.
+                out.push_str(&format!("{}{}{}\n{}{}", turn_open, role_assistant, "\n", content, turn_close));
+                next_is_assistant = true;
+            }
+            "tool" => {
+                out.push_str(&format!("{}{}{}\n{}{}", turn_open, role_tool, "\n", content, turn_close));
+                next_is_assistant = true;
+            }
+            "system" => {
+                // Extra system messages inside history are ignored here;
+                // we only honor the first (or profile default).
+            }
+            _ => {}
+        }
+    }
+
+    // Open the assistant turn for the model to continue.
+    out.push_str(&format!("{}{}", turn_open, role_assistant));
+    if profile.opens_with_thinking {
+        out.push_str("\n<think>\n");
+    } else {
+        out.push_str("\n");
+    }
+
+    // Mark where the model should start writing.
+    let _ = next_is_assistant;
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

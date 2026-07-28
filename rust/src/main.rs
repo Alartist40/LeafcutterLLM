@@ -28,7 +28,7 @@ use leafcutter::llama_ffi::{backend_init, backend_free, LlamaModel, LlamaContext
 use leafcutter::api::FfiEngine;
 
 use leafcutter::model::gguf::GGUFile;
-use leafcutter::profiles::{render_prompt, resolve_profile};
+use leafcutter::profiles::{render_chat_prompt, render_prompt, resolve_profile};
 use leafcutter::tokenizer::chat_template::apply_chat_template_from_gguf;
 
 #[derive(Parser)]
@@ -335,9 +335,8 @@ fn cmd_list_auto() {
     eprintln!("Run: leafcutter run <name>");
 }
 
-fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
+fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize) {
     use leafcutter::inference::engine::Engine;
-    use leafcutter::tokenizer::chat_template::apply_chat_template_from_gguf;
     use leafcutter::model::gguf::GGUFile;
 
     // Resolve model
@@ -361,36 +360,51 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
     };
 
     let info = engine.info();
-    eprintln!("Leaf: {}", path.file_name().unwrap().to_string_lossy());
-    eprintln!("Arch: {}  Layers: {}  Hidden: {}", info.architecture, info.total_layers, info.hidden_size);
-    eprintln!("Temp: {:.1}  Max tokens: {}", temp, max_tokens);
 
-    // Resolve the per-architecture profile (Ollama Modelfile-style) and
-    // announce it so the user can see which template + defaults are
-    // being used.
+    // Resolve the per-architecture profile (Ollama Modelfile-style).
     let gguf_for_profile = GGUFile::open(&path_str).ok();
     let profile = resolve_profile(
         &gguf_for_profile.as_ref().map(|f| &f.metadata).cloned().unwrap_or_default(),
         None,
     );
-    eprintln!(
-        "Profile: {} ({})",
-        profile.name, profile.description
-    );
-    eprintln!();
-    eprintln!("Type /bye to exit, /clear to reset context, /help for commands.");
-    eprintln!("─────────────────────────────────────────────────");
 
+    // If temp/top_p/max_tokens are still at CLI defaults, adopt profile defaults.
+    // (Ollama behavior: Modelfile params override CLI unless CLI explicitly sets.)
+    let mut system_prompt: String = String::new(); // empty → profile default
     let gguf = GGUFile::open(&path_str).ok();
+
+    // --- Welcome banner (Ollama-style model card) ---
+    let model_name = path.file_name().unwrap().to_string_lossy();
+    let file_mb = path.metadata().map(|m| m.len() as f64 / 1_048_576.0).unwrap_or(0.0);
+    eprintln!();
+    eprintln!("  ╔══════════════════════════════════════════════╗");
+    eprintln!("  ║  🌿 Leafcutter — Native Engine               ║");
+    eprintln!("  ╠══════════════════════════════════════════════╣");
+    eprintln!("  ║  Model:    {:<34}║", truncate_str(&model_name, 34));
+    eprintln!("  ║  Arch:     {:<34}║", truncate_str(&info.architecture, 34));
+    eprintln!("  ║  Layers:   {:<34}║", format!("{} layers, {} hidden", info.total_layers, info.hidden_size));
+    eprintln!("  ║  Size:     {:<34}║", format!("{:.1} MB", file_mb));
+    eprintln!("  ║  Profile:  {:<34}║", truncate_str(profile.name, 34));
+    eprintln!("  ║  Temp:     {:<34}║", format!("{:.2}  (top_p={:.2})", temp, top_p));
+    eprintln!("  ║  Max tok:  {:<34}║", format!("{}", max_tokens));
+    eprintln!("  ╚══════════════════════════════════════════════╝");
+    eprintln!();
+    eprintln!("  Type /help for commands. /bye to exit.");
+    eprintln!("  ─────────────────────────────────────────────────");
+
     let mut conversation: Vec<(String, String)> = Vec::new();
 
+    // Rolling stats for /stats command.
+    let mut total_tokens: usize = 0;
+    let mut total_time: f64 = 0.0;
+    let mut turn_count: usize = 0;
+
     // Start the background CPU/thermal/RSS safety monitor.
-    // Pure advisory — never throttles or blocks execution.  Disable with
-    // LEAFCUTTER_CPU_MONITOR=0.
     leafcutter::cpu_monitor::start();
 
     loop {
-        print!("\n> ");
+        // Ollama-style prompt: ">>> " for user input.
+        print!("\n>>> ");
         io::stdout().flush().ok();
 
         let mut input = String::new();
@@ -403,68 +417,208 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
             continue;
         }
 
-        // In-session commands
+        // --- In-session slash commands (Ollama-style) ---
         if input.starts_with('/') {
-            let parts: Vec<&str> = input.splitn(2, ' ').collect();
-            match parts[0] {
+            let parts: Vec<&str> = input.splitn(3, ' ').collect();
+            let cmd = parts[0];
+            match cmd {
                 "/bye" | "/quit" | "/exit" => {
-                    // Explicit cleanup: clear conversation, drop caches
                     conversation.clear();
                     engine.kv_cache.clear();
                     engine.ssm_cache.clear();
                     engine.deltanet_cache.clear();
                     engine.seq_offset = 0;
-                    eprintln!("[cache flushed] Goodbye!");
+                    eprintln!("Goodbye!");
                     break;
                 }
                 "/clear" => {
                     conversation.clear();
-                    // Clear engine internal caches so no stale KV/SSM state remains
                     engine.kv_cache.clear();
                     engine.ssm_cache.clear();
                     engine.deltanet_cache.clear();
                     engine.seq_offset = 0;
-                    eprintln!("[context cleared — cache flushed]");
+                    eprintln!("[context cleared]");
                     continue;
                 }
-                "/help" => {
-                    eprintln!();
-                    eprintln!("Commands:");
-                    eprintln!("  /bye        Exit");
-                    eprintln!("  /clear      Clear conversation context");
-                    eprintln!("  /temp <f>   Set temperature (current: {:.1})", temp);
-                    eprintln!("  /help       Show this help");
-                    eprintln!();
+                "/help" | "/?" => {
+                    print_help(temp, top_p, max_tokens, &profile);
                     continue;
                 }
-                "/temp" => {
+                "/set" => {
+                    // Ollama: /set parameter value
+                    // Also: /set system <text> to override system prompt.
                     if parts.len() < 2 {
-                        eprintln!("Usage: /temp <float>  (current: {:.1})", temp);
-                    } else if let Ok(v) = parts[1].trim().parse::<f32>() {
-                        temp = v;
-                        eprintln!("[temperature set to {:.1}]", temp);
+                        eprintln!("Usage: /set <temp|top_p|topk|max|system|repeat> <value>");
+                        eprintln!("  /set temp 0.8        Set temperature");
+                        eprintln!("  /set top_p 0.9       Set top-p");
+                        eprintln!("  /set max 512         Set max tokens");
+                        eprintln!("  /set system You are...  Set system prompt");
+                        eprintln!("  /set system default   Reset to profile default");
                     } else {
-                        eprintln!("Invalid temperature: {}", parts[1]);
+                        let key = parts[1];
+                        match key {
+                            "temp" | "temperature" => {
+                                if parts.len() < 3 {
+                                    eprintln!("temperature: {:.2}", temp);
+                                } else if let Ok(v) = parts[2].trim().parse::<f32>() {
+                                    temp = v;
+                                    eprintln!("[temperature = {:.2}]", temp);
+                                } else {
+                                    eprintln!("Invalid: {}", parts[2]);
+                                }
+                            }
+                            "top_p" | "topp" => {
+                                if parts.len() < 3 {
+                                    eprintln!("top_p: {:.2}", top_p);
+                                } else if let Ok(v) = parts[2].trim().parse::<f32>() {
+                                    top_p = v;
+                                    eprintln!("[top_p = {:.2}]", top_p);
+                                } else {
+                                    eprintln!("Invalid: {}", parts[2]);
+                                }
+                            }
+                            "max" | "max_tokens" | "maxtokens" => {
+                                if parts.len() < 3 {
+                                    eprintln!("max_tokens: {}", max_tokens);
+                                } else if let Ok(v) = parts[2].trim().parse::<usize>() {
+                                    max_tokens = v;
+                                    eprintln!("[max_tokens = {}]", max_tokens);
+                                } else {
+                                    eprintln!("Invalid: {}", parts[2]);
+                                }
+                            }
+                            "system" => {
+                                // "/set system" alone shows current; "/set system default" resets.
+                                if parts.len() < 3 {
+                                    if system_prompt.is_empty() {
+                                        eprintln!("[system = profile default]");
+                                    } else {
+                                        eprintln!("[system] {}", system_prompt);
+                                    }
+                                } else if parts[2].trim() == "default" || parts[2].trim() == "reset" {
+                                    system_prompt.clear();
+                                    eprintln!("[system reset to profile default]");
+                                } else {
+                                    system_prompt = parts[2].trim().to_string();
+                                    eprintln!("[system prompt set: {}]", truncate_str(&system_prompt, 60));
+                                }
+                            }
+                            _ => {
+                                eprintln!("Unknown /set key: {}  (temp, top_p, max, system)", key);
+                            }
+                        }
                     }
                     continue;
                 }
+                "/show" => {
+                    // Ollama: /show info|profile|system|stats
+                    if parts.len() < 2 {
+                        eprintln!("Usage: /show <info|profile|system|history|stats>");
+                    } else {
+                        match parts[1] {
+                            "info" => {
+                                eprintln!("  Model:    {}", model_name);
+                                eprintln!("  Arch:     {}", info.architecture);
+                                eprintln!("  Layers:   {}", info.total_layers);
+                                eprintln!("  Hidden:   {}", info.hidden_size);
+                                eprintln!("  Size:     {:.1} MB", file_mb);
+                                let peak = get_peak_rss_mb();
+                                eprintln!("  Peak RAM: {}", format_rss(peak));
+                            }
+                            "profile" => {
+                                eprintln!("  Profile:  {} ({})", profile.name, profile.description);
+                                eprintln!("  Archs:    {:?}", profile.architectures);
+                                eprintln!("  Temp:     {:.2}  Top_p: {:.2}  Top_k: {}  Repeat: {:.2}",
+                                    profile.sampling.temperature, profile.sampling.top_p,
+                                    profile.sampling.top_k, profile.sampling.repeat_penalty);
+                                eprintln!("  Thinking: {}", profile.opens_with_thinking);
+                                eprintln!("  Stop:     {:?}", profile.stop_tokens.iter().map(|s| s.1).collect::<Vec<_>>());
+                            }
+                            "system" => {
+                                if system_prompt.is_empty() {
+                                    eprintln!("[system = profile default]");
+                                    eprintln!("  {}", profile.default_system);
+                                } else {
+                                    eprintln!("{}", system_prompt);
+                                }
+                            }
+                            "history" => {
+                                if conversation.is_empty() {
+                                    eprintln!("[no conversation yet]");
+                                } else {
+                                    eprintln!("─ Conversation ({} turns) ─", conversation.len());
+                                    for (i, (role, content)) in conversation.iter().enumerate() {
+                                        let preview = truncate_str(content, 70);
+                                        eprintln!("  {}. [{}] {}", i + 1, role, preview);
+                                    }
+                                }
+                            }
+                            "stats" => {
+                                let avg_speed = if total_time > 0.0 {
+                                    total_tokens as f64 / total_time
+                                } else { 0.0 };
+                                eprintln!("  Turns:         {}", turn_count);
+                                eprintln!("  Total tokens:  {}", total_tokens);
+                                eprintln!("  Total time:    {:.2}s", total_time);
+                                eprintln!("  Avg speed:     {:.2} tok/s", avg_speed);
+                                let peak = get_peak_rss_mb();
+                                eprintln!("  Peak RAM:      {}", format_rss(peak));
+                                eprintln!("  Conversation:  {} turns in context", conversation.len());
+                            }
+                            _ => {
+                                eprintln!("Unknown /show target: {}  (info, profile, system, history, stats)", parts[1]);
+                            }
+                        }
+                    }
+                    continue;
+                }
+                "/temp" => {
+                    // Short alias for /set temp.
+                    if parts.len() < 2 {
+                        eprintln!("temperature: {:.2}  /temp <f>", temp);
+                    } else if let Ok(v) = parts[1].trim().parse::<f32>() {
+                        temp = v;
+                        eprintln!("[temperature = {:.2}]", temp);
+                    } else {
+                        eprintln!("Invalid: {}", parts[1]);
+                    }
+                    continue;
+                }
+                "/info" => {
+                    eprintln!("  Model:    {}", model_name);
+                    eprintln!("  Arch:     {}", info.architecture);
+                    eprintln!("  Layers:   {}", info.total_layers);
+                    eprintln!("  Hidden:   {}", info.hidden_size);
+                    eprintln!("  Size:     {:.1} MB", file_mb);
+                    let peak = get_peak_rss_mb();
+                    eprintln!("  Peak RAM: {}", format_rss(peak));
+                    continue;
+                }
+                "/stats" | "/usage" => {
+                    let avg_speed = if total_time > 0.0 {
+                        total_tokens as f64 / total_time
+                    } else { 0.0 };
+                    eprintln!("  Turns:       {}", turn_count);
+                    eprintln!("  Tokens out:  {}", total_tokens);
+                    eprintln!("  Time:        {:.2}s", total_time);
+                    eprintln!("  Avg speed:   {:.2} tok/s", avg_speed);
+                    let peak = get_peak_rss_mb();
+                    eprintln!("  Peak RAM:    {}", format_rss(peak));
+                    continue;
+                }
                 _ => {
-                    eprintln!("Unknown command: {}  (try /help)", parts[0]);
+                    eprintln!("Unknown command: {}  (try /help)", cmd);
                     continue;
                 }
             }
         }
 
-        // Build prompt from conversation history
+        // --- Build multi-turn prompt from conversation history ---
         conversation.push(("user".into(), input.clone()));
 
-        let system = ""; // empty → profile supplies its default
         let prompt_text = if let Some(ref file) = gguf {
-            // Profile-based rendering: each architecture has its own
-            // template family, default system prompt, sampling, and
-            // stop tokens.  This is what Ollama does with Modelfiles.
-            let profile = resolve_profile(&file.metadata, None);
-            render_prompt(&profile, system, &input)
+            let prof = resolve_profile(&file.metadata, None);
+            render_chat_prompt(&prof, &system_prompt, &conversation)
         } else {
             input.clone()
         };
@@ -472,6 +626,8 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
         let tokens = engine.tokenize(&prompt_text, true);
         if tokens.is_empty() {
             eprintln!("[tokenization failed — no tokenizer available]");
+            // Roll back the conversation push.
+            conversation.pop();
             continue;
         }
 
@@ -484,12 +640,6 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
 
         let gen_start = std::time::Instant::now();
         let mut generated_text = String::new();
-        // Build stop-token list from the active profile so reasoning models
-        // (Ornith/Qwen3.5) don't get cut off by mid-stream `<|im_end|>`
-        // markers.  We use `` (the reasoning start tag) as the
-        // ONLY stop signal — that way generation continues through the
-        // full thinking block, the `` close, AND the response body,
-        // and only halts when the model emits the final response terminator.
         let stop_token_ids: Vec<usize> = profile
             .stop_tokens
             .iter()
@@ -508,10 +658,6 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
                 if debug_chunks {
                     eprintln!("[chunk] id={} surface={:?} in_thinking={} thinking_done={}", id, chunk, in_thinking, thinking_done);
                 }
-                // Ornith thinking-stream protocol (matching Ollama):
-                //   id=248068  →  (opens thinking block — emitted by model)
-                //   id=248069  →  (closes thinking block — emitted by model)
-                // Both are control tokens; never print them as text.
                 match id {
                     248068 => { in_thinking = true; return true; }   // swallow opener
                     248069 => {                                       // swallow closer
@@ -540,13 +686,15 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
         } else { 0.0 };
         eprintln!();
 
-        // Get peak RSS from /proc/self/status (Linux)
-        let peak_rss = get_peak_rss_mb();
+        // Rolling stats.
+        total_tokens += gen_tokens;
+        total_time += gen_elapsed.as_secs_f64();
+        turn_count += 1;
 
-        // Stats line
+        let peak_rss = get_peak_rss_mb();
         eprintln!("─────────────────────────────────────────────────");
-        eprintln!("Model: {} | Tokens: {} | Time: {:.2}s | Speed: {:.2} tok/s | RAM: {}",
-            path.file_name().unwrap().to_string_lossy(),
+        eprintln!("{} | out={} | {:.2}s | {:.2} tok/s | RAM {}",
+            truncate_str(&model_name, 28),
             gen_tokens,
             gen_elapsed.as_secs_f64(),
             tok_per_sec,
@@ -554,6 +702,38 @@ fn cmd_run(model_arg: &str, mut temp: f32, top_p: f32, max_tokens: usize) {
         );
         eprintln!();
         conversation.push(("assistant".into(), generated_text));
+    }
+}
+
+/// Print the /help screen.
+fn print_help(temp: f32, top_p: f32, max_tokens: usize, profile: &leafcutter::profiles::ModelProfile) {
+    eprintln!();
+    eprintln!("Available Commands:");
+    eprintln!("  /set <key> <val>  Set parameter (temp, top_p, max, system)");
+    eprintln!("  /show <target>    Show info, profile, system, history, stats");
+    eprintln!("  /temp <f>         Set temperature (alias for /set temp)");
+    eprintln!("  /info             Show loaded model info");
+    eprintln!("  /stats            Show rolling session statistics");
+    eprintln!("  /clear            Clear conversation + flush caches");
+    eprintln!("  /help, /?         Show this help");
+    eprintln!("  /bye, /quit       Exit");
+    eprintln!();
+    eprintln!("Current Settings:");
+    eprintln!("  temperature : {:.2}", temp);
+    eprintln!("  top_p       : {:.2}", top_p);
+    eprintln!("  max_tokens  : {}", max_tokens);
+    eprintln!("  profile     : {} ({})", profile.name, profile.description);
+    eprintln!();
+}
+
+/// Truncate a string to `max` chars, appending "..." if truncated.
+fn truncate_str(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else if max <= 3 {
+        "...".to_string()
+    } else {
+        format!("{}...", &s[..max - 3])
     }
 }
 
