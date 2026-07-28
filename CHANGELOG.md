@@ -71,6 +71,52 @@ the K-quant matmul kernels were always correct.
 
 ---
 
+## [Unreleased] — 2026-07-29 (Ollama-style chat REPL)
+
+### Added — Multi-turn conversation history
+
+`src/profiles.rs` gained `render_chat_prompt()` which renders the
+conversation history (system + user + assistant turns) using the
+profile's chat template (ChatML for Qwen3.5/Ornith, [INST]/[/INST]
+for Mistral, `<|start_header_id|>` for Llama 3, `<start_of_turn>` for
+Gemma).  The native REPL now feeds the FULL history each turn so the
+model can refer back to earlier exchanges.
+
+### Added — Ollama-style slash commands in the REPL
+
+  /help, /?            Show help
+  /set <key> <val>     Set temp, top_p, max, or system prompt
+  /show info|profile|system|history|stats  Inspect session state
+  /info, /stats, /temp  Aliases
+  /clear               Drop conversation + flush KV/SSM caches
+  /bye, /quit, /exit   Exit cleanly
+
+### Added — Welcome banner
+
+Box-drawn model card on session start (model, arch, layers, hidden,
+size, profile, temp, max-tokens).  Ollama-style `>>> ` prompt.
+
+### Known issue — Native engine diverges from Ollama after a few layers
+
+The CHUNK_DEBUG trace shows the native engine emits multilingual
+fragment tokens (`"ва"`, `"大"`, `"clearfix"`, `"stddef"`) where
+Ollama's same-model session produces clean English reasoning text
+("The user is asking a simple factual question...").  Layer-0 forward
+diff vs pure-Rust reference is **0.000013** (fp32 epsilon), so the
+DeltaNet layer 0 fix holds.  The divergence comes from a deeper layer
+or stage (embedding, FFN, attention, output projection, sampling).
+Scope not yet isolated; Ollama backend is the working chat path
+until the residual divergence is closed.
+
+### Verified — Ollama backend ground truth still works
+
+With `--engine ollama` the REPL produces the expected Ornith reasoning
+trace and final answer for "What is the capital of France?" — `💭 The
+user is asking a simple factual question... The capital of France is
+**Paris**.`
+
+---
+
 ## [Unreleased] — 2026-07-26 (stats line + cache cleanup on exit)
 
 ### Added — Post-response stats line
