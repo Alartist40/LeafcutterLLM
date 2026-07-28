@@ -75,6 +75,13 @@ pub fn deltanet_forward(
         let kernel = conv_w.shape[0];
         let (mut out, new_state) = causal_conv1d_cached(&qkv_proj, conv_w, kernel, &conv_state);
         state_cache.set_conv(layer_idx, new_state);
+        if std::env::var("LEAFCUTTER_DELTANET_DEBUG").is_ok() && layer_idx == 0 {
+            let mn = out.data.iter().cloned().fold(f32::INFINITY, f32::min);
+            let mx = out.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let am = out.data.iter().map(|v| v.abs()).sum::<f32>() / out.data.len() as f32;
+            eprintln!("  [deltanet] conv_out pre-silu: min={:.4} max={:.4} abs_mean={:.4}", mn, mx, am);
+        }
+
         // SiLU: x * sigmoid(x)
         for i in 0..out.data.len() {
             let x = out.data[i];

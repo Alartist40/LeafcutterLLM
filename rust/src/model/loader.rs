@@ -544,8 +544,13 @@ impl GGUFModel {
             }
             // 3-D MoE expert tensors are stored as quantized blocks (q_data)
             // and need eager dequantization so slice_experts can index .data.
-            if keep_shape_3d {
+            // Conv1d weight (ssm_conv1d.weight) is read element-by-element by
+            // the conv1d kernel (not as a matmul) — it needs f32 .data even
+            // though the matmul paths use .q_data.
+            if keep_shape_3d || engine_name.contains("ssm_conv1d") {
+                eprintln!("[loader] materializing {} (shape={:?})", engine_name, tensor.shape);
                 tensor.materialize_data();
+                eprintln!("[loader] after materialize: data.len={}", tensor.data.len());
             }
             weights.insert(engine_name.to_string(), tensor);
         }
