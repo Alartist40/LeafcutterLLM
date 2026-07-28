@@ -453,9 +453,11 @@ fn causal_conv1d_cached(
             let global_t = state_len + t;
             for k in 0..kernel_size.min(global_t + 1) {
                 let x_val = full_input[(global_t - k) * channels + c];
-                // PyTorch Conv1d convention: w[k-1] is the coefficient for the CURRENT input.
-                // Reverse the kernel index to match exported weights.
-                let w_idx = kernel_size - 1 - k;
+                // llama.cpp convention: causal conv1d weight is stored as
+                // w[k] directly (not reversed like PyTorch).
+                //   out[t] = sum_k x[t-k] * w[k]
+                // So for k=0 (current input) we use w[0], not w[kernel-1].
+                let w_idx = k;  // not (kernel_size - 1 - k)
                 let w_val = if weight.shape.len() == 1 {
                     weight.data[w_idx]
                 } else {
