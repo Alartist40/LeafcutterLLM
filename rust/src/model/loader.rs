@@ -534,8 +534,11 @@ impl GGUFModel {
                     (Tensor::from_q6_k_only(mat, shape_gguf.clone()), false)
                 }
                 _ => {
-                    let t = Self::dequantize(raw, info.typ, shape_data.clone())?;
-                    (t, true)
+                    // F32/F16/BF16: data is stored GGUF-native (row-major in
+                    // declared dims). Use shape_gguf DIRECTLY without swap.
+                    // The swap+transpose path is only correct for K-quants.
+                    let t = Self::dequantize(raw, info.typ, shape_gguf.clone())?;
+                    (t, false)
                 }
             };
             if is_2d && needs_transpose {
