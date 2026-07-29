@@ -73,6 +73,47 @@ the K-quant matmul kernels were always correct.
 
 ## [Unreleased] — 2026-07-29 (Ollama-style chat REPL)
 
+### Verified — Native engine works for standard transformers (Ministral)
+
+Built `probe_mini` debug binary to test the native engine on a non-hybrid
+model.  Prompt "The capital of France is" through Ministral-3-3B Q4_K_M
+produced top-token id=6993 = " **Paris**" (logit 11.42).  Standard
+transformer path is **correct** end-to-end.
+
+This is the locked-in baseline: the K-quant matmul kernels, RMSNorm,
+FFN forward, attention forward, LM head, sampling — all work
+correctly for standard Llama/Mistral-style architectures.
+
+### Known issue — Native engine diverges from Ollama on Qwen3.5 / Ornith
+
+Same prompt through Ornith-1.0-9B Q4_K_M (hybrid DeltaNet + attention)
+produces top-token id=1873 = "�\"�" (logit 10.76) — gibberish.
+Verified at temperature 0, with NO chat template, just raw forward
+through `Engine::forward`.  Output is wrong regardless of prompt
+format, so this is a forward-pass bug specific to the DeltaNet /
+Qwen3.5-hybrid code path.
+
+Layer 0 of the DeltaNet forward matches the pure-Rust reference to
+0.000013 (fp32 epsilon).  The bug is therefore NOT in DeltaNet
+layer 0.  Suspects (unisolated): DeltaNet layers 1+, FFN forward
+on Qwen3.5-style weights, attention_forward on layers 3/7/11/...,
+post-attention norm, the LM head, or sampling.
+
+### Verified — Ollama backend still produces clean English
+
+`--engine ollama` chat for the same Ornith model produces the
+expected thinking trace + "**Paris**" response.  Ollama is the
+reliable chat path for hybrid models until the native bug closes.
+
+### Reverted — Ornith raw-prompt branch in render_chat_prompt
+
+Originally added a raw-text branch for the ornith profile based on
+a misreading of Ollama's Modelfile template.  Re-investigated via
+Ollama's /api/generate context dump: Ollama actually sends a full
+ChatML-wrapped prompt with `<|im_start|>system ... <|im_start|>user
+... <|im_start|>assistant\n`.  Reverted to standard ChatML wrapping
+so native engine matches Ollama's prompt structure.
+
 ### Added — Multi-turn conversation history
 
 `src/profiles.rs` gained `render_chat_prompt()` which renders the
