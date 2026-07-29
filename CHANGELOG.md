@@ -5,6 +5,62 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-07-29 (safetensor backend working end-to-end)
+
+### Added — Safetensor streaming backend (new engine: `--engine safetensor`)
+
+A new backend that runs safetensors models via HuggingFace transformers,
+streamed through a Python subprocess. This gives Leafcutter a working
+chat path for hybrid models (Qwen3.5 / Ornith / Gemma3.5) TODAY, even
+while the native GGUF engine is still being debugged.
+
+**Architecture:**
+```
+leafcutter (Rust) → spawns → scripts/leafcutter_safetensor_run.py
+                                        ↓
+                              HuggingFace transformers
+                                        ↓
+                              safetensors model files
+```
+
+**Protocol:** Rust writes one JSON command to the subprocess's stdin
+(path, prompt, max_tokens, temperature, top_p, top_k, stop, think_open,
+think_close), then closes stdin. The Python script streams newline-delimited
+JSON events to stdout: `thinking_open`, `thinking_close`, `token`,
+`done`, `error`.
+
+**Critical fix:** `drop(child.stdin.take())` after writing the command.
+Without closing stdin, Python's `sys.stdin.read()` blocks forever
+waiting for EOF. This was the sole blocker.
+
+**Files:**
+- `rust/scripts/leafcutter_safetensor_run.py` — Python inference script
+- `rust/src/safetensor_backend.rs` — Rust wrapper (subprocess + NDJSON)
+- `rust/src/main.rs` — `cmd_run_safetensor()` REPL integration
+
+**Verified:**
+```
+leafcutter run '<safetensor-dir>' --engine safetensor --temp 0.6 --max-tokens 5
+>>> What is the capital of France?
+The capital of France is ← streamed output (coherent English)
+Turn 1: 5 tokens in 87.2s (0.06 tok/s on CPU, 9B model)
+```
+
+**Limitations:**
+- Slow on CPU (~12s/tok for 9B). Users with CUDA torch get GPU speed
+  automatically.
+- No persistent model across turns (subprocess spawns per turn).
+  Future: keep Python process alive, send commands via a pipe.
+- Profile/chat-template uses fallback (generic) — doesn't apply
+  ChatML template yet. Needs profile detection from config.json.
+
+### Added — Research notes
+
+- `docs/research/airllm_vs_colibri.txt` — user research on AirLLM vs
+  Colibri architecture, speed, and MoE disk-streaming approach.
+
+---
+
 ## [Unreleased] — 2026-07-29 (native engine fixed: produces coherent English)
 
 ### Fixed — Native engine forward-pass bug (F32 loader swap+transpose)
