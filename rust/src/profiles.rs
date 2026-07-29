@@ -320,6 +320,23 @@ pub fn render_chat_prompt(
     system: &str,
     history: &[(String, String)],
 ) -> String {
+    // Ornith 1.0 uses Ollama's RAW prompt template (`{{ .Prompt }}` with
+    // the system prompt prepended).  The model was trained on raw text,
+    // NOT ChatML.  Match Ollama's behavior so the native engine and
+    // the Ollama backend produce identical prompts.
+    if profile.name == "ornith" {
+        let sys = if system.is_empty() { profile.default_system } else { system };
+        let mut out = String::new();
+        if !sys.is_empty() {
+            out.push_str(sys);
+            out.push_str("\n\n");
+        }
+        for (_role, content) in history {
+            out.push_str(content);
+            out.push_str("\n\n");
+        }
+        return out;
+    }
     if profile.raw_continuation {
         // Raw continuation: just concatenate everything with blank
         // lines.  No chat template.

@@ -1045,6 +1045,16 @@ impl Engine {
                 } else { None };
 
             for layer_idx in 0..num_layers {
+                if std::env::var("LEAFCUTTER_DEBUG_LAYERS").is_ok() {
+                    let l2 = hidden.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
+                    let max = hidden.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                    let min = hidden.data.iter().cloned().fold(f32::INFINITY, f32::min);
+                    let nan_count = hidden.data.iter().filter(|&&v| v.is_nan()).count();
+                    eprintln!(
+                        "[LAYER {layer_idx:>2}] pre  n={:>6}  l2={:>10.3}  min={:>12.4}  max={:>12.4}  nan={}",
+                        hidden.data.len(), l2, min, max, nan_count
+                    );
+                }
                 if is_gemma {
                     let cfg = &self.gemma_layouts[layer_idx];
                     let new_hidden = crate::inference::gemma::gemma_layer_forward(
@@ -1084,9 +1094,18 @@ impl Engine {
 
                     if has_standard_attn {
                         let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
+                        if std::env::var("LEAFCUTTER_DEBUG_LAYERS").is_ok() {
+                            let l2 = attn_out.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
+                            eprintln!("  [layer {layer_idx}] attn_out l2={l2:.3}");
+                        }
                         hidden = hidden.add(&attn_out);
                     } else if has_deltanet {
                         let deltanet_out = deltanet_forward(&normed, &layer_weights, &self.deltanet_params, &mut self.deltanet_cache, layer_idx);
+                        if std::env::var("LEAFCUTTER_DEBUG_LAYERS").is_ok() {
+                            let l2 = deltanet_out.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
+                            let max = deltanet_out.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                            eprintln!("  [layer {layer_idx}] deltanet_out l2={l2:.3} max={max:.4}");
+                        }
                         hidden = hidden.add(&deltanet_out);
                     } else if has_ssm {
                         let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
