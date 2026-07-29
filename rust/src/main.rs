@@ -203,6 +203,8 @@ async fn main() {
         Some(Commands::Run { model, temp, top_p, max_tokens, engine, ollama_host }) => {
             if engine == "ollama" {
                 cmd_run_ollama(&model, temp, top_p, max_tokens, &ollama_host);
+            } else if engine == "safetensor" || engine == "safetensors" {
+                cmd_run_safetensor(&model, temp, top_p, max_tokens);
             } else {
                 cmd_run(&model, temp, top_p, max_tokens);
             }
@@ -280,6 +282,222 @@ fn scan_models(dir: &PathBuf) -> Vec<(PathBuf, u64)> {
     models.sort_by(|a, b| a.0.file_name().cmp(&b.0.file_name()));
     models
 }
+
+/// Streaming chat via the safetensor subprocess backend.
+///
+/// Spawns `scripts/leafcutter_safetensor_run.py` (HuggingFace
+/// transformers + safetensors).  This is the reference-correct path
+/// for hybrid models like Qwen3.5 / Ornith while the native GGUF
+/// engine is being debugged.  CPU-only by default; users with a
+/// CUDA build of torch get GPU acceleration automatically (set
+/// CUDA_VISIBLE_DEVICES if needed).
+fn cmd_run_safetensor(model_arg: &str, mut temp: f32, _top_p: f32, mut max_tokens: usize) {
+    use leafcutter::model::gguf::GGUFile;
+    use leafcutter::profiles::{render_chat_prompt, resolve_profile};
+
+    // Resolve the model directory (accept either a path or a fuzzy name).
+    let path = std::path::PathBuf::from(model_arg);
+    let path = if path.exists() {
+        path
+    } else {
+        // Try common dirs before giving up.
+        let candidates = [
+            "/home/xander/Downloads/models",
+            "/home/xander/Documents/portfolio/LeafcutterLLM",
+        ];
+        let mut found = None;
+        for dir in &candidates {
+            if let Ok(rd) = std::fs::read_dir(dir) {
+                for entry in rd.flatten() {
+                    let p = entry.path();
+                    if p.is_dir()
+                        && p.file_name()
+                            .map(|n| n.to_string_lossy().to_lowercase()
+                                .contains(&model_arg.to_lowercase()))
+                            .unwrap_or(false)
+                    {
+                        found = Some(p);
+                        break;
+                    }
+                }
+            }
+            if found.is_some() {
+                break;
+            }
+        }
+        match found {
+            Some(p) => p,
+            None => {
+                eprintln!("Safetensor model directory '{}' not found.", model_arg);
+                std::process::exit(1);
+            }
+        }
+    };
+
+    // Read metadata from config.json (best-effort; safetensors may not
+    // have a GGUF-style .gguf file, but most do ship a config.json).
+    let config_path = path.join("config.json");
+    let profile = if config_path.exists() {
+        match GGUFile::open(config_path.to_string_lossy().as_ref()) {
+            Ok(_) => resolve_profile(&Default::default(), None),
+            Err(_) => resolve_profile(&Default::default(), None),
+        }
+    } else {
+        resolve_profile(&Default::default(), None)
+    };
+
+    eprintln!(
+        "🌿 Leafcutter via Safetensors (transformers)\n   Model: {}\n   Temp:  {:.2}  Max tokens: {}\n─────────────────────────────────────────────────",
+        path.display(),
+        temp,
+        max_tokens
+    );
+    eprintln!("Profile: {} ({})", profile.name, profile.description);
+    eprintln!();
+    eprintln!("Type /bye to exit, /clear to reset context, /help for commands.");
+
+    let model_dir = path.to_string_lossy().to_string();
+    let mut conversation: Vec<(String, String)> = Vec::new();
+    let mut system_prompt = String::new();
+    let mut total_tokens = 0usize;
+    let mut total_time = 0.0f64;
+    let mut turn_count = 0usize;
+
+    loop {
+        print!("\n>>> ");
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            break;
+        }
+        let input = input.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+        if input.starts_with('/') {
+            let parts: Vec<&str> = input.splitn(2, ' ').collect();
+            match parts[0] {
+                "/bye" | "/quit" | "/exit" => {
+                    eprintln!("Goodbye!");
+                    break;
+                }
+                "/clear" => {
+                    conversation.clear();
+                    system_prompt.clear();
+                    eprintln!("[context cleared]");
+                    continue;
+                }
+                "/help" => {
+                    eprintln!();
+                    eprintln!("Available Commands:");
+                    eprintln!("  /temp <f>         Set temperature");
+                    eprintln!("  /set system <t>   Override system prompt");
+                    eprintln!("  /clear            Clear conversation");
+                    eprintln!("  /bye, /quit       Exit");
+                    eprintln!("  /show stats       Rolling stats");
+                    eprintln!();
+                    continue;
+                }
+                "/temp" => {
+                    if parts.len() < 2 {
+                        eprintln!("temperature: {:.2}", temp);
+                    } else if let Ok(v) = parts[1].trim().parse::<f32>() {
+                        temp = v;
+                        eprintln!("[temperature = {:.2}]", temp);
+                    } else {
+                        eprintln!("Invalid: {}", parts[1]);
+                    }
+                    continue;
+                }
+                "/set" => {
+                    let rest = parts.get(1).copied().unwrap_or("").trim();
+                    if rest.starts_with("system") {
+                        let new_sys = rest.trim_start_matches("system").trim();
+                        if new_sys == "default" || new_sys == "reset" || new_sys.is_empty() {
+                            system_prompt.clear();
+                            eprintln!("[system reset to profile default]");
+                        } else {
+                            system_prompt = new_sys.to_string();
+                            eprintln!("[system prompt set: {}]", new_sys);
+                        }
+                    } else {
+                        eprintln!("Usage: /set system <text>  or  /set system default");
+                    }
+                    continue;
+                }
+                "/show" => {
+                    if parts.len() >= 2 && parts[1] == "stats" {
+                        let avg_speed = if total_time > 0.0 {
+                            total_tokens as f64 / total_time
+                        } else { 0.0 };
+                        eprintln!("  Turns: {}", turn_count);
+                        eprintln!("  Tokens out: {}", total_tokens);
+                        eprintln!("  Time: {:.2}s", total_time);
+                        eprintln!("  Avg speed: {:.2} tok/s", avg_speed);
+                    } else {
+                        eprintln!("Usage: /show stats");
+                    }
+                    continue;
+                }
+                _ => {
+                    eprintln!("Unknown: {}  (try /help)", parts[0]);
+                    continue;
+                }
+            }
+        }
+
+        conversation.push(("user".into(), input.clone()));
+        let prompt = render_chat_prompt(&profile, &system_prompt, &conversation);
+        eprintln!();
+
+        let gen_start = std::time::Instant::now();
+        let stop = profile.stop_tokens.iter().map(|s| s.1.to_string()).collect::<Vec<_>>();
+        let cb_start = std::time::Instant::now();
+        let mut first_token_time: Option<std::time::Duration> = None;
+        let result = leafcutter::safetensor_backend::stream(
+            &model_dir,
+            &prompt,
+            max_tokens,
+            temp,
+            0.95,
+            20,
+            &stop,
+            |text, in_thinking| {
+                if first_token_time.is_none() {
+                    first_token_time = Some(cb_start.elapsed());
+                }
+                if in_thinking {
+                    eprint!("💭{}", text);
+                } else {
+                    eprint!("{}", text);
+                }
+                let _ = std::io::stdout().flush();
+                true
+            },
+        );
+        let gen_elapsed = gen_start.elapsed();
+        eprintln!();
+        match result {
+            Ok(n) => {
+                total_tokens += n;
+                total_time += gen_elapsed.as_secs_f64();
+                turn_count += 1;
+                eprintln!("─────────────────────────────────────────────────");
+                eprintln!("Turn {}: {} tokens in {:.1}s ({:.2} tok/s)",
+                    turn_count, n, gen_elapsed.as_secs_f64(),
+                    if gen_elapsed.as_secs_f64() > 0.0 { n as f64 / gen_elapsed.as_secs_f64() } else { 0.0 });
+                eprintln!();
+                conversation.push(("assistant".into(), String::new()));
+            }
+            Err(e) => {
+                eprintln!("[safetensor backend error] {}", e);
+                eprintln!("Hint: install Python deps:  pip install transformers torch safetensors");
+                continue;
+            }
+        }
+    }
+}
+
 
 /// Find a model by fuzzy name match (case-insensitive substring)
 fn find_model(name: &str) -> Option<PathBuf> {
