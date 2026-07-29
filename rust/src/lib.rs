@@ -65,6 +65,7 @@ pub mod llama_ffi {
 pub mod model;
 pub mod ollama_backend;
 pub mod profiles;
+pub mod bpe_tokenizer;
 pub mod safetensor_backend;
 pub mod safetensors_loader;
 pub mod shard;
