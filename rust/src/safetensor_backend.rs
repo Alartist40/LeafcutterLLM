@@ -124,11 +124,14 @@ where
         .spawn()
         .map_err(|e| format!("spawn {python} {script}: {e}"))?;
 
+    eprintln!("[safetensor-backend] spawned {python} {script}");
     if let Some(stdin) = child.stdin.as_mut() {
         stdin
             .write_all(cmd_json.as_bytes())
             .map_err(|e| format!("write stdin: {e}"))?;
     }
+    // Close stdin so the Python script's read() returns EOF promptly.
+    drop(child.stdin.take());
 
     let stdout = child
         .stdout

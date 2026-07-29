@@ -1,0 +1,107 @@
+Great question, and you’re right that there’s almost no clean side‑by‑side benchmark. The short version:
+
+- **For the same model size (e.g., a 70B dense model), AirLLM will almost certainly be faster than Colibri in its current form.**  
+- **Colibri’s advantage is not “C vs Python”; it’s “MoE + disk streaming + minimal RAM use” that lets you run way bigger models (hundreds of billions) on tiny machines.**  
+- The “slow” reports for both are mostly about **memory‑vs‑speed trade‑offs**, not about C being slower than Python.
+
+Below is why, and how to think about it.
+
+## What Colibri actually does
+
+Colibri is built for one very specific scenario: run a **massive MoE model** (like GLM‑5.2, ~744B total params) on a **laptop with ~25 GB RAM** and no GPU. [github](https://github.com/JustVugg/colibri)
+
+Key points:
+
+- It’s a **pure C engine**, ~1,300–2,400 lines, no BLAS, no Python at runtime. [linkedin](https://www.linkedin.com/posts/alxgirard_github-justvuggcolibri-run-glm-52-744b-activity-7482624697768116225-GssU)
+- It relies on **Mixture‑of‑Experts (MoE)**: only a small fraction of parameters are active per token (e.g., ~40B of 744B, ~5%). [linkedin](https://www.linkedin.com/posts/alxgirard_github-justvuggcolibri-run-glm-52-744b-activity-7482624697768116225-GssU)
+- The **routed experts live on disk** (~hundreds of GB) and are **streamed on demand** into RAM via a per‑layer LRU cache. [github](https://github.com/JustVugg/colibri)
+- Typical speeds reported:
+  - Dev laptop (12‑core, 25 GB RAM): **0.05–0.1 tok/s** cold.
+  - Better NVMe + more RAM: **0.28–0.37 tok/s**.
+  - Apple M5 Max with Metal: up to **~1.06 tok/s**. [youtube](https://www.youtube.com/watch?v=_2knU_H8XwU)
+
+So Colibri is slow **by design**: it trades speed for the ability to run frontier‑scale models on consumer hardware. The bottleneck is **disk I/O and tiny active set**, not “C being slow.” [linkedin](https://www.linkedin.com/posts/alxgirard_github-justvuggcolibri-run-glm-52-744b-activity-7482624697768116225-GssU)
+
+## What AirLLM actually does
+
+AirLLM is a **Python library** focused on **layer‑wise inference** to shrink VRAM/RAM needs for very large dense models (like 70B or 405B). [pypi](https://pypi.org/project/airllm/2.3.0/)
+
+Key points:
+
+- It **loads one layer at a time** into GPU/CPU memory, so a 70B model can run on a **4 GB GPU** or very small RAM. [pypi](https://pypi.org/project/airllm/2.3.0/)
+- It can run **full precision** or use **block‑wise quantization** (e.g., 4‑bit) for up to ~3× speedup with small accuracy loss. [grokipedia](https://grokipedia.com/page/AirLLM)
+- It’s widely described as **“insanely slow”** when you push it to the extreme low‑memory regime, but still usable for experimentation. [ai505](https://ai505.com/airllm-run-70b-models-on-your-4gb-gpu-but-pack-a-lunch/)
+
+AirLLM’s slowness comes from:
+
+- Constantly loading/unloading layers.
+- Small batch sizes and non‑optimized kernels.
+- Python overhead and less specialized low‑level tuning compared to C/LLM‑focused runtimes.
+
+But it’s still **not designed for 700B‑class models**; its sweet spot is 70B–405B dense models on tiny GPUs.
+
+## C vs Python: why that’s not the main factor here
+
+You’re right that C is generally faster than Python for raw compute. But in both systems:
+
+- The **dominant cost is not raw FLOPs**, it’s:
+  - Disk I/O (Colibri streaming experts).
+  - Memory movement (AirLLM loading layers).
+  - Cache misses and bandwidth limits.
+- In Colibri, the **disk → RAM → compute pipeline** is the bottleneck; even a perfect C GEMM would not make it “fast” in the usual sense.
+- In AirLLM, the **layer‑by‑layer loading pattern** dominates; Python overhead is a penalty, but not the main reason it’s slow.
+
+So “C should be faster” is true in principle, but here the **system design choices** (streaming experts vs layer‑wise inference) dominate performance.
+
+## If you compare equal model sizes
+
+There is no public, rigorous benchmark that runs **the exact same 70B model** on both Colibri and AirLLM under identical hardware and settings. But we can reason:
+
+- Colibri is specialized for **huge MoE models** with disk streaming. Running a normal 70B dense model on it would mean:
+  - Either porting that model into Colibri’s format and engine (non‑trivial).
+  - Losing its main advantage (MoE + disk streaming).
+- AirLLM is already set up for **70B dense models** and optimized around that use case (layer‑wise, optional quantization).
+
+Given that:
+
+- For a **70B dense model**, AirLLM’s architecture is a better match, so it will almost certainly be **faster and more practical** than trying to force that workload into Colibri’s MoE‑disk engine.
+- Colibri’s “0.05–1 tok/s” numbers are for **744B MoE** on tiny RAM; if you ran a 70B model in a more conventional way on the same hardware, you could likely get much higher speeds, but then you’re no longer using Colibri as intended.
+
+So:
+
+- **Same model class (70B dense)** → AirLLM is likely faster and easier.
+- **Massive MoE (hundreds of B)** on tiny RAM → Only Colibri‑style approaches are realistic right now.
+
+## Why both are called “slow”
+
+Both are called slow because they push into **extreme memory‑constrained regimes**:
+
+- Colibri: “You can run a 744B MoE on 25 GB RAM, but expect sub‑1 tok/s on most laptops.” [flowtivity](https://flowtivity.ai/blog/colibri-glm-52-local-inference-disk-streaming/)
+- AirLLM: “You can run a 70B model on a 4 GB GPU, but inference will be very slow compared to normal setups.” [ai505](https://ai505.com/airllm-run-70b-models-on-your-4gb-gpu-but-pack-a-lunch/)
+
+They are **proof‑of‑concept / accessibility tools**, not production‑grade high‑throughput engines.
+
+## How you could test this yourself
+
+If you really want a side‑by‑side:
+
+1. Pick a model both can run (likely a smaller MoE or a 70B‑class model if Colibri can be adapted).
+2. Use the same hardware:
+   - Same CPU, RAM, SSD/NVMe.
+   - Same OS and power settings.
+3. Measure:
+   - Tokens per second (average over a long prompt).
+   - Time to first token.
+   - RAM/VRAM usage.
+4. Run multiple prompts and average.
+
+If you tell me your exact hardware (CPU, RAM, disk type, GPU if any), I can sketch a concrete benchmark plan and even help you write a small script to collect and compare results.
+
+## Bottom line
+
+- Colibri’s “C engine” is not slow because of C; it’s slow because it streams massive MoE models from disk to fit in tiny RAM.
+- AirLLM’s Python implementation is not the main reason it’s slow; it’s the layer‑by‑layer inference on minimal VRAM.
+- For **equal‑sized dense models (e.g., 70B)**, AirLLM is almost certainly the more practical and faster choice on typical hardware.
+- For **frontier‑scale MoE models (hundreds of B) on very small RAM**, Colibri‑style systems are in a different category and have no real competitor yet.
+
+If you want, next step can be: “Design a simple benchmark for my laptop” or “Explain MoE vs dense in more depth so I see why Colibri can do 744B and AirLLM can’t.”

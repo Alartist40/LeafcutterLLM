@@ -330,3 +330,115 @@ However, the **Jetson Orin Nano** ($499) has both ARM CPU and Ampere GPU. This i
 ---
 
 *End of strategy. No code was harmed in the making of this document.*
+
+
+
+
+
+
+
+new strategy 
+notes
+AirLLM uses HuggingFace transformers standard API (model.generate). It works on safetensors.
+    
+    Key insight: AirLLM and Colibri don't build their own forward pass. AirLLM uses HuggingFace transformers. Colibri has its own C engine. The user's strategy is correct: if we can get ANY native safetensor forward working
+    in leafcutter that produces coherent English, that's a real breakthrough — even if GGUF is broken.
+    
+    Let me think about the simplest approach: add a safetensor-based engine to leafcutter that uses HuggingFace transformers under the hood. This would be the "safetensor backend" — analogous to the existing ollama backend. It
+    would:
+    1. Use Python+torch via subprocess to run inference
+    2. Stream tokens back via stdout
+    3. Use HuggingFace's safetensors
+    
+    Or even simpler — since leafcutter is Rust, we could shell out to a Python script that does the work and streams tokens back.
+    
+OK — OllamaClient just makes HTTP calls. Clean pattern.
+    
+    Let me design the approach. The user wants safetensor-based streaming. The simplest approach:
+    
+    Option A: Python subprocess shell-out
+    
+    Write a Python script leafcutter_safetensor_run.py that:
+    1. Loads safetensors via transformers
+    2. Runs greedy/temperature sampling
+    3. Streams tokens to stdout
+    4. Supports thinking mode (Ornith's reasoning tokens)
+    
+    Then add a Rust wrapper safetensor_backend.rs that:
+    1. Detects safetensor paths (model-*.safetensors + index)
+    2. Spawns the Python script as subprocess
+    3. Streams stdout tokens back to the REPL
+    
+    Option B: Direct Python via PyO3
+    
+    Add PyO3 to leafcutter and call Python directly. More complex, requires rebuild.
+    
+    Option C: Pure Rust safetensor loader + candle/tch
+    
+    Add the candle Rust ML library and load safetensors directly in Rust. Most native but requires writing the full forward pass in Rust.
+    
+    Option A is fastest to ship today. Let me do that.
+    
+    But first — let me verify my hypothesis that the safetensor model works correctly. I already showed that:
+    - Top token for "The capital of France is" → " Paris" (logit 16.25)
+    - Top token for full ChatML prompt → "" (think start, logit 34.5)
+    
+    The model is correct. Now let me build the Python streaming script.
+    
+    Let me update the todo list and start:
+
+    
+I hear you. Let me give you my honest strategic thinking:
+    
+    Status of the safetensor attempt: The Python script works perfectly in isolation (verified " Paris" output in 60s). But the Rust wrapper integration into the leafcutter binary has a bug — it's hanging or not streaming. I'll
+    need to debug why. Given the complexity of integrating Python subprocess + streaming JSON + reading into the Rust REPL, this might take longer than expected. Let me commit what we have so far (working Python script + Rust module)
+    and continue.
+    
+    Honest assessment of your three options:
+    
+    1. Safetensors (AirLLM-style):
+    - Pros: We have a working Python script. Reference-correct for hybrid models. Same architecture as AirLLM.
+    - Cons: Slow on CPU (~12s/tok for 9B). Just as slow as AirLLM. Won't beat them. Adding a Rust wrapper around Python subprocess is complex (which is why our first attempt hung).
+    - Verdict: Safe path, but doesn't differentiate us. We become "another AirLLM".
+    
+    2. Ollama (HTTP):
+    - Pros: Ollama works. Their /api/generate endpoint is simple HTTP.
+    - Cons: We've debugged Ollama for days and STILL don't know what's different about their forward pass. The native engine matches layer 0 but diverges later. We can't replicate Ollama without figuring out the divergence.
+    - Verdict: ❌ Dead end for now. The native engine needs to be fixed independently of Ollama.
+    
+    3. Colibri (C, hardware-flex):
+    - Pros: Their own system, written from scratch. Pure C — works without CUDA. CPU implementations exist. This is the "build it ourselves properly" path.
+    - Cons: 12,000+ lines of C. Porting all of it to Rust is a massive undertaking. We'd be reinventing the wheel.
+    - Key insight from your question: YES, Colibri has CPU code paths (looking at backend_loader.c, decode_batch.h). It's not GPU-only. The CUDA backend is optional for speed, not correctness.
+    
+    My recommendation:
+    
+    Build a pure-Rust safetensor loader using candle (Rust ML framework). Not AirLLM-style Python subprocess. Instead:
+    
+    1. Add candle-core and candle-transformers as Rust deps
+    2. Write a Rust safetensor loader (candle handles safetensors natively)
+    3. Use candle's Qwen3 / Qwen3_5 model implementation (already exists in candle-transformers!)
+    4. Wire that as the "safetensor" backend
+    
+    This is better than AirLLM because:
+    - Same architecture (safetensors), but compiled native Rust — no Python startup overhead, no GIL
+    - Candle already has Qwen3_5 support (their Qwen3 implementation handles hybrid)
+    - Works on CPU and GPU (candle has CPU + CUDA + Metal backends)
+    - Not reinventing wheels — using candle's proven model code
+    
+    This is better than Colibri because:
+    - Much less code (candle handles the heavy lifting)
+    - Rust-native fits leafcutter's identity
+    - AirLLM only works on CUDA; candle works on CPU too
+    - We don't write our own forward pass from scratch
+    
+    Concrete next steps:
+    
+    1. Check if candle is already in Cargo.toml (probably not — that's the gap)
+    2. Add candle-core, candle-nn, candle-transformers, candle-examples 
+    3. Write a Rust module candle_backend.rs (mirroring safetensor_backend.rs pattern)
+    4. Test it produces "Paris" with the safetensors model
+    
+    Let me get started on this. The safetensor subprocess path we just built is a workable fallback, but the candle path is the strategic winner. Let me commit current work first:
+
+
