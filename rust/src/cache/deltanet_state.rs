@@ -53,6 +53,16 @@ impl DeltaNetStateCache {
         self.conv_states.insert(layer_idx, state);
     }
 
+    /// Get a mutable reference to the conv buffer for a layer, initializing if needed.
+    /// The conv buffer has shape [conv_dim, conv_k] stored flat as [c * conv_k + k] where
+    /// k=0 is the oldest input and k=conv_k-1 is the newest (current) input.
+    pub fn get_conv_buf_mut(&mut self, layer_idx: usize, conv_dim: usize, conv_k: usize) -> &mut Vec<f32> {
+        let entry = self.conv_states.entry(layer_idx).or_insert_with(|| {
+            vec![0.0f32; conv_dim * conv_k]
+        });
+        entry
+    }
+
     /// Report memory usage in bytes.
     pub fn memory_bytes(&self) -> usize {
         let state_bytes: usize = self.states.values().map(|v| v.len() * 4).sum();

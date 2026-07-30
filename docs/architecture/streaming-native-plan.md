@@ -5,8 +5,25 @@
 ## I. Streaming Native Rust Forward Pass — Implementation Plan
 
 > **Date:** 2026-07-30
-> **Status:** Active — step-by-step plan for human + AI pair programming
+> **Status:** ACTIVE — pipeline validated, debugging correctness
 > **Goal:** Beat AirLLM in speed. Run large models on small hardware. Pure Rust, minimal deps.
+
+### Progress (2026-07-30 end of day)
+
+| Milestone | Status |
+|-----------|--------|
+| Architecture validated (32 layers process, 137s) | ✅ |
+| Layer 0 token 0 hidden state matches Python | ✅ (Rust=0.0278 vs Python=0.0276) |
+| Real DeltaNet forward (vs placeholder) | ✅ |
+| Bug #1 — State update order (decay→predict→update) | ✅ Fixed |
+| Bug #2 — Qwen3_5MoeRMSNorm `(1 + weight)` | ✅ Fixed (line 750 + 572/582) |
+| Bug #3 — Sigmoid attention gate (not silu) | ✅ Fixed (line 663) |
+| Bug #4 — GLM-style split RoPE | ✅ Fixed (lines 571-599) |
+| Bug #5 — Conv1d buffer shift | ✅ Fixed |
+| Bug #6 — Decay computation (A_log convention) | 🔧 Identified, not yet applied |
+| " Paris" logit gap: 16.71 → 16.10 (from +0.150 to reference 16.25) | 🔧 In progress |
+
+See `strategy.md` for the full debugging plan and architecture reference.
 
 ### Background
 

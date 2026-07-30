@@ -1,8 +1,264 @@
-# LeafcutterLLM Strategy — Complete Build Guide
+# LeafcutterLLM Strategy — Streaming Native Rust Forward Pass
 
 > **Date:** 2026-07-30
+> **Status:** ACTIVE — 6 bugs fixed, debugging remaining divergence
 > **Goal:** Beat AirLLM in speed. Run large models on small hardware. Pure Rust, minimal deps.
 > **Workflow:** Hermes writes detailed plans + code. You build, test, report. Hermes diagnoses.
+
+---
+
+## Current State (updated 2026-07-30, end of day)
+
+### ✅ Working — Python subprocess backend (reference for correctness)
+`leafcutter run <dir> --engine safetensor` produces " Paris" (id=11751, logit=16.25).
+This is the gold standard we're matching.
+
+### ✅ Working — Rust infrastructure (reusable)
+- `src/safetensors_loader.rs` — slice reads (`read_tensor_slice_f32`)
+- `src/bpe_tokenizer.rs` — verified BPE
+- `src/ornith_config.rs` — config parsing
+- `src/model/tensor.rs` — `Tensor::matmul` uses `matrixmultiply::sgemm`
+
+### ✅ Working — Streaming pipeline validated end-to-end
+- `src/streaming_ornith.rs` — 750 lines, processes all 32 layers (137s)
+- `src/cache/deltanet_state.rs` — DeltaNet state cache + conv buffer
+
+### 🔧 In progress — Debugging correctness
+**6 bugs fixed so far:**
+1. ~~State update order~~ ✓ (decay → predict → update)
+2. ~~Qwen3_5MoeRMSNorm `(1 + w)`~~ ✓ (line 750 + lines 572/582)
+3. ~~Sigmoid attention gate~~ ✓ (line 663)
+4. ~~GLM-style split RoPE~~ ✓ (lines 571-599)
+5. ~~Conv1d buffer shift~~ ✓
+6. **Decay computation** — identified but NOT yet applied. Current code: `let a = -a_log_val.exp()`. Need to verify A_log convention by checking value ranges.
+
+**Progress on " Paris" logit:**
+- Reference: 16.25
+- Current: +0.150
+- Gap: 16.10 (was 16.71 initially)
+
+**Layer 0 token 0 hidden state matches Python:**
+- Rust: 0.0278, Python: 0.0276 ✓
+
+**Remaining divergence:** Compounds across layers for tokens 1+. Most likely the decay bug (A_log convention) since that affects state accumulation dynamics.
+
+### Files deleted (old wrong architecture)
+- `src/ornith_forward.rs` — loaded whole 18GB into RAM
+- `src/safetensor_tensors.rs` — clone-on-access cache
+- `src/engine_keymap.rs` — GGUF name mapping (not needed for safetensors)
+
+---
+
+## Next Move (immediate)
+
+**Step 1:** Verify A_log value convention.
+```bash
+cd /home/xander/Documents/portfolio/LeafcutterLLM/rust
+python3 -c "
+import json
+with open('/home/xander/Downloads/models/ornith safetensor/model-00001-of-00004.safetensors', 'rb') as f:
+    n = int.from_bytes(f.read(8), 'little')
+    header = json.loads(f.read(n))
+    print('A_log shape:', header['model.language_model.layers.0.linear_attn.A_log']['shape'])
+    print('A_log dtype:', header['model.language_model.layers.0.linear_attn.A_log']['dtype'])
+"
+```
+If shape is `[32]`, that's per-V-head. If dtype is BF16, we'll need to read the raw bytes to see actual values.
+
+**Step 2:** Add a debug print in deltanet_forward:
+```rust
+eprintln!("[debug] layer 0 A_log first 5: {:?}", &a_log[..5]);
+```
+- If values like `0.0, 1.0, 2.0` (positive, increasing): `|A| = exp(A_log)`, current code CORRECT
+- If values like `0.0, -1.0, -2.0` (negative): `A = -exp(A_log)` is WRONG, need `A = A_log`
+
+**Step 3:** Fix decay line 393 in streaming_ornith.rs based on convention.
+
+**Step 4:** Run 5-token test:
+```bash
+cargo build --release --no-default-features --bin test_streaming_forward
+timeout 300 ./target/release/test_streaming_forward 2>&1 | tail -30
+```
+
+**Expected if decay fix is correct:** " Paris" logit jumps from +0.150 to ~15-17 (matching reference 16.25).
+
+---
+
+## Architecture Reference
+
+### Ornith-1.0-9B config
+- hidden_size: 4096
+- num_hidden_layers: 32 (24 linear_attention + 8 full_attention)
+- num_attention_heads: 16, num_key_value_heads: 4, head_dim: 256
+- linear_num_key_heads: 16, linear_num_value_heads: 32
+- linear_key_head_dim: 128, linear_value_head_dim: 128
+- linear_conv_kernel_dim: 4
+- intermediate_size: 12288
+- vocab_size: 248320
+- rms_norm_eps: 1e-6
+- **rope_theta: 10000000, partial_rotary_factor: 0.25 (64 of 256 dims)**
+
+### Linear attention (DeltaNet) layer weights (14 tensors)
+```
+input_layernorm.weight              [4096]
+linear_attn.in_proj_qkv.weight      [8192, 4096]  → Q(2048)+K(2048)+V(4096)
+linear_attn.in_proj_a.weight         [32, 4096]    → decay alpha
+linear_attn.in_proj_b.weight         [32, 4096]    → beta gate
+linear_attn.in_proj_z.weight         [4096, 4096]  → z-gate (silu)
+linear_attn.conv1d.weight            [4, 8192] or [8192, 4]  → CHECK
+linear_attn.A_log                   [32]          → log of decay diagonal
+linear_attn.dt_bias                  [32]          → decay bias
+linear_attn.norm.weight              [128]         → per-head RMSNorm
+linear_attn.out_proj.weight          [4096, 4096]  → output projection
+post_attention_layernorm.weight      [4096]
+mlp.gate_proj.weight                 [12288, 4096]
+mlp.up_proj.weight                   [12288, 4096]
+mlp.down_proj.weight                 [4096, 12288]
+```
+
+### Full attention layer weights (9 tensors)
+```
+input_layernorm.weight              [4096]
+self_attn.q_proj.weight             [8192, 4096]  → Q(4096) + gate(4096) — split
+self_attn.k_proj.weight             [1024, 4096]  (4 heads × 256 dim)
+self_attn.v_proj.weight             [1024, 4096]
+self_attn.o_proj.weight             [4096, 4096]
+post_attention_layernorm.weight     [4096]
+mlp.gate_proj.weight                 [12288, 4096]
+mlp.up_proj.weight                   [12288, 4096]
+mlp.down_proj.weight                 [4096, 12288]
+```
+
+### DeltaNet forward (single token, pos=0, then pos=N with state)
+1. normed = rmsnorm(hidden, input_layernorm) [using (1+w) for Qwen3_5]
+2. qkv = normed @ in_proj_qkv^T → [8192]
+3. conv: shift buffer (tap0→1, 1→2, 2→3), write current at tap 3; conv1d + SiLU
+4. Split: Q[0:2048], K[2048:4096], V[4096:8192]
+5. L2-normalize Q and K per-head (128 dims, 16 heads)
+6. Q *= 1/sqrt(128)
+7. alpha = hidden @ in_proj_a^T → [32]
+8. dt = softplus(alpha + dt_bias)
+9. A_log[head] — depends on convention; A = -exp(A_log) or A = A_log
+10. decay = exp(dt * A) → [32]
+11. beta = sigmoid(hidden @ in_proj_b^T) → [32]
+12. For each (qk_head, v_head):
+    - **decay state first**: S[h_v] *= decay[h_v]
+    - **predict**: v_pred = S[h_v] @ k
+    - **update**: S[h_v] += beta[h_v] * (v - v_pred) ⊗ k
+    - **output**: o[h_v] = S[h_v] @ q
+13. Per-head RMSNorm (128 dims, 32 heads) with norm.weight [(1+w)]
+14. z = hidden @ in_proj_z^T → [4096]
+15. output *= silu(z)
+16. result = output @ out_proj^T → [4096]
+
+### Full attention forward (single token)
+1. normed = rmsnorm(hidden, input_layernorm) [(1+w)]
+2. q_proj: [1, 8192] split into Q[0:4096] and gate[4096:8192]
+3. K, V: [1, 1024] each
+4. Q norm: per-head RMSNorm with q_norm.weight [(1+w)]
+5. K norm: per-head RMSNorm with k_norm.weight [(1+w)]
+6. **RoPE** (GLM-style split pairs):
+   - rotary_dim = 256 * 0.25 = 64
+   - half_rotary = 32
+   - For head h, for i in 0..32:
+     - i0 = h*256 + i, i1 = h*256 + i + 32
+     - angle = pos / rope_theta^(2*i/rotary_dim)
+     - Q[i0], Q[i1] = rotate(Q[i0], Q[i1], angle)
+   - Same for K
+7. Append to KV cache (per-layer)
+8. Attention: Q @ K^T / sqrt(d) → softmax → @ V (broadcast via GQA: 16/4=4)
+9. **Output gate**: attn_out *= sigmoid(gate)
+10. result = attn_out @ o_proj^T → [4096]
+
+### MLP (SwiGLU)
+1. gate = hidden @ gate_proj^T → [12288]
+2. up = hidden @ up_proj^T → [12288]
+3. inter = silu(gate) * up
+4. result = inter @ down_proj^T → [4096]
+
+---
+
+## Debugging Methodology
+
+### Layer-by-layer comparison (Python ↔ Rust)
+
+```python
+# scripts/debug_first_layer.py — print hs after each layer
+import torch, json
+from transformers import AutoModelForCausalLM
+model = AutoModelForCausalLM.from_pretrained(
+    "/home/xander/Downloads/models/ornith safetensor",
+    trust_remote_code=True, torch_dtype=torch.bfloat16
+).eval()
+ids = tokenizer("The capital of France is")["input_ids"]
+with torch.no_grad():
+    out = model(ids, output_hidden_states=True)
+for i, hs in enumerate(out.hidden_states):
+    print(f"layer {i-1}: mean_abs={hs.abs().mean():.4f}")
+```
+
+Then run Rust with matching prints:
+```rust
+// In streaming_ornith.rs after each layer:
+eprintln!("[debug] after layer {layer_idx}: mean_abs={:.4}", hidden.iter().map(|v| v.abs()).sum::<f32>() / hidden.len() as f32);
+```
+
+The first layer where they diverge tells you which operation is wrong.
+
+### Per-operation comparison
+Once layer-level mismatch is found, narrow down by comparing intermediates:
+- After norm (RMSNorm)
+- After QKV projection
+- After conv1d
+- After L2 normalize
+- After decay computation
+- After state update
+- After output projection
+
+---
+
+## File Inventory
+
+| File | Status | Notes |
+|------|--------|-------|
+| `src/safetensors_loader.rs` | ✅ Done | Has slice reads |
+| `src/bpe_tokenizer.rs` | ✅ Done | Verified |
+| `src/ornith_config.rs` | ✅ Done | Ornith config parser |
+| `src/model/tensor.rs` | ✅ Done | BLAS-backed matmul |
+| `src/streaming_ornith.rs` | 🔧 Active | 750 lines, 6 bugs fixed, 1 remaining |
+| `src/cache/deltanet_state.rs` | ✅ Done | DeltaNet state + conv cache |
+| `src/bin/test_streaming_forward.rs` | ✅ Exists | Test binary |
+| `scripts/debug_first_layer.py` | 📝 New | Python reference for comparison |
+
+---
+
+## Performance Status
+
+| Backend | Time/token | Peak RAM | Correctness |
+|---------|-----------|----------|-------------|
+| AirLLM | ~12s | ~2GB | Reference |
+| Leafcutter Python (HF) | ~12s | ~4GB | " Paris" logit 16.25 |
+| Leafcutter Native Rust | ~4-5s (proj) | <500MB | " Paris" logit +0.150 (in progress) |
+
+**Targets after fix:** " Paris" logit ~16.25, time <12s/tok, peak RSS <500MB.
+
+---
+
+## What to do RIGHT NOW
+
+1. **Verify A_log convention** with the Python script above
+2. **Fix line 393** of streaming_ornith.rs based on convention found
+3. **Run 5-token test:**
+   ```bash
+   cd /home/xander/Documents/portfolio/LeafcutterLLM/rust
+   cargo build --release --no-default-features --bin test_streaming_forward 2>&1 | grep "^error" | head -5
+   timeout 300 ./target/release/test_streaming_forward 2>&1 | tail -30
+   ```
+4. **Report top-5 predictions and " Paris" logit**
+
+If " Paris" logit jumps to ~15-17, the native forward pass is correct. Then we measure speed and integrate with CLI.
+
+If still wrong, do layer-by-layer comparison with `scripts/debug_first_layer.py` to find next divergence point.
 
 ---
 

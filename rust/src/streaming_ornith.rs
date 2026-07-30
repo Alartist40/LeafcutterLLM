@@ -12,9 +12,11 @@
 //! with peak RAM = one layer's weights (~400MB for 9B), not the whole model.
 
 use crate::bpe_tokenizer::BpeTokenizer;
+use crate::cache::deltanet_state::DeltaNetStateCache;
 use crate::model::tensor::Tensor;
 use crate::ornith_config::OrnithConfig;
 use crate::safetensors_loader::Shards;
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -22,6 +24,11 @@ pub struct StreamingOrnith {
     pub cfg: OrnithConfig,
     pub shards: Shards,
     pub tok: BpeTokenizer,
+    /// Per-layer DeltaNet state matrices (accumulated across prompt tokens)
+    pub deltanet_cache: DeltaNetStateCache,
+    /// Per-layer KV cache for full_attention layers: layer_idx -> (keys, values)
+    /// keys/values: flat Vec<f32> of shape [seq_len, n_kv * head_dim] each
+    pub kv_cache: HashMap<usize, (Vec<f32>, Vec<f32>)>,
 }
 
 impl StreamingOrnith {
@@ -31,104 +38,152 @@ impl StreamingOrnith {
         let cfg = OrnithConfig::load(dir.join("config.json").to_str().unwrap())?;
         let shards = Shards::open_dir(dir)?;
         let tok = BpeTokenizer::load(dir.join("tokenizer.json").to_str().unwrap())?;
-        Ok(Self { cfg, shards, tok })
+        Ok(Self { cfg, shards, tok, deltanet_cache: DeltaNetStateCache::new(), kv_cache: HashMap::new() })
     }
 
     /// Forward pass for ONE token. Returns logits (vocab_size entries).
     ///
     /// `token_id`: the input token.
-    /// `pos`: position in the sequence (for RoPE).
-    pub fn forward_one_token(
-        &mut self,
-        token_id: i32,
-        pos: usize,
-    ) -> Result<Vec<f32>, String> {
+    /// Forward a multi-token sequence, processing all tokens layer by layer.
+    /// Each layer's weights are loaded ONCE from disk and shared across all tokens.
+    /// This avoids re-loading weights for every token.
+    pub fn forward_sequence(&mut self, tokens: &[i32]) -> Result<Vec<f32>, String> {
         let h = self.cfg.hidden_size;
         let num_layers = self.cfg.num_hidden_layers;
         let layer_types: Vec<String> = self.cfg.layer_types.clone();
         let rms_eps = self.cfg.rms_norm_eps;
         let vocab_size = self.cfg.vocab_size;
+        let seq_len = tokens.len();
 
-        // 1. Embedding: read ONLY the one row we need (h elements = 8KB BF16).
+        // 1. Embeddings for all tokens
         let embed_name = "model.language_model.embed_tokens.weight";
-        let mut hidden =
-            self.shards
-                .read_tensor_slice_f32(embed_name, token_id as usize * h, h)?;
-        eprintln!(
-            "[stream] embed row {} read: {} values, first 4 = {:?}",
-            token_id, hidden.len(), &hidden[..4]
-        );
+        let mut hidden_states: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
+        for &tid in tokens {
+            let embed = self.shards.read_tensor_slice_f32(embed_name, tid as usize * h, h)?;
+            hidden_states.push(embed);
+        }
 
-        // 2. Run all 32 layers — load each layer's weights, compute, discard.
+        // 2. Process each layer: load weights ONCE, run all tokens
         for layer_idx in 0..num_layers {
             let layer_type = layer_types
                 .get(layer_idx)
                 .map(|s| s.as_str())
                 .unwrap_or("linear_attention");
 
-            let t0 = std::time::Instant::now();
             let weights = self.load_layer_weights(layer_idx, layer_type)?;
-            eprintln!(
-                "[stream] layer {}/{} loaded {} tensors in {:?}",
-                layer_idx,
-                num_layers,
-                weights.len(),
-                t0.elapsed()
-            );
 
-            let residual = hidden.clone();
-            let t1 = std::time::Instant::now();
-            let attn_out = if layer_type == "linear_attention" {
-                self.deltanet_forward(&weights, &hidden, layer_idx)?
-            } else {
-                self.attention_forward(&weights, &hidden, layer_idx, pos)?
-            };
-            eprintln!(
-                "[stream] layer {} attn ({}) {:?}",
-                layer_idx, layer_type, t1.elapsed()
-            );
+            for pos in 0..seq_len {
+                let attn_out = if layer_type == "linear_attention" {
+                    self.deltanet_forward(&weights, &hidden_states[pos], layer_idx)?
+                } else {
+                    self.attention_forward(&weights, &hidden_states[pos], layer_idx, pos)?
+                };
 
-            // Add residual
-            for i in 0..h {
-                hidden[i] = residual[i] + attn_out[i];
+                // Residual
+                let mut new_hidden = hidden_states[pos].clone();
+                for i in 0..h { new_hidden[i] += attn_out[i]; }
+
+                // Post-attention norm + MLP
+                let post_norm = weights
+                    .get("post_attention_layernorm.weight")
+                    .ok_or("missing post_attention_layernorm")?;
+                let normed = rms_norm(&new_hidden, post_norm, rms_eps);
+                let mlp_out = self.mlp_forward(&weights, &normed)?;
+
+                for i in 0..h { new_hidden[i] += mlp_out[i]; }
+                hidden_states[pos] = new_hidden;
             }
 
-            // Post-attention norm + MLP
-            let post_norm = weights
-                .get("post_attention_layernorm.weight")
-                .ok_or("missing post_attention_layernorm")?;
-            let normed = rms_norm(&hidden, post_norm, rms_eps);
-
-            let t2 = std::time::Instant::now();
-            let mlp_out = self.mlp_forward(&weights, &normed)?;
-            eprintln!("[stream] layer {} mlp {:?}", layer_idx, t2.elapsed());
-
-            // Add residual again
-            for i in 0..h {
-                hidden[i] = residual[i] + mlp_out[i];
+            // Debug: show all tokens' hidden states at layer 0, last token at other layers
+            if layer_idx == 0 {
+                for t in 0..seq_len {
+                    let ma = hidden_states[t].iter().map(|v| v.abs()).sum::<f32>() / h as f32;
+                    eprintln!("[stream] layer {} tok {} hidden mean_abs={:.4} first4={:.4?}",
+                        layer_idx, t, ma, &hidden_states[t][..4]);
+                }
+            }
+            if (layer_idx == 1 || layer_idx == 2 || layer_idx == 24 || layer_idx == num_layers - 1) {
+                let last = seq_len - 1;
+                let mean_abs = hidden_states[last].iter().map(|v| v.abs()).sum::<f32>() / h as f32;
+                eprintln!("[stream] layer {} hidden[last] mean_abs={:.4} first4={:.4?}",
+                    layer_idx, mean_abs, &hidden_states[last][..4]);
             }
         }
 
-        // 3. Final norm
-        let final_w = self
-            .shards
-            .read_tensor_f32("model.language_model.norm.weight")?;
-        hidden = rms_norm(&hidden, &final_w, rms_eps);
+        // 3. Final norm on last token
+        let final_w = self.shards.read_tensor_f32("model.language_model.norm.weight")?;
+        let last_hidden = rms_norm(&hidden_states[seq_len - 1], &final_w, rms_eps);
 
         // 4. LM head: logits = hidden @ lm_head.T
-        // lm_head.weight is [vocab, hidden] = 248320 × 4096 (~4GB f32).
-        // Read it in CHUNKS of 1024 rows to keep peak RAM low.
         let lm_head_name = "lm_head.weight";
         let mut logits = vec![0.0f32; vocab_size];
         let chunk_size = 1024;
         for chunk_start in (0..vocab_size).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(vocab_size);
             let n_rows = chunk_end - chunk_start;
-            let chunk = self.shards.read_tensor_slice_f32(
-                lm_head_name,
-                chunk_start * h,
-                n_rows * h,
-            )?;
+            let chunk = self.shards.read_tensor_slice_f32(lm_head_name, chunk_start * h, n_rows * h)?;
+            let chunk_t = Tensor::from_vec(chunk, vec![n_rows, h]);
+            let hidden_t = Tensor::from_vec(last_hidden.clone(), vec![1, h]);
+            let logits_chunk = hidden_t.matmul(&chunk_t.transpose());
+            logits[chunk_start..chunk_end].copy_from_slice(&logits_chunk.data);
+        }
+
+        Ok(logits)
+    }
+
+    /// Forward ONE token (legacy — calls forward_sequence internally).
+    pub fn forward_one_token(
+        &mut self,
+        token_id: i32,
+        pos: usize,
+    ) -> Result<Vec<f32>, String> {
+        // forward_sequence resets caches, so we can't use it for multi-token
+        // unless we handle caching properly. For now, forward_one_token stays.
+        let h = self.cfg.hidden_size;
+        let num_layers = self.cfg.num_hidden_layers;
+        let layer_types: Vec<String> = self.cfg.layer_types.clone();
+        let rms_eps = self.cfg.rms_norm_eps;
+        let vocab_size = self.cfg.vocab_size;
+
+        let embed_name = "model.language_model.embed_tokens.weight";
+        let mut hidden = self.shards.read_tensor_slice_f32(embed_name, token_id as usize * h, h)?;
+
+        for layer_idx in 0..num_layers {
+            let layer_type = layer_types
+                .get(layer_idx)
+                .map(|s| s.as_str())
+                .unwrap_or("linear_attention");
+
+            let weights = self.load_layer_weights(layer_idx, layer_type)?;
+
+            let residual = hidden.clone();
+            let attn_out = if layer_type == "linear_attention" {
+                self.deltanet_forward(&weights, &hidden, layer_idx)?
+            } else {
+                self.attention_forward(&weights, &hidden, layer_idx, pos)?
+            };
+
+            for i in 0..h { hidden[i] = residual[i] + attn_out[i]; }
+
+            let post_norm = weights
+                .get("post_attention_layernorm.weight")
+                .ok_or("missing post_attention_layernorm")?;
+            let normed = rms_norm(&hidden, post_norm, rms_eps);
+            let mlp_out = self.mlp_forward(&weights, &normed)?;
+
+            for i in 0..h { hidden[i] += mlp_out[i]; }
+        }
+
+        let final_w = self.shards.read_tensor_f32("model.language_model.norm.weight")?;
+        hidden = rms_norm(&hidden, &final_w, rms_eps);
+
+        let lm_head_name = "lm_head.weight";
+        let mut logits = vec![0.0f32; vocab_size];
+        let chunk_size = 1024;
+        for chunk_start in (0..vocab_size).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(vocab_size);
+            let n_rows = chunk_end - chunk_start;
+            let chunk = self.shards.read_tensor_slice_f32(lm_head_name, chunk_start * h, n_rows * h)?;
             let chunk_t = Tensor::from_vec(chunk, vec![n_rows, h]);
             let hidden_t = Tensor::from_vec(hidden.clone(), vec![1, h]);
             let logits_chunk = hidden_t.matmul(&chunk_t.transpose());
@@ -141,15 +196,13 @@ impl StreamingOrnith {
     /// Load all weights for ONE layer from disk. ~13 tensors, ~400MB for 9B.
     /// These are returned as f32 and will be DROPPED after the layer computes.
     fn load_layer_weights(
-        &mut self,
+        &self,
         layer_idx: usize,
         layer_type: &str,
     ) -> Result<HashMap<String, Vec<f32>>, String> {
         let pfx = format!("model.language_model.layers.{layer_idx}.");
-        let mut w = HashMap::new();
 
-        // Always-present: input_layernorm, post_attention_layernorm, MLP
-        let names = match layer_type {
+        let names: Vec<&str> = match layer_type {
             "linear_attention" => vec![
                 "input_layernorm.weight",
                 "linear_attn.in_proj_qkv.weight",
@@ -172,6 +225,8 @@ impl StreamingOrnith {
                 "self_attn.k_proj.weight",
                 "self_attn.v_proj.weight",
                 "self_attn.o_proj.weight",
+                "self_attn.q_norm.weight",
+                "self_attn.k_norm.weight",
                 "post_attention_layernorm.weight",
                 "mlp.gate_proj.weight",
                 "mlp.up_proj.weight",
@@ -180,10 +235,19 @@ impl StreamingOrnith {
             _ => return Err(format!("unknown layer type: {layer_type}")),
         };
 
-        for suffix in &names {
-            let full = format!("{pfx}{suffix}");
-            let data = self.shards.read_tensor_f32(&full)?;
-            w.insert(suffix.to_string(), data);
+        // Parallel read using rayon
+        let results: Vec<(&str, Result<Vec<f32>, String>)> = names
+            .par_iter()
+            .map(|suffix| {
+                let full = format!("{pfx}{suffix}");
+                let data = self.shards.read_tensor_f32(&full);
+                (*suffix, data)
+            })
+            .collect();
+
+        let mut w = HashMap::new();
+        for (suffix, data) in results {
+            w.insert(suffix.to_string(), data?);
         }
         Ok(w)
     }
@@ -192,7 +256,7 @@ impl StreamingOrnith {
     /// For now, just do the QKV projection and output projection.
     /// Full DeltaNet recurrence to be implemented next.
     fn deltanet_forward(
-        &self,
+        &mut self,
         w: &HashMap<String, Vec<f32>>,
         hidden: &[f32],
         layer_idx: usize,
@@ -211,7 +275,10 @@ impl StreamingOrnith {
         // 1. Input norm
         let norm_w = w.get("input_layernorm.weight").ok_or("missing input_layernorm")?;
         let normed = rms_norm(hidden, norm_w, rms_eps);
-
+        if layer_idx < 2 {
+            let mn = normed.iter().map(|v| v.abs()).sum::<f32>() / h as f32;
+            eprintln!("[dbg] layer {} normed mean_abs={:.6} first4={:.4?}", layer_idx, mn, &normed[..4]);
+        }
         // 2. QKV projection: [1, h] @ [conv_dim, h]^T = [1, conv_dim]
         let qkv_w = w.get("linear_attn.in_proj_qkv.weight").ok_or("missing in_proj_qkv")?;
         let qkv_t = Tensor::from_vec(qkv_w.clone(), vec![conv_dim, h]);
@@ -219,33 +286,72 @@ impl StreamingOrnith {
         let qkv_proj = hidden_t.matmul(&qkv_t.transpose());
         // qkv_proj.data: [conv_dim] = [Q(2048) | K(2048) | V(4096)]
 
-        // 3. Causal Conv1d (kernel=4) + SiLU
-        // conv1d.weight shape in safetensors: [conv_dim, 1, conv_k] = [8192, 1, 4]
-        // Row-major index for channel c, kernel tap k: c * conv_k + k
-        // For pos=0 (first token), conv state is zeros, so only the last tap (k=3) applies.
+        // 3. Conv1d: per-channel FIR filter of kernel_size=4 on the QKV sequence.
+        //    conv1d.weight: [conv_dim, 1, 4] in safetensors, stored flat as weight[c*conv_k + k].
+        //    PyTorch Conv1d padding=conv_k-1 with causal padding:
+        //      out[t][c] = sum_{k=0}^{conv_k-1} weight[c][k] * input[t - (conv_k-1) + k]
+        //    For causal streaming:
+        //      out[c] = weight[c][0]*input[t-3] + weight[c][1]*input[t-2] + weight[c][2]*input[t-1] + weight[c][3]*input[t]
+        //    The conv buffer stores [conv_dim, conv_k] as [c * conv_k + k] where k=0 is oldest, k=conv_k-1 is newest.
         let conv_w = w.get("linear_attn.conv1d.weight").ok_or("missing conv1d")?;
-        let conv_out = if conv_w.len() == conv_dim * conv_k {
-            let mut out = vec![0.0f32; conv_dim];
-            for c in 0..conv_dim {
-                out[c] = conv_w[c * conv_k + (conv_k - 1)] * qkv_proj.data[c];
+        let cbuf = self.deltanet_cache.get_conv_buf_mut(layer_idx, conv_dim, conv_k);
+        // Shift buffer: oldest tap 0 is discarded, taps shift left, newest tap (conv_k-1) gets current input
+        for c in 0..conv_dim {
+            let base = c * conv_k;
+            for k in 0..conv_k - 1 {
+                cbuf[base + k] = cbuf[base + k + 1];
             }
-            // SiLU: x * sigmoid(x)
-            for v in out.iter_mut() {
-                *v = *v * (1.0 / (1.0 + (-*v).exp()));
+            cbuf[base + conv_k - 1] = qkv_proj.data[c];
+        }
+        let mut conv_out = vec![0.0f32; conv_dim];
+        for c in 0..conv_dim {
+            let mut sum = 0.0f32;
+            let base = c * conv_k;
+            // In safetensors, weight[c][k] for tap k where k=0 is oldest, k=conv_k-1 is newest.
+            // In PyTorch Conv1d with padding=K-1: out[t] = w[0]*x[t-3] + w[1]*x[t-2] + w[2]*x[t-1] + w[3]*x[t]
+            // Our buf: [input[t-3], input[t-2], input[t-1], input[t]]
+            // So: w[c][k] * buf[k] for k=0..conv_k-1
+            for k in 0..conv_k {
+                sum += conv_w[base + k] * cbuf[base + k];
             }
-            out
-        } else {
-            // Unexpected shape — just use raw QKV
-            qkv_proj.data.clone()
-        };
+            conv_out[c] = sum;
+        }
+        if layer_idx < 2 {
+            let pre_silu_ma = conv_out.iter().map(|v| v.abs()).sum::<f32>() / conv_out.len() as f32;
+            eprintln!("[dbg] layer {} conv pre-silu mean_abs={:.6} first4={:.4?}", layer_idx, pre_silu_ma, &conv_out[..4]);
+        }
+        // SiLU after conv
+        for v in conv_out.iter_mut() {
+            *v = *v / (1.0 + (-*v).exp());
+        }
+        // Shift conv buffer: discard oldest, make room for next token
+        for c in 0..conv_dim {
+            let base = c * conv_k;
+            for i in 0..conv_k - 1 {
+                cbuf[base + i] = cbuf[base + i + 1];
+            }
+            // cbuf[base + conv_k - 1] will be overwritten at next token
+        }
 
-        // 4. Split into Q, K, V
+        // 4. Debug: check QKV section magnitudes
         let q_total = n_qk * d_k;   // 2048
         let k_total = n_qk * d_k;   // 2048
         let v_total = n_v * d_v;    // 4096
+        if layer_idx < 2 {
+            let qkv_ma = conv_out.iter().map(|v| v.abs()).sum::<f32>() / conv_out.len() as f32;
+            eprintln!("[dbg] layer {} conv+silu mean_abs={:.6}", layer_idx, qkv_ma);
+            let sect0 = &conv_out[..q_total];
+            let sect1 = &conv_out[q_total..q_total + k_total];
+            let sect2 = &conv_out[q_total + k_total..];
+            let m0 = sect0.iter().map(|v| v.abs()).sum::<f32>() / q_total as f32;
+            let m1 = sect1.iter().map(|v| v.abs()).sum::<f32>() / k_total as f32;
+            let m2 = sect2.iter().map(|v| v.abs()).sum::<f32>() / v_total as f32;
+            eprintln!("[dbg] layer {} QKV mean_abs: Q={:.6} K={:.6} V={:.6}", layer_idx, m0, m1, m2);
+        }
+        // Split into Q, K, V — try Q|K|V order first
         let q_data = &conv_out[..q_total];
         let k_data = &conv_out[q_total..q_total + k_total];
-        let v_data = &conv_out[q_total + k_total..q_total + k_total + v_total];
+        let v_data = &conv_out[q_total + k_total..];
 
         // 5. L2-normalize Q and K (per-head)
         let mut q = q_data.to_vec();
@@ -265,6 +371,11 @@ impl StreamingOrnith {
         // Scale Q by 1/sqrt(d_k)
         let scale = 1.0f32 / (d_k as f32).sqrt();
         for v in q.iter_mut() { *v *= scale; }
+        if layer_idx < 2 {
+            let q_ma = q.iter().map(|v| v.abs()).sum::<f32>() / q.len() as f32;
+            let k_ma = k.iter().map(|v| v.abs()).sum::<f32>() / k.len() as f32;
+            eprintln!("[dbg] layer {} Q after norm+scale mean_abs={:.6} K after norm mean_abs={:.6}", layer_idx, q_ma, k_ma);
+        }
 
         // 6. Compute decay rates: decay = exp(softplus(alpha + dt_bias) * A)
         //    where alpha = hidden @ in_proj_a.weight, A = -exp(A_log)
@@ -284,20 +395,33 @@ impl StreamingOrnith {
             let dt = softplus(alpha_val + dt_val);
             decay[head] = (dt * a).exp();
         }
+        // Debug: check if any softplus overflows
+        if layer_idx < 2 {
+            let max_alpha = alpha.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let min_alpha = alpha.data.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max_dt = (0..n_v).map(|h| softplus(alpha.data[h] + dt_bias.get(h).copied().unwrap_or(0.0))).fold(f32::NEG_INFINITY, f32::max);
+            eprintln!("[dbg] layer {} alpha range=[{:.2}, {:.2}] max_dt={:.2}", layer_idx, min_alpha, max_alpha, max_dt);
+        }
 
         // 7. Compute beta gates: beta = sigmoid(hidden @ in_proj_b.weight)
         let b_w = w.get("linear_attn.in_proj_b.weight").ok_or("missing in_proj_b")?;
         let b_t = Tensor::from_vec(b_w.clone(), vec![n_v, h]);
         let beta_logits = hidden_t.matmul(&b_t.transpose()); // [1, n_v]
         let beta: Vec<f32> = beta_logits.data.iter().map(|&v| sigmoid(v)).collect();
+        if layer_idx < 2 {
+            let d_ma = decay.iter().sum::<f32>() / decay.len() as f32;
+            let b_ma = beta.iter().sum::<f32>() / beta.len() as f32;
+            eprintln!("[dbg] layer {} decay mean={:.6} beta mean={:.6}", layer_idx, d_ma, b_ma);
+        }
 
         // 8. Delta rule state update + output
-        // For pos=0: state starts at zero.
-        //   v_pred = S @ k = 0 (state is zero)
-        //   S = decay * S + beta * (v - v_pred) * k = beta * v * k (outer product)
-        //   o = S @ q = beta * (q . k) * v
         let v_heads_per_qk = if n_qk > 0 { n_v / n_qk } else { 1 };
         let mut output = vec![0.0f32; v_total];
+
+        // Ensure state is initialized for this layer
+        if self.deltanet_cache.get(layer_idx).is_none() {
+            self.deltanet_cache.init_layer(layer_idx, n_v, d_v, d_k);
+        }
 
         for h_qk in 0..n_qk {
             let q_h = &q[h_qk * d_k..(h_qk + 1) * d_k];
@@ -310,19 +434,50 @@ impl StreamingOrnith {
                 let decay_h = decay[h_v];
                 let beta_h = beta[h_v];
 
-                // For pos=0: state = 0, so:
-                //   S = decay * 0 + beta * (v - 0) * k = beta * v ⊗ k
-                //   o = S @ q = beta * (q · k) * v
-                let qk_dot: f32 = q_h.iter().zip(k_h.iter()).map(|(&qi, &ki)| qi * ki).sum();
-
-                // Direct computation for pos=0:
-                // S[i][j] = beta_h * v_h[i] * k_h[j]
-                // o[i] = sum_j S[i][j] * q_h[j] = beta_h * v_h[i] * (k_h . q_h)
-                //      = beta_h * qk_dot * v_h[i]
+                // Decay state first: S = decay_h * S
+                let state = self.deltanet_cache.get_mut(layer_idx).unwrap();
+                let state_stride = h_v * d_v * d_k;
                 for i in 0..d_v {
-                    output[h_v * d_v + i] = beta_h * qk_dot * v_h[i];
+                    for j in 0..d_k {
+                        let idx = state_stride + i * d_k + j;
+                        state[idx] = decay_h * state[idx];
+                    }
+                }
+
+                // Compute v_pred = S @ k (using decayed state)
+                let mut v_pred = vec![0.0f32; d_v];
+                for i in 0..d_v {
+                    let mut sum = 0.0f32;
+                    for j in 0..d_k {
+                        sum += state[state_stride + i * d_k + j] * k_h[j];
+                    }
+                    v_pred[i] = sum;
+                }
+
+                // State update: S = S + beta_h * ((v - v_pred) ⊗ k)
+                for i in 0..d_v {
+                    let delta = v_h[i] - v_pred[i];
+                    for j in 0..d_k {
+                        let idx = state_stride + i * d_k + j;
+                        state[idx] = state[idx] + beta_h * delta * k_h[j];
+                    }
+                }
+
+                // Output: o_h = S @ q (q already scaled by 1/sqrt(d_k))
+                for i in 0..d_v {
+                    let mut sum = 0.0f32;
+                    for j in 0..d_k {
+                        sum += state[state_stride + i * d_k + j] * q_h[j];
+                    }
+                    output[h_v * d_v + i] = sum;
                 }
             }
+        }
+
+        if layer_idx < 2 {
+            let delta_ma = output.iter().map(|v| v.abs()).sum::<f32>() / output.len() as f32;
+            eprintln!("[dbg] layer {} delta output mean_abs={:.8} first4={:.6?}",
+                layer_idx, delta_ma, &output[..4]);
         }
 
         // 9. Per-head RMSNorm using linear_attn.norm.weight
@@ -336,15 +491,26 @@ impl StreamingOrnith {
                 output[base + d] = (output[base + d] / rms) * norm_weight.get(d).copied().unwrap_or(1.0);
             }
         }
+        if layer_idx < 2 {
+            let nm_ma = output.iter().map(|v| v.abs()).sum::<f32>() / output.len() as f32;
+            eprintln!("[dbg] layer {} after rmsnorm mean_abs={:.8} first4={:.6?}",
+                layer_idx, nm_ma, &output[..4]);
+        }
 
         // 10. Z-gate: z = hidden @ in_proj_z.weight, then output *= silu(z)
         let z_w = w.get("linear_attn.in_proj_z.weight").ok_or("missing in_proj_z")?;
         let z_t = Tensor::from_vec(z_w.clone(), vec![v_total, h]);
         let z = hidden_t.matmul(&z_t.transpose()); // [1, v_total]
+        let z_mean = z.data.iter().map(|v| v.abs()).sum::<f32>() / z.data.len() as f32;
         for i in 0..output.len() {
             let z_val = z.data[i];
             let silu_z = z_val * (1.0 / (1.0 + (-z_val).exp()));
             output[i] *= silu_z;
+        }
+        if layer_idx < 2 {
+            let z_out_ma = output.iter().map(|v| v.abs()).sum::<f32>() / output.len() as f32;
+            eprintln!("[dbg] layer {} z mean_abs={:.6} after-z-gate mean_abs={:.6}",
+                layer_idx, z_mean, z_out_ma);
         }
 
         // 11. Output projection: [1, v_total] @ [h, v_total]^T = [1, h]
@@ -353,15 +519,17 @@ impl StreamingOrnith {
         let out_t = Tensor::from_vec(output, vec![1, v_total]);
         let result = out_t.matmul(&o_t.transpose());
 
-        if layer_idx == 0 {
-            eprintln!("[stream] layer 0 (deltanet) OUT first 4 = {:?}", &result.data[..4]);
+        if layer_idx < 2 {
+            let mean_abs = result.data.iter().map(|v| v.abs()).sum::<f32>() / h as f32;
+            eprintln!("[stream] layer {} (deltanet) OUT mean_abs={:.4} first 4 = {:?}",
+                layer_idx, mean_abs, &result.data[..4]);
         }
         Ok(result.data)
     }
 
     /// Standard attention forward (for full_attention layers).
     fn attention_forward(
-        &self,
+        &mut self,
         w: &HashMap<String, Vec<f32>>,
         hidden: &[f32],
         layer_idx: usize,
@@ -378,46 +546,131 @@ impl StreamingOrnith {
             .ok_or("missing input_layernorm")?;
         let normed = rms_norm(hidden, norm_w, rms_eps);
 
-        // Q = hidden @ q_proj^T — q_proj is [h, h]
+        // Q = hidden @ q_proj^T — q_proj is [2h, h] (first h = Q, second h = gate)
         let q_w = w.get("self_attn.q_proj.weight").ok_or("missing q_proj")?;
         let k_w = w.get("self_attn.k_proj.weight").ok_or("missing k_proj")?;
         let v_w = w.get("self_attn.v_proj.weight").ok_or("missing v_proj")?;
         let o_w = w.get("self_attn.o_proj.weight").ok_or("missing o_proj")?;
+        let q_norm_w = w.get("self_attn.q_norm.weight");
+        let k_norm_w = w.get("self_attn.k_norm.weight");
 
         let hidden_t = Tensor::from_vec(normed, vec![1, h]);
-        // q_proj is [2h, h] — first h is Q, second h is attn_output_gate
+        // q_proj output: [1, 2h] — split into Q and gate
         let q_all = hidden_t.matmul(&Tensor::from_vec(q_w.clone(), vec![2 * h, h]).transpose());
-        let q_data = q_all.data[..h].to_vec();
-        let q = Tensor::from_vec(q_data, vec![1, h]);
-        let k = hidden_t.matmul(&Tensor::from_vec(k_w.clone(), vec![n_kv * head_dim, h]).transpose());
-        let v = hidden_t.matmul(&Tensor::from_vec(v_w.clone(), vec![n_kv * head_dim, h]).transpose());
+        let mut q = q_all.data[..h].to_vec();
+        let gate = &q_all.data[h..];
+        let mut k = hidden_t.matmul(&Tensor::from_vec(k_w.clone(), vec![n_kv * head_dim, h]).transpose()).data;
+        let v = hidden_t.matmul(&Tensor::from_vec(v_w.clone(), vec![n_kv * head_dim, h]).transpose()).data;
 
-        // For a single token, attention is just: for each head, score = q @ k^T / sqrt(d).
-        // Since this is the FIRST token (pos=0 with no cache), it attends to itself.
-        let mut attn_out = vec![0.0f32; h];
-
-        for head in 0..n_heads {
-            let q_h = &q.data[head * head_dim..(head + 1) * head_dim];
-            // For each KV head, broadcast to q heads (GQA: n_heads / n_kv = 4)
-            let kv_head = head / (n_heads / n_kv);
-            let k_h = &k.data[kv_head * head_dim..(kv_head + 1) * head_dim];
-            let v_h = &v.data[kv_head * head_dim..(kv_head + 1) * head_dim];
-
-            // Single token: score = q @ k / sqrt(d), then softmax (trivially 1.0 for one token)
-            // output = score * v = v
-            for (i, &v_val) in v_h.iter().enumerate() {
-                attn_out[head * head_dim + i] += v_val;
+        // Apply Q norm (per-head RMSNorm with shared weight)
+        if let Some(qnw) = q_norm_w {
+            for head in 0..n_heads {
+                let base = head * head_dim;
+                let mut sq = 0.0f32;
+                for d in 0..head_dim { sq += q[base + d] * q[base + d]; }
+                let r = (sq / head_dim as f32 + rms_eps).sqrt();
+                for d in 0..head_dim { q[base + d] = q[base + d] / r * (1.0 + qnw[d]); }
             }
+        }
+        // Apply K norm (per-head RMSNorm with shared weight)
+        if let Some(knw) = k_norm_w {
+            for head in 0..n_kv {
+                let base = head * head_dim;
+                let mut sq = 0.0f32;
+                for d in 0..head_dim { sq += k[base + d] * k[base + d]; }
+                let r = (sq / head_dim as f32 + rms_eps).sqrt();
+                for d in 0..head_dim { k[base + d] = k[base + d] / r * (1.0 + knw[d]); }
+            }
+        }
+
+        // RoPE (GLM-style split pairs): pair (i, i+rotary_dim/2) for i in 0..rotary_dim/2
+        let rotary_dim = (self.cfg.head_dim as f32 * 0.25) as usize;
+        let rope_theta = 10000000f32;
+        let half_rotary = rotary_dim / 2;
+        for head in 0..n_heads {
+            let base = head * head_dim;
+            for i in 0..half_rotary {
+                let i0 = base + i;
+                let i1 = base + i + half_rotary;
+                let angle = pos as f32 / rope_theta.powf(2.0 * i as f32 / rotary_dim as f32);
+                let (sin, cos) = angle.sin_cos();
+                let x0 = q[i0];
+                let x1 = q[i1];
+                q[i0] = x0 * cos - x1 * sin;
+                q[i1] = x0 * sin + x1 * cos;
+            }
+        }
+        for head in 0..n_kv {
+            let base = head * head_dim;
+            for i in 0..half_rotary {
+                let i0 = base + i;
+                let i1 = base + i + half_rotary;
+                let angle = pos as f32 / rope_theta.powf(2.0 * i as f32 / rotary_dim as f32);
+                let (sin, cos) = angle.sin_cos();
+                let x0 = k[i0];
+                let x1 = k[i1];
+                k[i0] = x0 * cos - x1 * sin;
+                k[i1] = x0 * sin + x1 * cos;
+            }
+        }
+
+        // Append current token's K, V to cache
+        let kv_entry = self.kv_cache.entry(layer_idx).or_insert((Vec::new(), Vec::new()));
+        kv_entry.0.extend_from_slice(&k);
+        kv_entry.1.extend_from_slice(&v);
+        let cached_k = &kv_entry.0;
+        let cached_v = &kv_entry.1;
+        let seq_len = cached_k.len() / (n_kv * head_dim);
+
+        // Attention over all cached tokens
+        let mut attn_out = vec![0.0f32; h];
+        for head in 0..n_heads {
+            let kv_head = head / (n_heads / n_kv);
+            let q_base = head * head_dim;
+            // Compute score = q @ k_cache / sqrt(d)
+            let mut max_score = f32::NEG_INFINITY;
+            for t in 0..seq_len {
+                let k_base = t * n_kv * head_dim + kv_head * head_dim;
+                let mut score = 0.0f32;
+                for d in 0..head_dim {
+                    score += q[q_base + d] * cached_k[k_base + d];
+                }
+                score /= (head_dim as f32).sqrt();
+                if score > max_score { max_score = score; }
+            }
+            // Compute softmax numerator for each position and sum V weighted
+            let mut sum_exp = 0.0f32;
+            let mut weighted_v = vec![0.0f32; head_dim];
+            for t in 0..seq_len {
+                let k_base = t * n_kv * head_dim + kv_head * head_dim;
+                let mut score = 0.0f32;
+                for d in 0..head_dim {
+                    score += q[q_base + d] * cached_k[k_base + d];
+                }
+                score = (score / (head_dim as f32).sqrt() - max_score).exp();
+                sum_exp += score;
+                let v_base = t * n_kv * head_dim + kv_head * head_dim;
+                for d in 0..head_dim {
+                    weighted_v[d] += score * cached_v[v_base + d];
+                }
+            }
+            let inv_sum = 1.0 / sum_exp;
+            for d in 0..head_dim {
+                attn_out[q_base + d] = weighted_v[d] * inv_sum;
+            }
+        }
+
+        // Apply output gate: attn_out *= sigmoid(gate)
+        for i in 0..h {
+            attn_out[i] *= 1.0 / (1.0 + (-gate[i]).exp());
         }
 
         // Output projection
         let out_t = Tensor::from_vec(attn_out, vec![1, h]);
         let result = out_t.matmul(&Tensor::from_vec(o_w.clone(), vec![h, h]).transpose());
-        eprintln!(
-            "[stream] layer {} (full_attn) done, o first 4 = {:?}",
-            layer_idx,
-            &result.data[..4]
-        );
+        if layer_idx == 31 {
+            eprintln!("[stream] layer {layer_idx} (full_attn) done, o first 4 = {:?}", &result.data[..4]);
+        }
         Ok(result.data)
     }
 
@@ -494,13 +747,13 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let inv_rms = 1.0 / rms;
     x.iter()
         .zip(weight.iter())
-        .map(|(&xi, &wi)| xi * inv_rms * wi)
+        .map(|(&xi, &wi)| xi * inv_rms * (1.0 + wi))
         .collect()
 }
 
 #[inline]
 fn softplus(x: f32) -> f32 {
-    (1.0f32 + x.exp()).ln()
+    if x > 20.0 { x } else { (1.0 + x.exp()).ln() }
 }
 
 #[inline]

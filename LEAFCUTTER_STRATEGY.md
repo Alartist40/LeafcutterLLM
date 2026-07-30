@@ -292,3 +292,91 @@ slots doesn't 2× anything.
 Everything else (LFRU, KV persistence, MTP) is incremental
 polish, not new capability.
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Objective
+- Fix the streaming native Rust ornith pipeline (streaming_ornith.rs) to produce coherent English instead of garbage, matching the Python safetensor-backend reference that outputs "Paris" for "The capital of France is".
+Important Details
+- Model: Qwen3.5 (Ornith-1.0-9B): hidden=4096, vocab=248320, 32 layers (24 linear_attention + 8 full_attention), head_dim=256, n_heads=16, n_kv=4, intermediate=12288, linear_num_key_heads=16, linear_num_value_heads=32, head_k_dim=128, head_v_dim=128, conv_kernel=4
+- Streaming engine reads one layer at a time from safetensors (~400MB peak vs 18GB full load)
+- Token 11751 (" Paris") has logit -0.455; top-1 is token 96284 ("取") at logit 4.723
+- Python reference (leafcutter run --engine safetensor) works correctly, confirming weights/tokenizer are fine
+- A_log values vary by layer: some negative (Layer 0: mean -3.4), some positive (Layer 1: mean ~1.4) — code uses -exp(A_log) which gives correct negative A for both
+- Conv1d weight shape [8192, 1, 4] in safetensors; tap 3 mean_abs=0.029, tap 0 mean_abs=0.007 — both attenuate signal ~20-100x vs raw QKV
+- All tensor shapes verified match code expectations; q_proj.weight is [8192, 4096] = [2h, h] (includes output gate)
+Work State
+Completed
+- Fixed borrow checker in forward_one_token, deltanet_forward, attention_forward, mlp_forward by cloning self.cfg fields to locals
+- Deleted dead files: ornith_forward.rs, safetensor_tensors.rs, engine_keymap.rs; removed their pub mod lines from lib.rs
+- Removed dead code: scale_factor line, final_norm lookup, lm_head_transposed variable
+- Chunked lm_head reading (1024-row chunks instead of loading all 4GB)
+- Wired --engine native CLI handler in main.rs (uses StreamingOrnith directly)
+- Fixed critical residual bug: second residual was adding to residual (original hidden) instead of current hidden
+- Added DeltaNetStateCache and KV cache to StreamingOrnith for cross-token state
+- Updated deltanet_forward with full delta rule: S = decay*S + beta*(v - S@k)⊗k, output S@q
+- Updated attention_forward with proper attention over cached K,V (q_norm, k_norm, output gate, softmax over all positions)
+- Added conv1d with proper state caching (tap ordering: safetensors tap conv_k-1-k maps to GGUF weightk = current input)
+- Test now processes all 5 prompt tokens sequentially to build state before prediction
+- Verified all tensor shapes against safetensors metadata via Python
+Active
+- Output still wrong despite full state accumulation: top-1 is Chinese "取" (token 96284), " Paris" (token 11751) has logit -0.455
+- The conv1d output is ~0.0029 mean_abs before SiLU (vs raw QKV ~0.10), suggesting conv weights are too small or indexing is wrong
+- Without conv (raw QKV+SiLU): DeltaNet OUT mean_abs=0.06, hidden mean_abs=0.20; still produces wrong prediction
+- The delta rule output chain: QKV(~0.10) → conv/tap(~0.03) → delta_output(6e-5) → per-head-norm(→ 1.0) → z-gate(→ ~0.07) → out_proj(→ 3.3) — but actual observed output is 0.06, suggesting a missing factor in the computation chain
+Blocked
+- Conv1d weights are very small (mean_abs tap_3=0.029), making conv output 20x smaller than raw QKV; unclear if this is expected or indexing is wrong
+- Reference code applies SiLU only after conv, not without conv — our no-conv path always applies SiLU, which may be incorrect
+- The delta rule output magnitude is much smaller than expected from theoretical computation, suggesting a bug in the normalization, z-gate, or output projection steps
+Next Move
+1. Test raw QKV with NO SiLU (matching reference behavior when conv is absent) to see if SiLU alone is the culprit
+2. If still wrong, add debug prints for intermediate values (Q after norm, K after norm, qk_dot, beta, v_pred, delta_output per head) to find the missing factor
+3. Once correct output is achieved with raw QKV, re-enable conv1d with empirical verification of tap ordering
+Relevant Files
+- rust/src/streaming_ornith.rs: Main streaming forward pass — all fixes applied here
+- rust/src/inference/deltanet.rs (561 lines): Reference DeltaNet implementation (GGUF engine, proven correct)
+- rust/src/cache/deltanet_state.rs: DeltaNet matrix state cache + conv state cache
+- rust/src/ornith_config.rs: Config parser for Qwen3.5 hybrid model
+- rust/src/bin/test_streaming_forward.rs: Test binary processing all prompt tokens sequentially
+- /home/xander/Documents/portfolio/LeafcutterLLM/strategy.md: Complete build/debug guide with tensor shapes and known failure modes
+

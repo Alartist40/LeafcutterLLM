@@ -11,7 +11,8 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::Read;
+use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 /// Tensor metadata for a single stored tensor.
@@ -164,7 +165,7 @@ impl Shards {
     /// This is the key to streaming: for embedding lookup we read 4096 elements
     /// (8KB BF16) instead of the entire 2GB table.
     pub fn read_tensor_slice_f32(
-        &mut self,
+        &self,
         name: &str,
         offset: usize, // in elements
         count: usize,  // in elements
@@ -175,34 +176,30 @@ impl Shards {
             .ok_or_else(|| format!("tensor {name:?} not found"))?
             .clone();
 
-        let file = &mut self.files[file_idx];
+        let file = &self.files[file_idx];
         let bytes_per_elem = meta.dtype.bytes_per_elem() as usize;
         let byte_offset = meta.offset as usize + offset * bytes_per_elem;
         let nbytes = count * bytes_per_elem;
 
         let mut buf = vec![0u8; nbytes];
-        file.seek(SeekFrom::Start(byte_offset as u64))
-            .map_err(|e| format!("seek: {e}"))?;
-        file.read_exact(&mut buf)
-            .map_err(|e| format!("read: {e}"))?;
+        file.read_exact_at(&mut buf, byte_offset as u64)
+            .map_err(|e| format!("pread: {e}"))?;
 
         dequant_slice(&buf, meta.dtype, count)
     }
 
     /// Read entire tensor as f32 (existing behavior — loads whole tensor).
-    pub fn read_tensor_f32(&mut self, name: &str) -> Result<Vec<f32>, String> {
+    pub fn read_tensor_f32(&self, name: &str) -> Result<Vec<f32>, String> {
         let (file_idx, meta) = self
             .index
             .get(name)
             .ok_or_else(|| format!("tensor {name:?} not found"))?
             .clone();
 
-        let file = &mut self.files[file_idx];
+        let file = &self.files[file_idx];
         let mut buf = vec![0u8; meta.nbytes as usize];
-        file.seek(SeekFrom::Start(meta.offset))
-            .map_err(|e| format!("seek: {e}"))?;
-        file.read_exact(&mut buf)
-            .map_err(|e| format!("read: {e}"))?;
+        file.read_exact_at(&mut buf, meta.offset)
+            .map_err(|e| format!("pread: {e}"))?;
 
         // Dequantize to f32 based on dtype.
         match meta.dtype {
