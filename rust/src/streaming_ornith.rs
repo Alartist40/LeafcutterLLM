@@ -110,32 +110,30 @@ impl StreamingOrnith {
         }
 
         // 3. Final norm
-        let final_norm = self
-            .shards
-            .lookup("model.language_model.norm.weight")
-            .ok_or("missing final norm")?;
         let final_w = self
             .shards
             .read_tensor_f32("model.language_model.norm.weight")?;
         hidden = rms_norm(&hidden, &final_w, rms_eps);
 
         // 4. LM head: logits = hidden @ lm_head.T
-        // lm_head is [vocab, hidden]. Read it in chunks to avoid loading
-        // the whole 2GB at once. For now, read it all (it's the same size
-        // as embed — we'll optimize this later).
-        let lm_head = self.shards.read_tensor_f32("lm_head.weight")?;
-        let vocab = vocab_size;
-        let mut logits = vec![0.0f32; vocab];
-        // logits[v] = dot(hidden, lm_head_row_v)
-        let lm_head_t = Tensor::from_vec(lm_head, vec![vocab, h]);
-        let hidden_t = Tensor::from_vec(hidden, vec![1, h]);
-        let lm_head_transposed = lm_head_t.transpose();
-        let logits_t = hidden_t.matmul(&lm_head_t.transpose());
-        // The above creates [1, vocab] = hidden @ lm_head^T.
-        // Wait — lm_head is [vocab, h], so hidden(1,h) @ lm_head^T(h, vocab) = [1, vocab].
-        logits = logits_t.data;
-        // Truncate just in case
-        logits.truncate(vocab);
+        // lm_head.weight is [vocab, hidden] = 248320 × 4096 (~4GB f32).
+        // Read it in CHUNKS of 1024 rows to keep peak RAM low.
+        let lm_head_name = "lm_head.weight";
+        let mut logits = vec![0.0f32; vocab_size];
+        let chunk_size = 1024;
+        for chunk_start in (0..vocab_size).step_by(chunk_size) {
+            let chunk_end = (chunk_start + chunk_size).min(vocab_size);
+            let n_rows = chunk_end - chunk_start;
+            let chunk = self.shards.read_tensor_slice_f32(
+                lm_head_name,
+                chunk_start * h,
+                n_rows * h,
+            )?;
+            let chunk_t = Tensor::from_vec(chunk, vec![n_rows, h]);
+            let hidden_t = Tensor::from_vec(hidden.clone(), vec![1, h]);
+            let logits_chunk = hidden_t.matmul(&chunk_t.transpose());
+            logits[chunk_start..chunk_end].copy_from_slice(&logits_chunk.data);
+        }
 
         Ok(logits)
     }
@@ -222,24 +220,14 @@ impl StreamingOrnith {
         // qkv_proj.data: [conv_dim] = [Q(2048) | K(2048) | V(4096)]
 
         // 3. Causal Conv1d (kernel=4) + SiLU
-        // For pos=0 (first token), conv state is zeros. Output = conv_w[3] * input.
-        // conv1d.weight shape: [conv_k, conv_dim] = [4, 8192]
+        // conv1d.weight shape in safetensors: [conv_dim, 1, conv_k] = [8192, 1, 4]
+        // Row-major index for channel c, kernel tap k: c * conv_k + k
+        // For pos=0 (first token), conv state is zeros, so only the last tap (k=3) applies.
         let conv_w = w.get("linear_attn.conv1d.weight").ok_or("missing conv1d")?;
-        // conv_w is stored as [conv_dim, conv_k] in safetensors (out, in) for conv1d
-        // Actually for Conv1d: weight shape is [out_channels, in_channels, kernel_size]
-        // In safetensors it might be [conv_dim, 1, conv_k] flattened to [conv_dim * conv_k]
-        // or [conv_k, conv_dim]. Let's handle both:
         let conv_out = if conv_w.len() == conv_dim * conv_k {
-            // [conv_dim, conv_k] or [conv_k, conv_dim] — try [conv_k, conv_dim] first
-            // For pos=0 with zero state: out[c] = conv_w[3*conv_dim + c] * qkv[c]
-            // But we need to know the layout. Let's try both and see which gives sane values.
-            // Most common: weight shape = [conv_k, conv_dim] (PyTorch Conv1d convention)
             let mut out = vec![0.0f32; conv_dim];
             for c in 0..conv_dim {
-                // For kernel_size=4, at pos=0, the conv looks at positions [-3,-2,-1,0]
-                // Positions [-3,-2,-1] are zero (no previous state).
-                // out[c] = conv_w[3 * conv_dim + c] * qkv_proj.data[c]
-                out[c] = conv_w[3 * conv_dim + c] * qkv_proj.data[c];
+                out[c] = conv_w[c * conv_k + (conv_k - 1)] * qkv_proj.data[c];
             }
             // SiLU: x * sigmoid(x)
             for v in out.iter_mut() {
@@ -326,7 +314,6 @@ impl StreamingOrnith {
                 //   S = decay * 0 + beta * (v - 0) * k = beta * v ⊗ k
                 //   o = S @ q = beta * (q · k) * v
                 let qk_dot: f32 = q_h.iter().zip(k_h.iter()).map(|(&qi, &ki)| qi * ki).sum();
-                let scale_factor = decay_h.ln() + (beta_h * qk_dot).ln(); // not right, let me just do it directly
 
                 // Direct computation for pos=0:
                 // S[i][j] = beta_h * v_h[i] * k_h[j]
@@ -384,11 +371,12 @@ impl StreamingOrnith {
         let n_heads = self.cfg.num_attention_heads;
         let head_dim = self.cfg.head_dim; // 256
         let n_kv = self.cfg.num_key_value_heads; // 4
+        let rms_eps = self.cfg.rms_norm_eps;
 
         let norm_w = w
             .get("input_layernorm.weight")
             .ok_or("missing input_layernorm")?;
-        let normed = rms_norm(hidden, norm_w, self.cfg.rms_norm_eps);
+        let normed = rms_norm(hidden, norm_w, rms_eps);
 
         // Q = hidden @ q_proj^T — q_proj is [h, h]
         let q_w = w.get("self_attn.q_proj.weight").ok_or("missing q_proj")?;
@@ -474,6 +462,27 @@ impl StreamingOrnith {
             }
         }
         best
+    }
+
+    /// Generate text: single-token autoregressive loop.
+    /// Note: no KV cache yet — each token re-processes all 32 layers.
+    pub fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String, String> {
+        let mut ids = self.tok.encode(prompt, 1024);
+        eprintln!("[generate] prompt tokens: {}", ids.len());
+        for i in 0..max_tokens {
+            let last = *ids.last().unwrap() as i32;
+            let pos = ids.len() - 1;
+            let logits = self.forward_one_token(last, pos)?;
+            let next = Self::argmax(&logits) as i32;
+            ids.push(next);
+            let text = self.tok.decode(&[next]);
+            print!("{text}");
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+            if i == 0 {
+                eprintln!("\n[generate] first token id={next} text=\"{text}\"");
+            }
+        }
+        Ok(self.tok.decode(&ids))
     }
 }
 

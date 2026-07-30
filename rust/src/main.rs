@@ -205,6 +205,8 @@ async fn main() {
                 cmd_run_ollama(&model, temp, top_p, max_tokens, &ollama_host);
             } else if engine == "safetensor" || engine == "safetensors" {
                 cmd_run_safetensor(&model, temp, top_p, max_tokens);
+            } else if engine == "native" {
+                cmd_run_native(&model, max_tokens);
             } else {
                 cmd_run(&model, temp, top_p, max_tokens);
             }
@@ -493,6 +495,95 @@ fn cmd_run_safetensor(model_arg: &str, mut temp: f32, _top_p: f32, mut max_token
                 eprintln!("[safetensor backend error] {}", e);
                 eprintln!("Hint: install Python deps:  pip install transformers torch safetensors");
                 continue;
+            }
+        }
+    }
+}
+
+
+/// Streaming chat via the native Rust safetensor backend.
+/// Uses StreamingOrnith — pure Rust, no Python dependency.
+fn cmd_run_native(model_arg: &str, max_tokens: usize) {
+    use leafcutter::streaming_ornith::StreamingOrnith;
+
+    let path = std::path::PathBuf::from(shellexpand::tilde(model_arg).as_ref());
+    if !path.exists() {
+        eprintln!("Model path '{}' not found.", path.display());
+        std::process::exit(1);
+    }
+
+    // Check if this looks like a safetensors model directory
+    let has_safetensors = std::fs::read_dir(&path)
+        .ok()
+        .map(|rd| rd.flatten().any(|e| {
+            e.path().extension().and_then(|s| s.to_str()) == Some("safetensors")
+        }))
+        .unwrap_or(false);
+    if !has_safetensors {
+        eprintln!("No .safetensors files found in '{}'.", path.display());
+        eprintln!("The native engine requires a directory with .safetensors shards.");
+        std::process::exit(1);
+    }
+
+    let mut model = match StreamingOrnith::open(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to open model: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!(
+        "🌿 Leafcutter Native Engine (Streaming)\n   Model: {}\n   Max tokens: {}",
+        path.display(),
+        max_tokens,
+    );
+    eprintln!("  ─────────────────────────────────────────────────");
+
+    loop {
+        print!("\n>>> ");
+        std::io::stdout().flush().ok();
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input).is_err() {
+            break;
+        }
+        let input = input.trim().to_string();
+        if input.is_empty() {
+            continue;
+        }
+        if input.starts_with('/') {
+            match input.trim() {
+                "/bye" | "/quit" | "/exit" => {
+                    eprintln!("Goodbye!");
+                    break;
+                }
+                "/clear" => {
+                    eprintln!("[native engine has no persistent state to clear]");
+                    continue;
+                }
+                "/help" => {
+                    eprintln!("\nCommands: /bye /quit /exit  /clear  /help\n");
+                    continue;
+                }
+                _ => {
+                    eprintln!("Unknown command: {}", input);
+                    continue;
+                }
+            }
+        }
+
+        let t0 = std::time::Instant::now();
+        match model.generate(&input, max_tokens) {
+            Ok(text) => {
+                let elapsed = t0.elapsed();
+                let tokens = text.split_whitespace().count();
+                eprintln!(
+                    "\n─────────────────────────────────────────────────"
+                );
+                eprintln!("Generated ~{} tokens in {:.1}s", tokens, elapsed.as_secs_f64());
+            }
+            Err(e) => {
+                eprintln!("\n[native engine error] {}", e);
             }
         }
     }
