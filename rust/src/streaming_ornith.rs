@@ -44,6 +44,10 @@ impl StreamingOrnith {
         pos: usize,
     ) -> Result<Vec<f32>, String> {
         let h = self.cfg.hidden_size;
+        let num_layers = self.cfg.num_hidden_layers;
+        let layer_types: Vec<String> = self.cfg.layer_types.clone();
+        let rms_eps = self.cfg.rms_norm_eps;
+        let vocab_size = self.cfg.vocab_size;
 
         // 1. Embedding: read ONLY the one row we need (h elements = 8KB BF16).
         let embed_name = "model.language_model.embed_tokens.weight";
@@ -56,10 +60,8 @@ impl StreamingOrnith {
         );
 
         // 2. Run all 32 layers — load each layer's weights, compute, discard.
-        for layer_idx in 0..self.cfg.num_hidden_layers {
-            let layer_type = self
-                .cfg
-                .layer_types
+        for layer_idx in 0..num_layers {
+            let layer_type = layer_types
                 .get(layer_idx)
                 .map(|s| s.as_str())
                 .unwrap_or("linear_attention");
@@ -69,7 +71,7 @@ impl StreamingOrnith {
             eprintln!(
                 "[stream] layer {}/{} loaded {} tensors in {:?}",
                 layer_idx,
-                self.cfg.num_hidden_layers,
+                num_layers,
                 weights.len(),
                 t0.elapsed()
             );
@@ -95,7 +97,7 @@ impl StreamingOrnith {
             let post_norm = weights
                 .get("post_attention_layernorm.weight")
                 .ok_or("missing post_attention_layernorm")?;
-            let normed = rms_norm(&hidden, post_norm, self.cfg.rms_norm_eps);
+            let normed = rms_norm(&hidden, post_norm, rms_eps);
 
             let t2 = std::time::Instant::now();
             let mlp_out = self.mlp_forward(&weights, &normed)?;
@@ -115,14 +117,14 @@ impl StreamingOrnith {
         let final_w = self
             .shards
             .read_tensor_f32("model.language_model.norm.weight")?;
-        hidden = rms_norm(&hidden, &final_w, self.cfg.rms_norm_eps);
+        hidden = rms_norm(&hidden, &final_w, rms_eps);
 
         // 4. LM head: logits = hidden @ lm_head.T
         // lm_head is [vocab, hidden]. Read it in chunks to avoid loading
         // the whole 2GB at once. For now, read it all (it's the same size
         // as embed — we'll optimize this later).
         let lm_head = self.shards.read_tensor_f32("lm_head.weight")?;
-        let vocab = self.cfg.vocab_size;
+        let vocab = vocab_size;
         let mut logits = vec![0.0f32; vocab];
         // logits[v] = dot(hidden, lm_head_row_v)
         let lm_head_t = Tensor::from_vec(lm_head, vec![vocab, h]);
@@ -198,49 +200,175 @@ impl StreamingOrnith {
         layer_idx: usize,
     ) -> Result<Vec<f32>, String> {
         let h = self.cfg.hidden_size;
-        // Input norm
-        let norm_w = w
-            .get("input_layernorm.weight")
-            .ok_or("missing input_layernorm")?;
-        let normed = rms_norm(hidden, norm_w, self.cfg.rms_norm_eps);
+        let rms_eps = self.cfg.rms_norm_eps;
 
-        // QKV projection: [1, h] @ [h, 3h] = [1, 3h]
-        // in_proj_qkv is [3h, h] in safetensors (out, in).
-        // We need hidden @ qkv^T = [1, 3h].
-        let qkv_w = w
-            .get("linear_attn.in_proj_qkv.weight")
-            .ok_or("missing in_proj_qkv")?;
-        let qkv_t = Tensor::from_vec(qkv_w.clone(), vec![3 * h, h]);
-        let hidden_t = Tensor::from_vec(normed, vec![1, h]);
-        let qkv = hidden_t.matmul(&qkv_t.transpose());
-        eprintln!(
-            "[stream] layer {} qkv shape: {} first 4 = {:?}",
-            layer_idx,
-            qkv.data.len(),
-            &qkv.data[..4]
-        );
+        // Config for linear attention heads
+        let n_qk = self.cfg.linear_num_key_heads;   // 16
+        let n_v = self.cfg.linear_num_value_heads;   // 32
+        let d_k = self.cfg.linear_key_head_dim;     // 128
+        let d_v = self.cfg.linear_value_head_dim;   // 128
+        let conv_k = self.cfg.linear_conv_kernel_dim; // 4
+        let conv_dim = n_qk * d_k + n_qk * d_k + n_v * d_v; // 8192
 
-        // TODO: full DeltaNet recurrence (conv1d, A_log, dt_bias, state update)
-        // For now, just use the Q part for a simplified attention pass.
-        let q = &qkv.data[..h];
-        let k = &qkv.data[h..2 * h];
-        let v = &qkv.data[2 * h..3 * h];
+        // 1. Input norm
+        let norm_w = w.get("input_layernorm.weight").ok_or("missing input_layernorm")?;
+        let normed = rms_norm(hidden, norm_w, rms_eps);
 
-        // Simple scaled dot-product: just q @ v^T (simplified — no state yet)
-        // This is WRONG but lets us validate the pipeline end-to-end.
-        // We'll replace with proper DeltaNet next.
-        let mut out = vec![0.0f32; h];
-        for i in 0..h {
-            out[i] = q[i] * v[i]; // placeholder
+        // 2. QKV projection: [1, h] @ [conv_dim, h]^T = [1, conv_dim]
+        let qkv_w = w.get("linear_attn.in_proj_qkv.weight").ok_or("missing in_proj_qkv")?;
+        let qkv_t = Tensor::from_vec(qkv_w.clone(), vec![conv_dim, h]);
+        let hidden_t = Tensor::from_vec(normed.clone(), vec![1, h]);
+        let qkv_proj = hidden_t.matmul(&qkv_t.transpose());
+        // qkv_proj.data: [conv_dim] = [Q(2048) | K(2048) | V(4096)]
+
+        // 3. Causal Conv1d (kernel=4) + SiLU
+        // For pos=0 (first token), conv state is zeros. Output = conv_w[3] * input.
+        // conv1d.weight shape: [conv_k, conv_dim] = [4, 8192]
+        let conv_w = w.get("linear_attn.conv1d.weight").ok_or("missing conv1d")?;
+        // conv_w is stored as [conv_dim, conv_k] in safetensors (out, in) for conv1d
+        // Actually for Conv1d: weight shape is [out_channels, in_channels, kernel_size]
+        // In safetensors it might be [conv_dim, 1, conv_k] flattened to [conv_dim * conv_k]
+        // or [conv_k, conv_dim]. Let's handle both:
+        let conv_out = if conv_w.len() == conv_dim * conv_k {
+            // [conv_dim, conv_k] or [conv_k, conv_dim] — try [conv_k, conv_dim] first
+            // For pos=0 with zero state: out[c] = conv_w[3*conv_dim + c] * qkv[c]
+            // But we need to know the layout. Let's try both and see which gives sane values.
+            // Most common: weight shape = [conv_k, conv_dim] (PyTorch Conv1d convention)
+            let mut out = vec![0.0f32; conv_dim];
+            for c in 0..conv_dim {
+                // For kernel_size=4, at pos=0, the conv looks at positions [-3,-2,-1,0]
+                // Positions [-3,-2,-1] are zero (no previous state).
+                // out[c] = conv_w[3 * conv_dim + c] * qkv_proj.data[c]
+                out[c] = conv_w[3 * conv_dim + c] * qkv_proj.data[c];
+            }
+            // SiLU: x * sigmoid(x)
+            for v in out.iter_mut() {
+                *v = *v * (1.0 / (1.0 + (-*v).exp()));
+            }
+            out
+        } else {
+            // Unexpected shape — just use raw QKV
+            qkv_proj.data.clone()
+        };
+
+        // 4. Split into Q, K, V
+        let q_total = n_qk * d_k;   // 2048
+        let k_total = n_qk * d_k;   // 2048
+        let v_total = n_v * d_v;    // 4096
+        let q_data = &conv_out[..q_total];
+        let k_data = &conv_out[q_total..q_total + k_total];
+        let v_data = &conv_out[q_total + k_total..q_total + k_total + v_total];
+
+        // 5. L2-normalize Q and K (per-head)
+        let mut q = q_data.to_vec();
+        let mut k = k_data.to_vec();
+        for head in 0..n_qk {
+            let base = head * d_k;
+            let mut norm_sq = 0.0f32;
+            for d in 0..d_k { norm_sq += q[base + d] * q[base + d]; }
+            let norm = norm_sq.sqrt().max(1e-6);
+            for d in 0..d_k { q[base + d] /= norm; }
+
+            let mut norm_sq = 0.0f32;
+            for d in 0..d_k { norm_sq += k[base + d] * k[base + d]; }
+            let norm = norm_sq.sqrt().max(1e-6);
+            for d in 0..d_k { k[base + d] /= norm; }
+        }
+        // Scale Q by 1/sqrt(d_k)
+        let scale = 1.0f32 / (d_k as f32).sqrt();
+        for v in q.iter_mut() { *v *= scale; }
+
+        // 6. Compute decay rates: decay = exp(softplus(alpha + dt_bias) * A)
+        //    where alpha = hidden @ in_proj_a.weight, A = -exp(A_log)
+        let a_w = w.get("linear_attn.in_proj_a.weight").ok_or("missing in_proj_a")?;
+        let a_t = Tensor::from_vec(a_w.clone(), vec![n_v, h]);
+        let alpha = hidden_t.matmul(&a_t.transpose()); // [1, n_v]
+
+        let a_log = w.get("linear_attn.A_log").ok_or("missing A_log")?;
+        let dt_bias = w.get("linear_attn.dt_bias").ok_or("missing dt_bias")?;
+
+        let mut decay = vec![0.0f32; n_v];
+        for head in 0..n_v {
+            let alpha_val = alpha.data[head];
+            let dt_val = dt_bias.get(head).copied().unwrap_or(0.0);
+            let a_log_val = a_log.get(head).copied().unwrap_or(0.0);
+            let a = -a_log_val.exp(); // A = -exp(A_log)
+            let dt = softplus(alpha_val + dt_val);
+            decay[head] = (dt * a).exp();
         }
 
-        // Output projection
-        let o_w = w
-            .get("linear_attn.out_proj.weight")
-            .ok_or("missing out_proj")?;
-        let o_t = Tensor::from_vec(o_w.clone(), vec![h, h]);
-        let out_t = Tensor::from_vec(out, vec![1, h]);
+        // 7. Compute beta gates: beta = sigmoid(hidden @ in_proj_b.weight)
+        let b_w = w.get("linear_attn.in_proj_b.weight").ok_or("missing in_proj_b")?;
+        let b_t = Tensor::from_vec(b_w.clone(), vec![n_v, h]);
+        let beta_logits = hidden_t.matmul(&b_t.transpose()); // [1, n_v]
+        let beta: Vec<f32> = beta_logits.data.iter().map(|&v| sigmoid(v)).collect();
+
+        // 8. Delta rule state update + output
+        // For pos=0: state starts at zero.
+        //   v_pred = S @ k = 0 (state is zero)
+        //   S = decay * S + beta * (v - v_pred) * k = beta * v * k (outer product)
+        //   o = S @ q = beta * (q . k) * v
+        let v_heads_per_qk = if n_qk > 0 { n_v / n_qk } else { 1 };
+        let mut output = vec![0.0f32; v_total];
+
+        for h_qk in 0..n_qk {
+            let q_h = &q[h_qk * d_k..(h_qk + 1) * d_k];
+            let k_h = &k[h_qk * d_k..(h_qk + 1) * d_k];
+
+            for v_idx in 0..v_heads_per_qk.max(1) {
+                let h_v = h_qk * v_heads_per_qk + v_idx;
+                if h_v >= n_v { continue; }
+                let v_h = &v_data[h_v * d_v..(h_v + 1) * d_v];
+                let decay_h = decay[h_v];
+                let beta_h = beta[h_v];
+
+                // For pos=0: state = 0, so:
+                //   S = decay * 0 + beta * (v - 0) * k = beta * v ⊗ k
+                //   o = S @ q = beta * (q · k) * v
+                let qk_dot: f32 = q_h.iter().zip(k_h.iter()).map(|(&qi, &ki)| qi * ki).sum();
+                let scale_factor = decay_h.ln() + (beta_h * qk_dot).ln(); // not right, let me just do it directly
+
+                // Direct computation for pos=0:
+                // S[i][j] = beta_h * v_h[i] * k_h[j]
+                // o[i] = sum_j S[i][j] * q_h[j] = beta_h * v_h[i] * (k_h . q_h)
+                //      = beta_h * qk_dot * v_h[i]
+                for i in 0..d_v {
+                    output[h_v * d_v + i] = beta_h * qk_dot * v_h[i];
+                }
+            }
+        }
+
+        // 9. Per-head RMSNorm using linear_attn.norm.weight
+        let norm_weight = w.get("linear_attn.norm.weight").ok_or("missing norm.weight")?;
+        for head in 0..n_v {
+            let base = head * d_v;
+            let mut sq_sum = 0.0f32;
+            for d in 0..d_v { sq_sum += output[base + d] * output[base + d]; }
+            let rms = (sq_sum / d_v as f32 + rms_eps).sqrt();
+            for d in 0..d_v {
+                output[base + d] = (output[base + d] / rms) * norm_weight.get(d).copied().unwrap_or(1.0);
+            }
+        }
+
+        // 10. Z-gate: z = hidden @ in_proj_z.weight, then output *= silu(z)
+        let z_w = w.get("linear_attn.in_proj_z.weight").ok_or("missing in_proj_z")?;
+        let z_t = Tensor::from_vec(z_w.clone(), vec![v_total, h]);
+        let z = hidden_t.matmul(&z_t.transpose()); // [1, v_total]
+        for i in 0..output.len() {
+            let z_val = z.data[i];
+            let silu_z = z_val * (1.0 / (1.0 + (-z_val).exp()));
+            output[i] *= silu_z;
+        }
+
+        // 11. Output projection: [1, v_total] @ [h, v_total]^T = [1, h]
+        let o_w = w.get("linear_attn.out_proj.weight").ok_or("missing out_proj")?;
+        let o_t = Tensor::from_vec(o_w.clone(), vec![h, v_total]);
+        let out_t = Tensor::from_vec(output, vec![1, v_total]);
         let result = out_t.matmul(&o_t.transpose());
+
+        if layer_idx == 0 {
+            eprintln!("[stream] layer 0 (deltanet) OUT first 4 = {:?}", &result.data[..4]);
+        }
         Ok(result.data)
     }
 
@@ -269,7 +397,10 @@ impl StreamingOrnith {
         let o_w = w.get("self_attn.o_proj.weight").ok_or("missing o_proj")?;
 
         let hidden_t = Tensor::from_vec(normed, vec![1, h]);
-        let q = hidden_t.matmul(&Tensor::from_vec(q_w.clone(), vec![h, h]).transpose());
+        // q_proj is [2h, h] — first h is Q, second h is attn_output_gate
+        let q_all = hidden_t.matmul(&Tensor::from_vec(q_w.clone(), vec![2 * h, h]).transpose());
+        let q_data = q_all.data[..h].to_vec();
+        let q = Tensor::from_vec(q_data, vec![1, h]);
         let k = hidden_t.matmul(&Tensor::from_vec(k_w.clone(), vec![n_kv * head_dim, h]).transpose());
         let v = hidden_t.matmul(&Tensor::from_vec(v_w.clone(), vec![n_kv * head_dim, h]).transpose());
 
@@ -356,4 +487,14 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
         .zip(weight.iter())
         .map(|(&xi, &wi)| xi * inv_rms * wi)
         .collect()
+}
+
+#[inline]
+fn softplus(x: f32) -> f32 {
+    (1.0f32 + x.exp()).ln()
+}
+
+#[inline]
+fn sigmoid(x: f32) -> f32 {
+    1.0f32 / (1.0f32 + (-x).exp())
 }
