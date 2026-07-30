@@ -331,6 +331,40 @@ However, the **Jetson Orin Nano** ($499) has both ARM CPU and Ampere GPU. This i
 
 *End of strategy. No code was harmed in the making of this document.*
 
+---
+
+## I. Streaming Native Rust Forward Pass — ACTIVE PLAN (2026-07-30)
+
+> **See:** `docs/architecture/streaming-native-plan.md` for the full step-by-step plan.
+
+### Summary
+
+The native Rust forward pass attempt failed (100x slower than Python) because:
+1. Naive triple-loop matmul instead of using existing `Tensor::matmul` (which dispatches to `matrixmultiply::sgemm`, BLAS-like)
+2. Loaded the ENTIRE 18GB model into RAM (clone-on-access cache) instead of streaming layer-by-layer
+
+### The fix: streaming + existing backend
+- Load ONE layer at a time from disk (~400MB peak RAM, not 18GB)
+- Read embedding as a single row (8KB, not 2GB)
+- Use existing `Tensor::matmul` for BLAS-like compute
+- Read lm_head in chunks (avoid loading 2GB at once)
+
+### 9 steps (detailed in streaming-native-plan.md)
+1. Fix borrow checker in `streaming_ornith.rs`
+2. Delete old architecture files (`ornith_forward.rs`, `safetensor_tensors.rs`, `engine_keymap.rs`)
+3. Implement real DeltaNet forward (currently placeholder)
+4. Full attention forward (simplified works for first token)
+5. Chunked lm_head read (stream, don't load 2GB)
+6. End-to-end test run
+7. Validate correctness against Python ("Paris")
+8. Multi-token generation loop
+9. Measure: time/tok, peak RSS, correctness
+
+### Targets
+- Time per token: <12s (beat Python's ~12s/tok)
+- Peak RAM: <500MB (vs Python's ~4GB, vs AirLLM's ~2GB)
+- Correctness: produces "Paris" for "The capital of France is"
+
 
 
 

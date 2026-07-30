@@ -159,8 +159,37 @@ impl Shards {
         Ok(Self { files, paths, index })
     }
 
-    /// Read a tensor by name, returning its data as f32 (dequantized if needed).
-    /// The data is read via pread (seek + read) so we don't disturb file position.
+    /// Read a SLICE of a tensor: `offset..offset+count` elements, returned as f32.
+    /// Reads only `count * dtype_bytes` from disk — does NOT load the whole tensor.
+    /// This is the key to streaming: for embedding lookup we read 4096 elements
+    /// (8KB BF16) instead of the entire 2GB table.
+    pub fn read_tensor_slice_f32(
+        &mut self,
+        name: &str,
+        offset: usize, // in elements
+        count: usize,  // in elements
+    ) -> Result<Vec<f32>, String> {
+        let (file_idx, meta) = self
+            .index
+            .get(name)
+            .ok_or_else(|| format!("tensor {name:?} not found"))?
+            .clone();
+
+        let file = &mut self.files[file_idx];
+        let bytes_per_elem = meta.dtype.bytes_per_elem() as usize;
+        let byte_offset = meta.offset as usize + offset * bytes_per_elem;
+        let nbytes = count * bytes_per_elem;
+
+        let mut buf = vec![0u8; nbytes];
+        file.seek(SeekFrom::Start(byte_offset as u64))
+            .map_err(|e| format!("seek: {e}"))?;
+        file.read_exact(&mut buf)
+            .map_err(|e| format!("read: {e}"))?;
+
+        dequant_slice(&buf, meta.dtype, count)
+    }
+
+    /// Read entire tensor as f32 (existing behavior — loads whole tensor).
     pub fn read_tensor_f32(&mut self, name: &str) -> Result<Vec<f32>, String> {
         let (file_idx, meta) = self
             .index
@@ -341,5 +370,66 @@ fn f16_to_f32(h: u16) -> f32 {
         f32::from_bits(sign | 0x7F800000 | (mant << 13))
     } else {
         f32::from_bits(sign | ((exp + 127 - 15) << 23) | (mant << 13))
+    }
+}
+
+/// Dequantize a byte slice to `count` f32 values. Same logic as
+/// `read_tensor_f32` but works on an already-read buffer.
+fn dequant_slice(buf: &[u8], dtype: StDtype, count: usize) -> Result<Vec<f32>, String> {
+    match dtype {
+        StDtype::F32 => {
+            if buf.len() < count * 4 {
+                return Err(format!(
+                    "F32 slice too short: {} bytes for {} elements",
+                    buf.len(),
+                    count
+                ));
+            }
+            let mut out = vec![0f32; count];
+            for (i, chunk) in buf.chunks_exact(4).take(count).enumerate() {
+                out[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            }
+            Ok(out)
+        }
+        StDtype::Bf16 => {
+            if buf.len() < count * 2 {
+                return Err(format!(
+                    "BF16 slice too short: {} bytes for {} elements",
+                    buf.len(),
+                    count
+                ));
+            }
+            let mut out = vec![0f32; count];
+            for (i, chunk) in buf.chunks_exact(2).take(count).enumerate() {
+                let h = u16::from_le_bytes([chunk[0], chunk[1]]);
+                out[i] = bf16_to_f32(h);
+            }
+            Ok(out)
+        }
+        StDtype::F16 => {
+            if buf.len() < count * 2 {
+                return Err(format!(
+                    "F16 slice too short: {} bytes for {} elements",
+                    buf.len(),
+                    count
+                ));
+            }
+            let mut out = vec![0f32; count];
+            for (i, chunk) in buf.chunks_exact(2).take(count).enumerate() {
+                let h = u16::from_le_bytes([chunk[0], chunk[1]]);
+                out[i] = f16_to_f32(h);
+            }
+            Ok(out)
+        }
+        StDtype::U8 => {
+            if buf.len() < count {
+                return Err(format!(
+                    "U8 slice too short: {} bytes for {} elements",
+                    buf.len(),
+                    count
+                ));
+            }
+            Ok(buf.iter().take(count).map(|&b| b as f32).collect())
+        }
     }
 }

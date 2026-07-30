@@ -83,55 +83,56 @@ impl OrnithModel {
         let mut hidden: Vec<f32> = embed.data
             [token_id as usize * hidden_size..(token_id as usize + 1) * hidden_size]
             .to_vec();
+        eprintln!("[t] embed lookup done, hidden[0..4]={:?}", &hidden[..4]);
 
         // 2. Run all 32 layers
+        let total_t0 = std::time::Instant::now();
+        eprintln!("[t] starting layer loop at {:?}", total_t0);
         for layer_idx in 0..self.cfg.num_hidden_layers {
-            eprintln!("[native-forward] layer {}/{}", layer_idx, self.cfg.num_hidden_layers);
             let layer_type = self
                 .cfg
                 .layer_types
                 .get(layer_idx)
                 .map(|s| s.as_str())
                 .unwrap_or("linear_attention");
+            let load_t = total_t0.elapsed();
             let weights = load_layer_weights(&self.tensors, layer_idx, layer_type);
+            eprintln!("[t] load layer {} took {:?}", layer_idx, total_t0.elapsed() - load_t);
 
             let residual = hidden.clone();
+            let run_t = total_t0.elapsed();
             hidden = self.run_layer(layer_idx, layer_type, &weights, hidden, pos, state)?;
-            // Add residual
+            eprintln!("[t] layer {} ({}) run={:?} total={:?}", layer_idx, layer_type, total_t0.elapsed() - run_t, total_t0.elapsed());
             for i in 0..hidden.len() {
                 hidden[i] += residual[i];
             }
         }
+        eprintln!("[t] all 32 layers done in {:?}", total_t0.elapsed());
 
         // 3. Final norm
         let final_norm = self
             .tensors
             .get("model.language_model.norm.weight")
             .ok_or("missing final norm")?;
-        let saved = hidden.clone();
-        crate::ornith_kernels::rmsnorm(
-            &mut hidden,
-            &saved,
-            &final_norm.data,
-            self.cfg.rms_norm_eps,
-        );
+        let hidden_t = Tensor::from_vec(hidden, vec![1, hidden_size]);
+        let normed = hidden_t.rms_norm(&final_norm, self.cfg.rms_norm_eps);
+        let mut hidden: Vec<f32> = normed.data;
 
-        // 4. LM head: logits = hidden @ lm_head.T
-        // lm_head.weight shape: [vocab, hidden]
-        // We need logits[vocab] = sum_i hidden[i] * lm_head[v, i]
+        // 4. LM head: logits = hidden @ lm_head.T (use Tensor::matmul for speed)
         let lm_head = self
             .tensors
             .get("lm_head.weight")
             .ok_or("missing lm_head")?;
         let vocab_size = self.cfg.vocab_size;
-        let mut logits = vec![0.0f32; vocab_size];
-        for v in 0..vocab_size {
-            let mut sum = 0.0f32;
-            for i in 0..hidden_size {
-                sum += hidden[i] * lm_head.data[v * hidden_size + i];
-            }
-            logits[v] = sum;
-        }
+        let hidden_t = Tensor::from_vec(hidden, vec![1, hidden_size]);
+        // Tensor::matmul expects A @ B where A is [m,k] and B is [k,n].
+        // lm_head is [vocab, hidden], so we want hidden @ lm_head.T.
+        // Transpose lm_head (one-time cost on load would be better, but do it here for now).
+        let lm_head_t = lm_head.transpose();
+        let logits_t = hidden_t.matmul(&lm_head_t);
+        let mut logits = logits_t.data;
+        // Truncate to vocab_size in case lm_head was padded.
+        logits.truncate(vocab_size);
         Ok(logits)
     }
 
@@ -146,6 +147,7 @@ impl OrnithModel {
     ) -> Result<Vec<f32>, String> {
         let h = self.cfg.hidden_size;
         let hidden_tensor = Tensor::from_vec(hidden, vec![1, h]);
+        let saved_for_residual = hidden_tensor.data.clone();
 
         // Attention block
         let attn_out = if layer_type == "linear_attention" {
@@ -174,8 +176,9 @@ impl OrnithModel {
 
         // Post-attention norm
         if let Some(post_norm) = weights.get("ffn_norm.weight") {
-            let saved = out.clone();
-            crate::ornith_kernels::rmsnorm(&mut out, &saved, &post_norm.data, self.cfg.rms_norm_eps);
+            let out_t = Tensor::from_vec(out, vec![1, h]);
+            let normed = out_t.rms_norm(post_norm, self.cfg.rms_norm_eps);
+            out = normed.data;
         }
 
         // MLP block (SwiGLU)
@@ -185,36 +188,16 @@ impl OrnithModel {
             weights.get("mlp.down_proj.weight"),
         ) {
             let inter = self.cfg.intermediate_size;
-            let mut gate_out = vec![0.0f32; inter];
-            crate::ornith_kernels::matmul(
-                &mut gate_out,
-                &out,
-                &gate.data,
-                1,
-                h,
-                inter,
-            );
-            let mut up_out = vec![0.0f32; inter];
-            crate::ornith_kernels::matmul(
-                &mut up_out,
-                &out,
-                &up.data,
-                1,
-                h,
-                inter,
-            );
+            // Use Tensor::matmul (dispatches to BLAS-like backend) instead of
+            // naive triple-loop.  This is the difference between 600s/tok and 12s/tok.
+            let out_tensor = Tensor::from_vec(out, vec![1, h]);
+            let gate_out_t = out_tensor.matmul(gate);
+            let up_out_t = out_tensor.matmul(up);
             let mut mlp_hidden = vec![0.0f32; inter];
-            crate::ornith_kernels::swiglu(&mut mlp_hidden, &gate_out, &up_out);
-            let mut mlp_out = vec![0.0f32; h];
-            crate::ornith_kernels::matmul(
-                &mut mlp_out,
-                &mlp_hidden,
-                &down.data,
-                1,
-                inter,
-                h,
-            );
-            out = mlp_out;
+            crate::ornith_kernels::swiglu(&mut mlp_hidden, &gate_out_t.data, &up_out_t.data);
+            let mlp_hidden_t = Tensor::from_vec(mlp_hidden, vec![1, inter]);
+            let mlp_out_t = mlp_hidden_t.matmul(down);
+            out = mlp_out_t.data;
         }
 
         Ok(out)
