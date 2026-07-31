@@ -58,6 +58,18 @@ pub struct GGUFModel {
     pub file: GGUFile,
     pub config: ModelConfig,
     pub architecture: ModelArchitecture,
+    /// Persistent per-layer weight cache (Phase 5 perf fix).
+    ///
+    /// `load_layer()` re-parses + re-dequantizes every layer's weights from
+    /// the mmap each call, which previously happened once per token (32× per
+    /// generated token). Holding each layer's `Tensor`s here (as `Arc` so
+    /// callers share without cloning the multi-GB matrices) turns every call
+    /// after the first into a cache hit.
+    ///
+    /// The cache holds the raw quantized blocks (`Tensor.q_data`), NOT f32
+    /// dequantized copies — so Q4_K/Q6_K stay ~file-size in RAM and GEMM
+    /// kernels dequantize on the fly.
+    layer_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<HashMap<String, Tensor>>>>,
 }
 
 impl GGUFModel {
@@ -65,7 +77,62 @@ impl GGUFModel {
         let file = GGUFile::open(path)?;
         let architecture = ModelArchitecture::detect(&file);
         let config = Self::extract_config(&file, architecture);
-        Ok(Self { file, config, architecture })
+        Ok(Self {
+            file,
+            config,
+            architecture,
+            layer_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Number of resident layer-weights in the cache (for monitoring).
+    pub fn cached_layers(&self) -> usize {
+        self.layer_cache.lock().map(|c| c.len()).unwrap_or(0)
+    }
+
+    /// Total estimated bytes of cached quantized weights (for monitoring).
+    pub fn cached_bytes(&self) -> usize {
+        self.layer_cache.lock().map(|c| {
+            c.values().map(|arc| arc.values().map(|t| t.quantized_memory_bytes()).sum::<usize>()).sum::<usize>()
+        }).unwrap_or(0)
+    }
+
+    /// Load a layer's weights, cached across calls.
+    ///
+    /// First call per layer parses + dequantizes from the mmap (as before);
+    /// subsequent calls return the cached `Arc` — O(1), no disk I/O, no
+    /// re-dequantization. This is the Phase 5 fix for the 16× slowdown.
+    pub fn get_layer(&self, idx: usize) -> Result<std::sync::Arc<HashMap<String, Tensor>>, GGUError> {
+        if std::env::var("LEAFCUTTER_NO_CACHE").map(|v| v == "1").unwrap_or(false) {
+            return Ok(std::sync::Arc::new(self.load_layer(idx)?));
+        }
+        {
+            let cache = self.layer_cache.lock().map_err(|_| GGUError::UnsupportedQuantType("cache poisoned".into(), 0))?;
+            if let Some(arc) = cache.get(&idx) {
+                return Ok(std::sync::Arc::clone(arc));
+            }
+        }
+        // Cache miss: build the layer (may take ~10-100 ms for a big layer).
+        let weights = self.load_layer(idx)?;
+        let arc = std::sync::Arc::new(weights);
+        let mut cache = self.layer_cache.lock().map_err(|_| GGUError::UnsupportedQuantType("cache poisoned".into(), 0))?;
+        // Re-check under lock in case a concurrent caller built it first.
+        cache.entry(idx).or_insert_with(|| std::sync::Arc::clone(&arc));
+        Ok(arc)
+    }
+
+    /// Optional: evict a layer from the cache to bound RSS (e.g. huge models).
+    pub fn evict_layer(&self, idx: usize) {
+        if let Ok(mut cache) = self.layer_cache.lock() {
+            cache.remove(&idx);
+        }
+    }
+
+    /// Clear the whole layer cache (e.g. before a fresh conversation).
+    pub fn clear_layer_cache(&self) {
+        if let Ok(mut cache) = self.layer_cache.lock() {
+            cache.clear();
+        }
     }
 
     /// Generate a pre-flight capability report without loading any weights.

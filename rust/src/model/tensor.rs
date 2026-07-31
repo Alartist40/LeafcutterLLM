@@ -56,7 +56,10 @@ impl Tensor {
 
     /// Create a tensor from raw data, using the global backend.
     pub fn from_vec(data: Vec<f32>, shape: Vec<usize>) -> Self {
-        assert_eq!(data.len(), shape.iter().product::<usize>());
+        let expected = shape.iter().product::<usize>();
+        if data.len() != expected {
+            panic!("Tensor::from_vec: data.len={} != shape={:?} (expected={})", data.len(), shape, expected);
+        }
         Self {
             shape,
             data,
@@ -67,7 +70,10 @@ impl Tensor {
 
     /// Create a tensor with a specific backend.
     pub fn from_vec_with_backend(data: Vec<f32>, shape: Vec<usize>, backend: &'static dyn Backend) -> Self {
-        assert_eq!(data.len(), shape.iter().product::<usize>());
+        let expected = shape.iter().product::<usize>();
+        if data.len() != expected {
+            panic!("Tensor::from_vec_with_backend: data.len={} != shape={:?} (expected={})", data.len(), shape, expected);
+        }
         Self { shape, data, q_data: None, backend }
     }
 

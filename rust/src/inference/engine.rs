@@ -1000,13 +1000,11 @@ impl Engine {
         //     self.kv_cache` simultaneously.
         let model_ref = &self.model;
         let num_layers = self.config.num_hidden_layers;
-        // Phase 2: per-layer async prefetch via std::thread::scope.
-        //
-        // load_layer() dequantizes Q4_K/Q6_K weights from mmap; on the 3B
-        // model that's ~12 ms per layer / ~310 ms per pass / ~40% of wall.
-        // We spawn `load_layer(layer_idx+1)` on a worker thread while the
-        // main thread runs layer `layer_idx`'s matmul, so the next layer is
-        // ready when we ask for it.
+        // Layer weights are served from a persistent cache (`get_layer`).
+        // The first call per layer parses + dequantizes from the mmap; every
+        // later token is a cache hit (cheap Arc clone). The prefetch worker
+        // overlaps the FIRST token's layer loads with matmul; afterwards all
+        // layers are already resident so prefetch is instant.
         //
         // Borrow mechanics:
         //   - `model_ref = &self.model` is a SHARED borrow of `self.model`.
@@ -1015,32 +1013,16 @@ impl Engine {
         //     `self.model` and `self.kv_cache` are different fields, so the
         //     worker can hold `&self.model` while main borrows `&mut
         //     self.kv_cache` simultaneously.
-        let model_ref = &self.model;
-        let num_layers = self.config.num_hidden_layers;
-        // Phase 2: per-layer async prefetch via std::thread::scope.
-        //
-        // load_layer() dequantizes Q4_K/Q6_K weights from mmap; on the 3B
-        // model that's ~12 ms per layer / ~310 ms per pass / ~40% of wall.
-        // We overlap `load_layer(layer_idx+1)` on a worker while the main
-        // thread runs layer `layer_idx`'s matmul.  Same-correctness as the
-        // sequential version; on N-layer models we issue N+1 loads (one for
-        // layer 0 before the loop, one for layers 1..N on workers during
-        // iterations 0..N-1).
-        let model_ref = &self.model;
-        let num_layers = self.config.num_hidden_layers;
         std::thread::scope(|scope| -> Result<(), String> {
             // Initial layer 0 (sync) + prefetch kick-off for layer 1.
-            let mut layer_weights: HashMap<String, Tensor> = model_ref
-                .load_layer(0)
+            let mut layer_weights: std::sync::Arc<HashMap<String, Tensor>> = model_ref
+                .get_layer(0)
                 .map_err(|e| format!("layer 0 load: {}", e))?;
-            // Default-on as of 2026-07-25: measured 1.16× speedup on 70B
-            // (rust/PHASE2_70B_MEASUREMENT.md, commit 3db1df1).  Opt-out
-            // remains available via `LEAFCUTTER_PREFETCH=0`.
             let use_prefetch = std::env::var("LEAFCUTTER_PREFETCH").map(|v| v != "0" && v != "false").unwrap_or(true);
-            let mut prefetch: Option<std::thread::ScopedJoinHandle<'_, Result<HashMap<String, Tensor>, String>>> =
+            let mut prefetch: Option<std::thread::ScopedJoinHandle<'_, Result<std::sync::Arc<HashMap<String, Tensor>>, String>>> =
                 if use_prefetch && num_layers > 1 {
                     Some(scope.spawn(move || {
-                        model_ref.load_layer(1).map_err(|e| format!("layer 1 load: {}", e))
+                        model_ref.get_layer(1).map_err(|e| format!("layer 1 load: {}", e))
                     }))
                 } else { None };
 
@@ -1056,10 +1038,16 @@ impl Engine {
                     );
                 }
                 if is_gemma {
+                    // Gemma mutates layer weights in place (fuses QKV by
+                    // materializing f32), so it gets its own owned map —
+                    // never the shared Arc cache. Non-cached per token.
+                    let mut gemma_weights: HashMap<String, Tensor> = model_ref
+                        .load_layer(layer_idx)
+                        .map_err(|e| format!("layer {} load: {}", layer_idx, e))?;
                     let cfg = &self.gemma_layouts[layer_idx];
                     let new_hidden = crate::inference::gemma::gemma_layer_forward(
                         &hidden,
-                        &mut layer_weights,
+                        &mut gemma_weights,
                         cfg,
                         &self.attn_params,
                         &mut self.kv_cache,
@@ -1129,9 +1117,20 @@ impl Engine {
                     hidden = hidden.add(&ffn_out);
                 }
 
-                // ── Common tail: free current, swap to prefetched next (if any).
-                layer_weights = HashMap::new(); // drop in place
-                self.model.file.drop_pages_from_cache();
+                // ── Common tail: swap to prefetched next (if any).
+                // Keep the Arc alive so the cache retains the weights; the
+                // next iteration reuses them via `get_layer`. The old Arc
+                // reference is released when we reassign below.
+
+                // MADV_DONTNEED on the whole mmap is OFF by default (Phase 5):
+                // evicting the model from the OS page cache every layer forced
+                // a full disk re-read per token (~16× slowdown). Layers are now
+                // served from the RAM cache, so the mmap only needs the embed
+                // table + first-load paths. Opt back in for RAM-constrained
+                // systems with LEAFCUTTER_DROP_PAGES=1.
+                if std::env::var("LEAFCUTTER_DROP_PAGES").map(|v| v == "1").unwrap_or(false) {
+                    self.model.file.drop_pages_from_cache();
+                }
 
                 if let Some(h) = prefetch.take() {
                     layer_weights = h.join()
@@ -1143,7 +1142,7 @@ impl Engine {
                     let next_layer_idx = layer_idx + 2;
                     if next_layer_idx < num_layers {
                         prefetch = Some(scope.spawn(move || {
-                            model_ref.load_layer(next_layer_idx)
+                            model_ref.get_layer(next_layer_idx)
                                 .map_err(|e| format!("layer {} load: {}", next_layer_idx, e))
                         }));
                     }
@@ -1151,7 +1150,7 @@ impl Engine {
                     // No prefetch available: load synchronously (env var NOT set
                     // path).  The `else if` matches single-layer models.
                     layer_weights = model_ref
-                        .load_layer(layer_idx + 1)
+                        .get_layer(layer_idx + 1)
                         .map_err(|e| format!("layer {} load: {}", layer_idx + 1, e))?;
                 }
             }

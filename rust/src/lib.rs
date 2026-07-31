@@ -8,6 +8,7 @@ pub mod cache;
 /// Background safety monitor — observes CPU temp/RSS and prints warnings
 /// to stderr.  Never throttles execution; pure advisory.
 pub mod cpu_monitor;
+pub mod gguf_provider;
 
 pub mod init;
 

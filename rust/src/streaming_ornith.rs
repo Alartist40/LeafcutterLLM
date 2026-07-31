@@ -15,14 +15,14 @@ use crate::bpe_tokenizer::BpeTokenizer;
 use crate::cache::deltanet_state::DeltaNetStateCache;
 use crate::model::tensor::Tensor;
 use crate::ornith_config::OrnithConfig;
-use crate::safetensors_loader::Shards;
-use rayon::prelude::*;
+use crate::safetensors_loader::{Shards, WeightProvider};
+use crate::gguf_provider::{self, GGUFWeightProvider};
 use std::collections::HashMap;
 use std::path::Path;
 
 pub struct StreamingOrnith {
     pub cfg: OrnithConfig,
-    pub shards: Shards,
+    pub weights: Box<dyn WeightProvider>,
     pub tok: BpeTokenizer,
     /// Per-layer DeltaNet state matrices (accumulated across prompt tokens)
     pub deltanet_cache: DeltaNetStateCache,
@@ -38,7 +38,22 @@ impl StreamingOrnith {
         let cfg = OrnithConfig::load(dir.join("config.json").to_str().unwrap())?;
         let shards = Shards::open_dir(dir)?;
         let tok = BpeTokenizer::load(dir.join("tokenizer.json").to_str().unwrap())?;
-        Ok(Self { cfg, shards, tok, deltanet_cache: DeltaNetStateCache::new(), kv_cache: HashMap::new() })
+        Ok(Self { cfg, weights: Box::new(shards), tok, deltanet_cache: DeltaNetStateCache::new(), kv_cache: HashMap::new() })
+    }
+
+    /// Open a model from a GGUF file.
+    ///
+    /// `gguf_path` — path to the .gguf file.
+    /// `tokenizer_path` — path to tokenizer.json (can be in the same directory).
+    pub fn open_gguf(gguf_path: &str, tokenizer_path: &str) -> Result<Self, String> {
+        use crate::model::gguf::GGUFile;
+        let gguf = GGUFile::open(gguf_path)
+            .map_err(|e| format!("open GGUF: {e}"))?;
+        let cfg = gguf_provider::extract_ornith_config(&gguf)?;
+        let provider = GGUFWeightProvider::from_gguf(gguf)
+            .map_err(|e| format!("GGUF provider: {e}"))?;
+        let tok = BpeTokenizer::load(tokenizer_path)?;
+        Ok(Self { cfg, weights: Box::new(provider), tok, deltanet_cache: DeltaNetStateCache::new(), kv_cache: HashMap::new() })
     }
 
     /// Forward pass for ONE token. Returns logits (vocab_size entries).
@@ -59,7 +74,7 @@ impl StreamingOrnith {
         let embed_name = "model.language_model.embed_tokens.weight";
         let mut hidden_states: Vec<Vec<f32>> = Vec::with_capacity(seq_len);
         for &tid in tokens {
-            let embed = self.shards.read_tensor_slice_f32(embed_name, tid as usize * h, h)?;
+            let embed = self.weights.read_tensor_slice_f32(embed_name, tid as usize * h, h)?;
             hidden_states.push(embed);
         }
 
@@ -94,24 +109,17 @@ impl StreamingOrnith {
                 hidden_states[pos] = new_hidden;
             }
 
-            // Debug: show all tokens' hidden states at layer 0, last token at other layers
-            if layer_idx == 0 {
-                for t in 0..seq_len {
-                    let ma = hidden_states[t].iter().map(|v| v.abs()).sum::<f32>() / h as f32;
-                    eprintln!("[stream] layer {} tok {} hidden mean_abs={:.4} first4={:.4?}",
-                        layer_idx, t, ma, &hidden_states[t][..4]);
-                }
-            }
-            if (layer_idx == 1 || layer_idx == 2 || layer_idx == 24 || layer_idx == num_layers - 1) {
+            // Debug: dump last token's hidden at every layer
+            {
                 let last = seq_len - 1;
-                let mean_abs = hidden_states[last].iter().map(|v| v.abs()).sum::<f32>() / h as f32;
-                eprintln!("[stream] layer {} hidden[last] mean_abs={:.4} first4={:.4?}",
-                    layer_idx, mean_abs, &hidden_states[last][..4]);
+                let ma = hidden_states[last].iter().map(|v| v.abs()).sum::<f32>() / h as f32;
+                eprintln!("[rust] L{} tok{} mean_abs={:.6} first4={:.4?}",
+                    layer_idx, last, ma, &hidden_states[last][..4]);
             }
         }
 
         // 3. Final norm on last token
-        let final_w = self.shards.read_tensor_f32("model.language_model.norm.weight")?;
+        let final_w = self.weights.read_tensor_f32("model.language_model.norm.weight")?;
         let last_hidden = rms_norm(&hidden_states[seq_len - 1], &final_w, rms_eps);
 
         // 4. LM head: logits = hidden @ lm_head.T
@@ -121,7 +129,7 @@ impl StreamingOrnith {
         for chunk_start in (0..vocab_size).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(vocab_size);
             let n_rows = chunk_end - chunk_start;
-            let chunk = self.shards.read_tensor_slice_f32(lm_head_name, chunk_start * h, n_rows * h)?;
+            let chunk = self.weights.read_tensor_slice_f32(lm_head_name, chunk_start * h, n_rows * h)?;
             let chunk_t = Tensor::from_vec(chunk, vec![n_rows, h]);
             let hidden_t = Tensor::from_vec(last_hidden.clone(), vec![1, h]);
             let logits_chunk = hidden_t.matmul(&chunk_t.transpose());
@@ -146,7 +154,7 @@ impl StreamingOrnith {
         let vocab_size = self.cfg.vocab_size;
 
         let embed_name = "model.language_model.embed_tokens.weight";
-        let mut hidden = self.shards.read_tensor_slice_f32(embed_name, token_id as usize * h, h)?;
+        let mut hidden = self.weights.read_tensor_slice_f32(embed_name, token_id as usize * h, h)?;
 
         for layer_idx in 0..num_layers {
             let layer_type = layer_types
@@ -174,7 +182,7 @@ impl StreamingOrnith {
             for i in 0..h { hidden[i] += mlp_out[i]; }
         }
 
-        let final_w = self.shards.read_tensor_f32("model.language_model.norm.weight")?;
+        let final_w = self.weights.read_tensor_f32("model.language_model.norm.weight")?;
         hidden = rms_norm(&hidden, &final_w, rms_eps);
 
         let lm_head_name = "lm_head.weight";
@@ -183,7 +191,7 @@ impl StreamingOrnith {
         for chunk_start in (0..vocab_size).step_by(chunk_size) {
             let chunk_end = (chunk_start + chunk_size).min(vocab_size);
             let n_rows = chunk_end - chunk_start;
-            let chunk = self.shards.read_tensor_slice_f32(lm_head_name, chunk_start * h, n_rows * h)?;
+            let chunk = self.weights.read_tensor_slice_f32(lm_head_name, chunk_start * h, n_rows * h)?;
             let chunk_t = Tensor::from_vec(chunk, vec![n_rows, h]);
             let hidden_t = Tensor::from_vec(hidden.clone(), vec![1, h]);
             let logits_chunk = hidden_t.matmul(&chunk_t.transpose());
@@ -235,21 +243,7 @@ impl StreamingOrnith {
             _ => return Err(format!("unknown layer type: {layer_type}")),
         };
 
-        // Parallel read using rayon
-        let results: Vec<(&str, Result<Vec<f32>, String>)> = names
-            .par_iter()
-            .map(|suffix| {
-                let full = format!("{pfx}{suffix}");
-                let data = self.shards.read_tensor_f32(&full);
-                (*suffix, data)
-            })
-            .collect();
-
-        let mut w = HashMap::new();
-        for (suffix, data) in results {
-            w.insert(suffix.to_string(), data?);
-        }
-        Ok(w)
+        self.weights.load_layer_weights(layer_idx, layer_type, &names, &pfx)
     }
 
     /// DeltaNet (linear attention) forward — simplified.
@@ -324,15 +318,6 @@ impl StreamingOrnith {
         for v in conv_out.iter_mut() {
             *v = *v / (1.0 + (-*v).exp());
         }
-        // Shift conv buffer: discard oldest, make room for next token
-        for c in 0..conv_dim {
-            let base = c * conv_k;
-            for i in 0..conv_k - 1 {
-                cbuf[base + i] = cbuf[base + i + 1];
-            }
-            // cbuf[base + conv_k - 1] will be overwritten at next token
-        }
-
         // 4. Debug: check QKV section magnitudes
         let q_total = n_qk * d_k;   // 2048
         let k_total = n_qk * d_k;   // 2048
@@ -415,7 +400,6 @@ impl StreamingOrnith {
         }
 
         // 8. Delta rule state update + output
-        let v_heads_per_qk = if n_qk > 0 { n_v / n_qk } else { 1 };
         let mut output = vec![0.0f32; v_total];
 
         // Ensure state is initialized for this layer
@@ -423,14 +407,15 @@ impl StreamingOrnith {
             self.deltanet_cache.init_layer(layer_idx, n_v, d_v, d_k);
         }
 
-        for h_qk in 0..n_qk {
+        // Qwen3.5 V-head pairing is INTERLEAVED (llama.cpp ggml_repeat_4d,
+        // llama-model.cpp:523-525): v_head h_v uses k/q head (h_v % n_qk).
+        // Pattern [k0_v0, k1_v1, k0_v2, k1_v3] for n_v=2*n_qk.
+        for h_v in 0..n_v {
+            let h_qk = h_v % n_qk;
             let q_h = &q[h_qk * d_k..(h_qk + 1) * d_k];
             let k_h = &k[h_qk * d_k..(h_qk + 1) * d_k];
-
-            for v_idx in 0..v_heads_per_qk.max(1) {
-                let h_v = h_qk * v_heads_per_qk + v_idx;
-                if h_v >= n_v { continue; }
-                let v_h = &v_data[h_v * d_v..(h_v + 1) * d_v];
+            let v_h = &v_data[h_v * d_v..(h_v + 1) * d_v];
+            {
                 let decay_h = decay[h_v];
                 let beta_h = beta[h_v];
 
@@ -569,7 +554,7 @@ impl StreamingOrnith {
                 let mut sq = 0.0f32;
                 for d in 0..head_dim { sq += q[base + d] * q[base + d]; }
                 let r = (sq / head_dim as f32 + rms_eps).sqrt();
-                for d in 0..head_dim { q[base + d] = q[base + d] / r * (1.0 + qnw[d]); }
+                for d in 0..head_dim { q[base + d] = q[base + d] / r * qnw[d]; }
             }
         }
         // Apply K norm (per-head RMSNorm with shared weight)
@@ -579,7 +564,7 @@ impl StreamingOrnith {
                 let mut sq = 0.0f32;
                 for d in 0..head_dim { sq += k[base + d] * k[base + d]; }
                 let r = (sq / head_dim as f32 + rms_eps).sqrt();
-                for d in 0..head_dim { k[base + d] = k[base + d] / r * (1.0 + knw[d]); }
+                for d in 0..head_dim { k[base + d] = k[base + d] / r * knw[d]; }
             }
         }
 
@@ -719,27 +704,53 @@ impl StreamingOrnith {
 
     /// Generate text: single-token autoregressive loop.
     /// Note: no KV cache yet — each token re-processes all 32 layers.
-    pub fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String, String> {
+    /// Generate text from a raw prompt (no chat wrapping).
+    /// `stop_tokens` — generation stops when any of these token IDs is produced.
+    pub fn generate_with_stop(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        stop_tokens: &[i32],
+    ) -> Result<String, String> {
         let mut ids = self.tok.encode(prompt, 1024);
         eprintln!("[generate] prompt tokens: {}", ids.len());
-        for i in 0..max_tokens {
+        for _ in 0..max_tokens {
             let last = *ids.last().unwrap() as i32;
             let pos = ids.len() - 1;
             let logits = self.forward_one_token(last, pos)?;
             let next = Self::argmax(&logits) as i32;
+            if stop_tokens.contains(&next) {
+                break;
+            }
             ids.push(next);
             let text = self.tok.decode(&[next]);
             print!("{text}");
             std::io::Write::flush(&mut std::io::stdout()).ok();
-            if i == 0 {
-                eprintln!("\n[generate] first token id={next} text=\"{text}\"");
-            }
         }
         Ok(self.tok.decode(&ids))
+    }
+
+    /// Chat convenience: wraps input in the Ornith chat template and
+    /// stops at `<|im_end|>` (looked up dynamically from the tokenizer).
+    pub fn chat(&mut self, user_input: &str, max_tokens: usize) -> Result<String, String> {
+        let system = "You are Ornith, an open-source agentic coding assistant. Think step by step in a reasoning block, then act. Use the provided tools when they help. Be concise, correct, and direct: write working code and explain only what is non-obvious.";
+        let prompt = format!(
+            "<|im_start|>system\n{}<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n<think>\n",
+            system, user_input
+        );
+        let stop_im_end = self.tok.id_of("<|im_end|>");
+        let stop_eot = self.tok.id_of("<|endoftext|>");
+        let stops: Vec<i32> = [stop_im_end, stop_eot].into_iter().filter(|&id| id >= 0).collect();
+        self.generate_with_stop(&prompt, max_tokens, &stops)
+    }
+
+    pub fn generate(&mut self, prompt: &str, max_tokens: usize) -> Result<String, String> {
+        self.generate_with_stop(prompt, max_tokens, &[])
     }
 }
 
 /// RMSNorm: x * rsqrt(mean(x^2) + eps) * weight
+/// NOTE: converter bakes gamma as (1 + gamma) into GGUF, so weight multiplies directly.
 fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let n = x.len();
     let sum_sq: f32 = x.iter().map(|&v| v * v).sum();
@@ -747,7 +758,7 @@ fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let inv_rms = 1.0 / rms;
     x.iter()
         .zip(weight.iter())
-        .map(|(&xi, &wi)| xi * inv_rms * (1.0 + wi))
+        .map(|(&xi, &wi)| xi * inv_rms * wi)
         .collect()
 }
 

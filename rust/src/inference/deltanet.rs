@@ -156,33 +156,25 @@ pub fn deltanet_forward(
     }
     let state = state_cache.get_mut(layer_idx).unwrap();
 
-    // Map QK heads to V heads.  Most Qwen3.5 variants have num_v_heads == num_qk_heads
-    // or num_v_heads is a multiple of num_qk_heads.
-    let v_heads_per_qk = if params.num_qk_heads > 0 {
-        params.num_v_heads / params.num_qk_heads
-    } else {
-        1
-    };
-
+    // Qwen3.5 V-head pairing is INTERLEAVED (llama.cpp ggml_repeat_4d,
+    // llama-model.cpp:523-525): v_head h_v pairs with q/k head (h_v % num_qk_heads).
+    // The GGUF converter reorders V to tiled order [K0_v0, K1_v0, ..., K0_v1, ...],
+    // so the v_head index itself gives the q/k head via modulo.
     for s in 0..seq_len {
-        for h_qk in 0..params.num_qk_heads {
+        for h_v in 0..params.num_v_heads {
+            let h_qk = h_v % params.num_qk_heads;
             let q_base = s * params.num_qk_heads * params.head_k_dim + h_qk * params.head_k_dim;
             let k_base = s * params.num_qk_heads * params.head_k_dim + h_qk * params.head_k_dim;
             let q_h = &q.data[q_base..q_base + params.head_k_dim];
             let k_h = &k.data[k_base..k_base + params.head_k_dim];
 
-            for v_idx in 0..v_heads_per_qk.max(1) {
-                let h_v = h_qk * v_heads_per_qk + v_idx;
-                if h_v >= params.num_v_heads {
-                    continue;
-                }
-                // Decay and beta are per-V-head (ssm_alpha/beta/a/dt have num_v_heads outputs)
-                let decay_h = decay[s * params.num_v_heads + h_v];
-                let beta_h = beta[s * params.num_v_heads + h_v];
+            // Decay and beta are per-V-head (ssm_alpha/beta/a/dt have num_v_heads outputs)
+            let decay_h = decay[s * params.num_v_heads + h_v];
+            let beta_h = beta[s * params.num_v_heads + h_v];
 
-                let state_stride = h_v * params.head_v_dim * params.head_k_dim;
-                let v_base = s * params.num_v_heads * params.head_v_dim + h_v * params.head_v_dim;
-                let v_h = &v.data[v_base..v_base + params.head_v_dim];
+            let state_stride = h_v * params.head_v_dim * params.head_k_dim;
+            let v_base = s * params.num_v_heads * params.head_v_dim + h_v * params.head_v_dim;
+            let v_h = &v.data[v_base..v_base + params.head_v_dim];
 
                 // DeltaNet delta rule:
                 // 1. Predict v from current state: v_pred = S @ k
@@ -219,7 +211,6 @@ pub fn deltanet_forward(
                 }
             }
         }
-    }
 
     let mut output_tensor = Tensor::from_vec(output, vec![seq_len, output_dim_per_token]);
 
@@ -467,15 +458,17 @@ fn causal_conv1d_cached(
             let global_t = state_len + t;
             for k in 0..kernel_size.min(global_t + 1) {
                 let x_val = full_input[(global_t - k) * channels + c];
-                // Empirical: `w_idx = k` matches conv_out magnitudes with
-                // the engine's K-quant matmul.  `kernel_size - 1 - k` makes
-                // the spike bigger (12 vs 6), so it's not just a sign issue.
-                // Need to check actual llama.cpp convention; for now keep `k`.
-                let w_idx = k;
+                // llama.cpp ggml_ssm_conv: out[t] = sum_j w[j]*x[t-(d_conv-1)+j],
+                // so w[0] pairs with the oldest sample and w[d_conv-1] with the
+                // current token.  x_val here is newest-first (k=0 is current),
+                // hence the reversed weight index.
+                let w_idx = kernel_size - 1 - k;
                 let w_val = if weight.shape.len() == 1 {
                     weight.data[w_idx]
                 } else {
-                    weight.data[w_idx * weight.shape[1] + c]
+                    // GGUF stores conv1d flat as channel-major [c*conv_k + k]
+                    // (dims[0]=kernel is the contiguous dim per channel).
+                    weight.data[c * weight.shape[0] + w_idx]
                 };
                 sum += x_val * w_val;
             }

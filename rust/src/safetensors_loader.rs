@@ -15,6 +15,48 @@ use std::io::Read;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 
+/// Generic weight provider trait.
+///
+/// Abstracts over safetensor shards and GGUF files so the streaming engine
+/// can load weights from either format without knowing the underlying storage.
+pub trait WeightProvider: Send + Sync {
+    /// Read an entire tensor as f32.
+    fn read_tensor_f32(&self, name: &str) -> Result<Vec<f32>, String>;
+    /// Read a slice of tensor data (offset elements from start, count elements).
+    fn read_tensor_slice_f32(&self, name: &str, offset: usize, count: usize) -> Result<Vec<f32>, String>;
+
+    /// Load all weights for one transformer layer.
+    ///
+    /// The default implementation reads each tensor by its full safetensor-style
+    /// name.  Implementations for different weight formats override this to
+    /// map names appropriately.
+    fn load_layer_weights(
+        &self,
+        layer_idx: usize,
+        layer_type: &str,
+        _layer_names: &[&str],
+        prefix: &str,
+    ) -> Result<HashMap<String, Vec<f32>>, String>
+    where
+        Self: Sync,
+    {
+        use rayon::prelude::*;
+        let results: Vec<(&str, Result<Vec<f32>, String>)> = _layer_names
+            .par_iter()
+            .map(|suffix| {
+                let full = format!("{prefix}{suffix}");
+                let data = self.read_tensor_f32(&full);
+                (*suffix, data)
+            })
+            .collect();
+        let mut w = HashMap::new();
+        for (suffix, data) in results {
+            w.insert(suffix.to_string(), data?);
+        }
+        Ok(w)
+    }
+}
+
 /// Tensor metadata for a single stored tensor.
 #[derive(Debug, Clone)]
 pub struct StTensor {
@@ -241,6 +283,16 @@ impl Shards {
     /// List all tensor names.
     pub fn tensor_names(&self) -> Vec<&str> {
         self.index.keys().map(|k| k.as_str()).collect()
+    }
+}
+
+impl WeightProvider for Shards {
+    fn read_tensor_f32(&self, name: &str) -> Result<Vec<f32>, String> {
+        self.read_tensor_f32(name)
+    }
+
+    fn read_tensor_slice_f32(&self, name: &str, offset: usize, count: usize) -> Result<Vec<f32>, String> {
+        self.read_tensor_slice_f32(name, offset, count)
     }
 }
 

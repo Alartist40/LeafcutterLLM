@@ -12,3 +12,4 @@ pub mod lfru_cache;
 pub use format::{ShardHeader, ShardTensorMeta, QuantFormat};
 pub use loader::{ShardLoader, Manifest, LayerCache, CachePolicy, ShardCache};
 pub use lfru_cache::{LfruCache, CacheStats};
+pub use writer::split_gguf_model;

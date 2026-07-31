@@ -512,25 +512,57 @@ fn cmd_run_native(model_arg: &str, max_tokens: usize) {
         std::process::exit(1);
     }
 
-    // Check if this looks like a safetensors model directory
-    let has_safetensors = std::fs::read_dir(&path)
+    // Detect format: .gguf file or safetensors directory
+    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let is_gguf = ext == "gguf";
+    let has_safetensors = !is_gguf && std::fs::read_dir(&path)
         .ok()
         .map(|rd| rd.flatten().any(|e| {
             e.path().extension().and_then(|s| s.to_str()) == Some("safetensors")
         }))
         .unwrap_or(false);
-    if !has_safetensors {
-        eprintln!("No .safetensors files found in '{}'.", path.display());
-        eprintln!("The native engine requires a directory with .safetensors shards.");
-        std::process::exit(1);
-    }
 
-    let mut model = match StreamingOrnith::open(&path) {
-        Ok(m) => m,
-        Err(e) => {
-            eprintln!("Failed to open model: {}", e);
-            std::process::exit(1);
+    let mut model = if is_gguf {
+        // Look for tokenizer.json in order:
+        //   1. <filename>/tokenizer.json (subdirectory named after model)
+        //   2. <parent-dir>/tokenizer.json (same directory as .gguf)
+        //   3. ./tokenizer.json (current working directory)
+        let parent = path.parent().unwrap();
+        let tokenizer_candidates = [
+            path.with_extension("").join("tokenizer.json"),
+            parent.join("tokenizer.json"),
+            std::path::PathBuf::from("tokenizer.json"),
+        ];
+        let tokenizer_path = tokenizer_candidates.iter()
+            .find(|p| p.exists())
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| {
+                eprintln!("Tokenizer not found. Tried:");
+                for c in &tokenizer_candidates {
+                    eprintln!("  - {}", c.display());
+                }
+                eprintln!("Place tokenizer.json alongside the .gguf file.");
+                std::process::exit(1);
+            });
+        match StreamingOrnith::open_gguf(&path.to_string_lossy(), &tokenizer_path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to open GGUF model: {}", e);
+                std::process::exit(1);
+            }
         }
+    } else if has_safetensors {
+        match StreamingOrnith::open(&path) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("Failed to open model: {}", e);
+                std::process::exit(1);
+            }
+        }
+    } else {
+        eprintln!("No .safetensors files or .gguf file found in '{}'.", path.display());
+        eprintln!("The native engine requires a directory with .safetensors shards or a .gguf file.");
+        std::process::exit(1);
     };
 
     eprintln!(
@@ -573,7 +605,14 @@ fn cmd_run_native(model_arg: &str, max_tokens: usize) {
         }
 
         let t0 = std::time::Instant::now();
-        match model.generate(&input, max_tokens) {
+        let result = if is_gguf {
+            // GGUF mode: use chat template with stop tokens
+            model.chat(&input, max_tokens)
+        } else {
+            // safetensor mode: raw prompt (backward compat)
+            model.generate(&input, max_tokens)
+        };
+        match result {
             Ok(text) => {
                 let elapsed = t0.elapsed();
                 let tokens = text.split_whitespace().count();
@@ -1482,10 +1521,9 @@ fn cmd_generate_native(
             true
         }
         (Some(t), Some(_)) => {
-            // Temporarily allow HF tokenizer even with vocab mismatch for testing
-            eprintln!("⚠️  HF tokenizer vocab mismatch (HF={}, model={}), using HF tokenizer anyway for testing",
+            eprintln!("⚠️  HF tokenizer vocab mismatch (HF={}, model={}), using GGUF-native tokenizer instead",
                 t.vocab_size(), expected_vocab);
-            true
+            false
         }
         (None, Some(_)) => {
             eprintln!("📝 Using GGUF-native tokenizer (vocab={})", gguf_tok.as_ref().unwrap().vocab_size());
