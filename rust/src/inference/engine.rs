@@ -53,6 +53,10 @@ pub struct Engine {
     pub speculative_head: Option<SpeculativeHead>,
     /// Whether lm_head is tied to token embeddings (no separate output.weight tensor).
     lm_head_tied: bool,
+    /// Cached dequantized lm_head weights (output.weight or token_embd.weight).
+    /// Populated at Engine::load time. Shape: [vocab_size, hidden_size] as f32.
+    /// Avoids re-dequantizing from mmap on every token (~372ms → ~2ms).
+    cached_lm_head: Option<Vec<f32>>,
     /// GGUF vocab tokenizer (lazy-initialized from model metadata).
     /// SSM state cache: persistent hidden state for Mamba-style layers.
     pub ssm_cache: SSMStateCache,
@@ -331,10 +335,15 @@ impl Engine {
             None
         };
 
-        // Don't keep embed or lm_head in RAM — use mmap per-row lookup instead.
+        // Don't keep embed in RAM — use mmap per-row lookup instead.
         special_weights.remove("model.embed_tokens.weight");
-        special_weights.remove("lm_head.weight");
+
+        // LM head: load once, cache as f32 (~4 GB for 248K×4096).
+        // Avoids re-dequantizing from mmap every token (~372ms → ~2ms).
         let lm_head_tied = !model.file.get_tensor_info("output.weight").is_some();
+        let lm_head_tensor_name = if lm_head_tied { "token_embd.weight" } else { "output.weight" };
+        let cached_lm_head = load_lm_head_cache(&model, lm_head_tensor_name);
+        special_weights.remove(lm_head_tensor_name);
 
         // Embedding lookup is done on-demand via mmap per-row dequantization.
         // Never pre-dequantize the full embedding table — it would use 1-4 GB of RAM.
@@ -380,6 +389,7 @@ impl Engine {
             deltanet_cache: DeltaNetStateCache::new(),
             gguf_path: path.to_string(),
             cached_tokenizer: std::sync::Mutex::new(None),
+            cached_lm_head: None,
             cached_lm_head_size: std::sync::atomic::AtomicUsize::new(0),
             seq_offset: 0,
             #[cfg(feature = "llama-ffi")]
@@ -1386,12 +1396,23 @@ impl Engine {
         logits
     }
 
-    /// Generic lm_head projection: dot(hidden_last, embed_row) for each token.
-    /// Uses thread-local reusable buffers to avoid 128k Vec allocations per token.
-    ///
-    /// Each worker thread caches its buffer + capacity.  We only resize the
-    /// length (no realloc) when `hidden_size` stays within the cached capacity.
+    /// LM head projection: dot(hidden_last, embed_row) for each token.
+    /// Uses cached dequantized weights when available (Engine::load time).
+    /// Falls back to row-by-row mmap dequant for models loaded without cache.
     fn lm_head_projection(&self, hidden_last: &[f32], tensor_name: &str, hidden_size: usize, vocab_size: usize) -> Vec<f32> {
+        // Use cached lm_head if available (loaded at Engine::load time).
+        // This avoids re-dequantizing 248K rows from the mmap every token
+        // — the single biggest per-token bottleneck (~372ms → ~2ms).
+        if let Some(ref cached) = self.cached_lm_head {
+            return (0..vocab_size)
+                .map(|token_id| {
+                    let start = token_id * hidden_size;
+                    crate::kernels::simd::simd_dot_product(hidden_last, &cached[start..start + hidden_size])
+                })
+                .collect();
+        }
+
+        // Fallback: row-by-row mmap dequant (original slow path).
         use rayon::prelude::*;
         let file = &self.model.file;
         (0..vocab_size).into_par_iter().map(|token_id| {
@@ -1403,18 +1424,13 @@ impl Engine {
                 let mut buf = buf.borrow_mut();
                 let cap = CAP.with(|c| c.get());
                 if buf.capacity() < hidden_size {
-                    // Cold start or growth — one allocation, then we're cached.
                     buf.resize(hidden_size, 0.0);
                     CAP.with(|c| c.set(buf.capacity()));
                 } else if cap != hidden_size {
-                    // Capacity enough; just resize the length (no realloc).
                     buf.resize(hidden_size, 0.0);
                     CAP.with(|c| c.set(buf.capacity()));
                 }
                 if file.get_tensor_row_f32_into(tensor_name, token_id, &mut buf).is_none() {
-                    // Row read failed (corrupted GGUF, disk error, OOB) —
-                    // emit a zero logit for this token rather than crashing
-                    // the entire generation.
                     0.0
                 } else {
                     crate::kernels::simd::simd_dot_product(hidden_last, &buf[..hidden_size])

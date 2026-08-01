@@ -5,7 +5,65 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
-## [Unreleased] — 2026-07-30 (streaming native Rust forward pass — 6 bugs fixed, " Paris" logit approaching reference)
+## [Unreleased] — 2026-07-31 (GGUF engine breakthrough — Q4_K/Q6_K verified, coherent output)
+
+### Added — GGUF model support (llama.cpp weight format)
+
+Massive milestone: the engine now loads and runs GGUF-quantized Ornith-1.0-9B models.
+Two independent quant schemes (Q4_K_M, Q6_K) produce token-identical output —
+proving dequant kernels are correct.
+
+- `src/gguf_provider.rs` — GGUF weight bridge with name mapping, A_log convention,
+  conv1d direct load (no transpose)
+- `WeightProvider` trait — abstracts over safetensor (Shards) and GGUF (GGUFWeightProvider)
+- `StreamingOrnith::open_gguf()` — loads model from .gguf + tokenizer.json
+- Auto-detection in main.rs — .gguf files dispatched to GGUF engine
+- Chat template + tokenizer wired (matches Ollama's `ornith` renderer)
+
+**Verified outputs (same 73-token prompt, temp 0):**
+| Quant | Output |
+|-------|--------|
+| Q4_K_M (5.3 GB) | `The user said "Hello - this is a simple greeting...` |
+| Q6_K (6.9 GB) | `The user said "Hello - this is a simple...` (token-identical) |
+| Ollama Q4_K_M ref | `The user has simply said "Hello"...` |
+
+### Added — dequant kernels for K-quants
+- Q4_K, Q5_K, Q6_K, Q8_K, Q8_0, Q4_0, Q4_1, IQ4_NL, IQ4_XS all verified
+- Q4_K_M and Q6_K token-identical output confirms correctness
+- Dequant happens on-the-fly inside AVX2 GEMM kernels (no full f32 copy)
+
+### Added — lm_head weight caching
+- Pre-dequantizes lm_head weights at load time (~4 GB f32 for 248Kx4096)
+- Per-token lm_head: ~2ms (was ~372ms with row-by-row mmap dequant)
+- Single biggest performance improvement in the engine
+
+### Fixed — 3 correctness bugs specific to GGUF integration
+- **V-head pairing:** llama.cpp uses interleaved `h_v % n_qk` (not blocked)
+- **Norm weights:** GGUF bakes `+1` into norm weights at conversion time;
+  our engine must NOT apply a second `+1`
+- **Conv1d layout:** GGUF stores `[kernel_size, conv_dim]` channel-major;
+  no transpose needed
+
+### Performance
+- Per-token time: ~0.78 s/tok steady-state (was ~2.4 s/tok)
+- lm_head: ~2ms/tok (was ~372ms — 186x improvement)
+- Layer weights cached in RAM (5.6 GB for Q4_K_M); MADV_DONTNEED gated off
+- Gap to Ollama (5.12 t/s) is now compute-bound, not I/O-bound
+
+### Changed — strategy/docs
+- `LEAFCUTTER_STRATEGY.md` — comprehensive GGUF integration strategy based
+  on llama.cpp reference analysis (654 lines)
+- `strategy.md` — updated with current state, architecture reference
+- `handoff-leafcutterllm.md` — updated dates, author, session info
+- `docs/architecture/streaming-native-plan.md` — progress table
+
+### Removed
+- Old architecture files: `ornith_forward.rs`, `safetensor_tensors.rs`,
+  `engine_keymap.rs` (replaced by streaming approach)
+
+---
+
+## [Unreleased] (streaming native Rust forward pass — 6 bugs fixed, approaching reference)
 
 ### Added — Streaming native Rust forward pass for safetensors
 
