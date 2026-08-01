@@ -372,6 +372,15 @@ impl GgufTokenizer {
     /// converted back to their original bytes (Ġ U+0120 → 0x20 space, etc.).
     /// All output is accumulated as raw bytes then decoded as UTF-8 (lossy).
     pub fn decode(&self, tokens: &[usize]) -> String {
+        String::from_utf8_lossy(&self.decode_bytes(tokens)).to_string()
+    }
+
+    /// Decode token IDs to the raw UTF-8 byte stream, without the lossy
+    /// UTF-8 pass.  Streaming callers can accumulate these bytes and only
+    /// convert to a `String` when a complete UTF-8 sequence is available —
+    /// decoding per-token mangles multi-byte chars (e.g. emoji) that split
+    /// across byte-level tokens.
+    pub fn decode_bytes(&self, tokens: &[usize]) -> Vec<u8> {
         let mut bytes: Vec<u8> = Vec::new();
 
         for &id in tokens {
@@ -394,18 +403,36 @@ impl GgufTokenizer {
             }
 
             // Reverse GPT-2 byte-to-unicode mapping for each char in the piece.
-            // GPT-2 maps: printable ASCII (33-126) stays as-is,
-            // everything else (0-32, 127-255) → chr(byte + 256).
-            // So chars >= 0x100 need to be reversed: byte = codepoint - 256.
-            // Chars < 0x100 are the raw byte value directly.
+            //
+            // The real GPT-2 byte-to-unicode map (as used by llama.cpp and HF)
+            // maps only the "non-printable" bytes to U+0100-U+0143, in a fixed
+            // order.  It is NOT "every byte -> chr(byte+256)":
+            //   - bytes 0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF map to THEMSELVES
+            //   - the remaining 68 bytes (0x00-0x20, 0x7F-0xA0, 0xAD) map to
+            //     U+0100..U+0143 in ascending byte order
+            // A naive `cp - 256` for all of 0x100-0x1FF corrupts genuine
+            // Latin-1/Latin-Extended chars stored as bytes in the vocab.
             for c in piece.chars() {
                 let cp = c as u32;
-                if cp >= 0x100 && cp <= 0x1FF {
-                    // GPT-2 mapped byte
-                    bytes.push((cp - 256) as u8);
-                } else if cp <= 0xFF {
-                    // Raw byte stored as Unicode codepoint
+                if (0x21..=0x7E).contains(&cp)
+                    || (0xA1..=0xAC).contains(&cp)
+                    || (0xAE..=0xFF).contains(&cp)
+                {
+                    // Printable byte stored as its own codepoint
                     bytes.push(cp as u8);
+                } else if (0x100..=0x143).contains(&cp) {
+                    // Non-printable byte stored as chr(byte + 256) in order:
+                    // 0x100..0x120 -> 0x00..0x20, 0x121..0x142 -> 0x7F..0xA0,
+                    // 0x143 -> 0xAD.
+                    let n = (cp - 0x100) as usize;
+                    let b = if n < 33 {
+                        n as u8
+                    } else if n < 67 {
+                        (0x7F + (n - 33)) as u8
+                    } else {
+                        0xAD
+                    };
+                    bytes.push(b);
                 } else {
                     // Regular Unicode char — encode as UTF-8
                     let mut buf = [0u8; 4];
@@ -415,7 +442,7 @@ impl GgufTokenizer {
             }
         }
 
-        String::from_utf8_lossy(&bytes).to_string()
+        bytes
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -654,12 +681,25 @@ impl GgufBpeTokenizer {
                 }
 
                 // Reverse GPT-2 byte-to-unicode mapping for each char
+                // (see GgufTokenizer::decode for the exact map: only the 68
+                // non-printable bytes map to U+0100-U+0143, in order).
                 for c in token_str.chars() {
                     let cp = c as u32;
-                    if cp >= 0x100 && cp <= 0x1FF {
-                        bytes.push((cp - 256) as u8);
-                    } else if cp <= 0xFF {
+                    if (0x21..=0x7E).contains(&cp)
+                        || (0xA1..=0xAC).contains(&cp)
+                        || (0xAE..=0xFF).contains(&cp)
+                    {
                         bytes.push(cp as u8);
+                    } else if (0x100..=0x143).contains(&cp) {
+                        let n = (cp - 0x100) as usize;
+                        let b = if n < 33 {
+                            n as u8
+                        } else if n < 67 {
+                            (0x7F + (n - 33)) as u8
+                        } else {
+                            0xAD
+                        };
+                        bytes.push(b);
                     } else {
                         let mut buf = [0u8; 4];
                         let s = c.encode_utf8(&mut buf);

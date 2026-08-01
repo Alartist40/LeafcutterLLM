@@ -205,8 +205,10 @@ async fn main() {
                 cmd_run_ollama(&model, temp, top_p, max_tokens, &ollama_host);
             } else if engine == "safetensor" || engine == "safetensors" {
                 cmd_run_safetensor(&model, temp, top_p, max_tokens);
-            } else if engine == "native" {
-                cmd_run_native(&model, max_tokens);
+            } else if engine == "native" || engine == "leafcutter" {
+                // Native = the fast Rust `Engine` (GGUF prefill + KV/layer
+                // caches + streaming). This is the Ollama-style REPL.
+                cmd_run(&model, temp, top_p, max_tokens);
             } else {
                 cmd_run(&model, temp, top_p, max_tokens);
             }
@@ -501,134 +503,6 @@ fn cmd_run_safetensor(model_arg: &str, mut temp: f32, _top_p: f32, mut max_token
 }
 
 
-/// Streaming chat via the native Rust safetensor backend.
-/// Uses StreamingOrnith — pure Rust, no Python dependency.
-fn cmd_run_native(model_arg: &str, max_tokens: usize) {
-    use leafcutter::streaming_ornith::StreamingOrnith;
-
-    let path = std::path::PathBuf::from(shellexpand::tilde(model_arg).as_ref());
-    if !path.exists() {
-        eprintln!("Model path '{}' not found.", path.display());
-        std::process::exit(1);
-    }
-
-    // Detect format: .gguf file or safetensors directory
-    let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
-    let is_gguf = ext == "gguf";
-    let has_safetensors = !is_gguf && std::fs::read_dir(&path)
-        .ok()
-        .map(|rd| rd.flatten().any(|e| {
-            e.path().extension().and_then(|s| s.to_str()) == Some("safetensors")
-        }))
-        .unwrap_or(false);
-
-    let mut model = if is_gguf {
-        // Look for tokenizer.json in order:
-        //   1. <filename>/tokenizer.json (subdirectory named after model)
-        //   2. <parent-dir>/tokenizer.json (same directory as .gguf)
-        //   3. ./tokenizer.json (current working directory)
-        let parent = path.parent().unwrap();
-        let tokenizer_candidates = [
-            path.with_extension("").join("tokenizer.json"),
-            parent.join("tokenizer.json"),
-            std::path::PathBuf::from("tokenizer.json"),
-        ];
-        let tokenizer_path = tokenizer_candidates.iter()
-            .find(|p| p.exists())
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| {
-                eprintln!("Tokenizer not found. Tried:");
-                for c in &tokenizer_candidates {
-                    eprintln!("  - {}", c.display());
-                }
-                eprintln!("Place tokenizer.json alongside the .gguf file.");
-                std::process::exit(1);
-            });
-        match StreamingOrnith::open_gguf(&path.to_string_lossy(), &tokenizer_path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("Failed to open GGUF model: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else if has_safetensors {
-        match StreamingOrnith::open(&path) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("Failed to open model: {}", e);
-                std::process::exit(1);
-            }
-        }
-    } else {
-        eprintln!("No .safetensors files or .gguf file found in '{}'.", path.display());
-        eprintln!("The native engine requires a directory with .safetensors shards or a .gguf file.");
-        std::process::exit(1);
-    };
-
-    eprintln!(
-        "🌿 Leafcutter Native Engine (Streaming)\n   Model: {}\n   Max tokens: {}",
-        path.display(),
-        max_tokens,
-    );
-    eprintln!("  ─────────────────────────────────────────────────");
-
-    loop {
-        print!("\n>>> ");
-        std::io::stdout().flush().ok();
-        let mut input = String::new();
-        if std::io::stdin().read_line(&mut input).is_err() {
-            break;
-        }
-        let input = input.trim().to_string();
-        if input.is_empty() {
-            continue;
-        }
-        if input.starts_with('/') {
-            match input.trim() {
-                "/bye" | "/quit" | "/exit" => {
-                    eprintln!("Goodbye!");
-                    break;
-                }
-                "/clear" => {
-                    eprintln!("[native engine has no persistent state to clear]");
-                    continue;
-                }
-                "/help" => {
-                    eprintln!("\nCommands: /bye /quit /exit  /clear  /help\n");
-                    continue;
-                }
-                _ => {
-                    eprintln!("Unknown command: {}", input);
-                    continue;
-                }
-            }
-        }
-
-        let t0 = std::time::Instant::now();
-        let result = if is_gguf {
-            // GGUF mode: use chat template with stop tokens
-            model.chat(&input, max_tokens)
-        } else {
-            // safetensor mode: raw prompt (backward compat)
-            model.generate(&input, max_tokens)
-        };
-        match result {
-            Ok(text) => {
-                let elapsed = t0.elapsed();
-                let tokens = text.split_whitespace().count();
-                eprintln!(
-                    "\n─────────────────────────────────────────────────"
-                );
-                eprintln!("Generated ~{} tokens in {:.1}s", tokens, elapsed.as_secs_f64());
-            }
-            Err(e) => {
-                eprintln!("\n[native engine error] {}", e);
-            }
-        }
-    }
-}
-
-
 /// Find a model by fuzzy name match (case-insensitive substring)
 fn find_model(name: &str) -> Option<PathBuf> {
     // Direct path
@@ -718,6 +592,12 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
 
     // If temp/top_p/max_tokens are still at CLI defaults, adopt profile defaults.
     // (Ollama behavior: Modelfile params override CLI unless CLI explicitly sets.)
+    if temp == 0.7 {
+        temp = profile.sampling.temperature;
+    }
+    if top_p == 0.9 {
+        top_p = profile.sampling.top_p;
+    }
     let mut system_prompt: String = String::new(); // empty → profile default
     let gguf = GGUFile::open(&path_str).ok();
 
@@ -994,7 +874,8 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
             .map(|s| s.0)
             .collect();
         let mut in_thinking = profile.opens_with_thinking;
-        let mut thinking_done = false;
+        let mut thinking_prefix_shown = false;
+        let mut thinking_tail = String::new();
         let debug_chunks = std::env::var("LEAFCUTTER_CHUNK_DEBUG").is_ok();
         let generated_ids = engine.generate_streaming_with_stops(
             &tokens,
@@ -1004,22 +885,48 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
             &stop_token_ids,
             |id, chunk| {
                 if debug_chunks {
-                    eprintln!("[chunk] id={} surface={:?} in_thinking={} thinking_done={}", id, chunk, in_thinking, thinking_done);
+                    eprintln!("[chunk] id={} surface={:?} in_thinking={}", id, chunk, in_thinking);
                 }
-                match id {
-                    248068 => { in_thinking = true; return true; }   // swallow opener
-                    248069 => {                                       // swallow closer
+                if in_thinking {
+                    thinking_tail.push_str(chunk);
+                    // Check for the full `</think>` marker BEFORE trimming
+                    // (it is 8 chars; the trimmed tail is only 7).
+                    if let Some(pos) = thinking_tail.find("</think>") {
+                        let (pre, rest) = thinking_tail.split_at(pos);
+                        if !pre.is_empty() {
+                            if !thinking_prefix_shown {
+                                eprint!("💭");
+                                thinking_prefix_shown = true;
+                            }
+                            eprint!("{}", pre);
+                        }
+                        thinking_tail = rest["</think>".len()..].to_string();
+                        if std::env::var("LEAFCUTTER_CHUNK_DEBUG").is_ok() {
+                            eprintln!("[gen-marker-set] thinking_tail now={:?}", thinking_tail);
+                        }
                         in_thinking = false;
-                        thinking_done = true;
+                        eprintln!();
                         let _ = io::stdout().flush();
-                        return true;
+                    } else {
+                        // Emit all but the last 7 chars (they can't be part
+                        // of a partial `</think>`), keeping the boundary.
+                        let keep = thinking_tail.len().saturating_sub(7);
+                        if keep > 0 {
+                            let (emit, rest) = thinking_tail.split_at(keep);
+                            if !thinking_prefix_shown {
+                                eprint!("💭");
+                                thinking_prefix_shown = true;
+                            }
+                            eprint!("{}", emit);
+                            thinking_tail = rest.to_string();
+                        }
                     }
-                    _ => {}
-                }
-                if in_thinking && !thinking_done {
-                    eprint!("💭{}", chunk);
                     let _ = io::stdout().flush();
                     return true;
+                }
+                if !thinking_tail.is_empty() {
+                    eprint!("{}", thinking_tail);
+                    thinking_tail.clear();
                 }
                 eprint!("{}", chunk);
                 let _ = io::stdout().flush();
@@ -1492,11 +1399,14 @@ fn cmd_generate_native(
     max_tokens: usize,
     temperature: f32,
 ) {
-    use leafcutter::tokenizer::{Tokenizer, GgufBpeTokenizer, BaseTokenizer};
     use leafcutter::inference::engine::Engine;
 
-    eprintln!("🌿 LeafcutterLLM Native Engine (no llama.cpp FFI)");
-    eprintln!("   Model: {}", model_path.display());
+    let debug = std::env::var("LEAFCUTTER_DEBUG").map(|v| v == "1").unwrap_or(false);
+
+    if debug {
+        eprintln!("🌿 LeafcutterLLM Native Engine (no llama.cpp FFI)");
+        eprintln!("   Model: {}", model_path.display());
+    }
 
     let mut engine = match Engine::load(model_path.to_str().unwrap()) {
         Ok(e) => e,
@@ -1506,107 +1416,110 @@ fn cmd_generate_native(
         }
     };
 
-    // Try HF tokenizer first, then fall back to GGUF-native BPE tokenizer
-    let expected_vocab = engine.config.vocab_size;
-    let hf_tok = Tokenizer::from_file("models/tokenizer_qwen35.json")
-        .or_else(|_| Tokenizer::from_file("tests/tokenizer_qwen35.json"))
-        .or_else(|_| Tokenizer::from_file("tests/tokenizer_llama.json"))
-        .or_else(|_| Tokenizer::from_file("tests/tokenizer.json"))
-        .ok();
-    let gguf_tok = GgufBpeTokenizer::from_gguf(model_path.to_str().unwrap());
+    // Resolve the per-architecture profile (Ollama Modelfile-style), which
+    // supplies the chat template (with <think> for reasoning models), stop
+    // tokens, and default sampling parameters.
+    let gguf = GGUFile::open(model_path.to_str().unwrap()).ok();
+    let profile = resolve_profile(
+        &gguf.as_ref().map(|f| &f.metadata).cloned().unwrap_or_default(),
+        None,
+    );
 
-    let use_hf = match (&hf_tok, &gguf_tok) {
-        (Some(t), _) if t.vocab_size() == expected_vocab => {
-            eprintln!("📝 Using HF tokenizer (vocab={})", t.vocab_size());
-            true
-        }
-        (Some(t), Some(_)) => {
-            eprintln!("⚠️  HF tokenizer vocab mismatch (HF={}, model={}), using GGUF-native tokenizer instead",
-                t.vocab_size(), expected_vocab);
-            false
-        }
-        (None, Some(_)) => {
-            eprintln!("📝 Using GGUF-native tokenizer (vocab={})", gguf_tok.as_ref().unwrap().vocab_size());
-            false
-        }
-        (Some(t), None) => {
-            eprintln!("⚠️  HF tokenizer vocab mismatch (HF={}, model={}), no GGUF vocab fallback",
-                t.vocab_size(), expected_vocab);
-            true
-        }
-        (None, None) => {
-            eprintln!("❌ No tokenizer found. Place tests/tokenizer_llama.json or ensure GGUF has tokenizer.ggml.tokens");
-            std::process::exit(1);
-        }
-    };
-
-    // Auto-detect chat template from GGUF metadata
+    // Build the prompt.  --raw skips the chat template entirely (raw text
+    // continuation); otherwise use the profile's chat template so reasoning
+    // models like Ornith receive their system prompt + <think> opener.
     let prompt_text = if raw {
         prompt.to_string()
     } else {
-        let gguf = GGUFile::open(model_path.to_str().unwrap()).ok();
-        if let Some(ref file) = gguf {
-            let formatted = apply_chat_template_from_gguf(&file.metadata, system, prompt);
-            let family = if formatted.starts_with("[SYSTEM_PROMPT]") {
-                "Ministral"
-            } else if formatted.contains("<|start_header_id|>") {
-                "Llama-3"
-            } else if formatted.contains("[INST]") {
-                "Mistral"
-            } else if formatted.contains("<|im_start|>") {
-                "ChatML"
-            } else if formatted.contains("<start_of_turn>") {
-                "Gemma"
-            } else {
-                "Unknown / plain"
-            };
-            eprintln!("🎭 Chat template applied (detected: {})", family);
-            formatted
-        } else {
-            if system.is_empty() {
-                prompt.to_string()
-            } else {
-                format!("{system}\n\n{prompt}")
-            }
-        }
+        let history: Vec<(String, String)> = vec![("user".into(), prompt.to_string())];
+        render_chat_prompt(&profile, system, &history)
     };
 
-    let tokens = if use_hf {
-        match &hf_tok {
-            Some(t) => t.encode(&prompt_text),
-            None => {
-                eprintln!("❌ HF tokenizer selected but not available");
-                std::process::exit(1);
-            }
-        }
-    } else {
-        match &gguf_tok {
-            Some(t) => t.encode(&prompt_text),
-            None => {
-                eprintln!("❌ No GGUF-embedded tokenizer found. Cannot tokenize input.");
-                eprintln!("   Ensure the GGUF file contains tokenizer.ggml.tokens metadata.");
-                std::process::exit(1);
-            }
-        }
-    };
-    eprintln!("📝 Prompt tokens: {}", tokens.len());
+    let tokens = engine.tokenize(&prompt_text, true);
+    if tokens.is_empty() {
+        eprintln!("❌ No tokenizer available (GGUF lacks tokenizer.ggml.tokens metadata).");
+        std::process::exit(1);
+    }
+    if debug {
+        eprintln!("📝 Prompt tokens: {}", tokens.len());
+    }
 
     let info = engine.info();
-    eprintln!("   Arch: {}  Layers: {}  Hidden: {}", info.architecture, info.total_layers, info.hidden_size);
+    if debug {
+        eprintln!("   Arch: {}  Layers: {}  Hidden: {}", info.architecture, info.total_layers, info.hidden_size);
+    }
 
-    let generated = engine.generate(&tokens, max_tokens, temperature, 0.9);
-    let text = if use_hf {
-        match &hf_tok {
-            Some(t) => t.decode(&generated),
-            None => String::new(),
-        }
-    } else {
-        match &gguf_tok {
-            Some(t) => t.decode(&generated),
-            None => String::new(),
-        }
-    };
-    println!("{}", text);
+    // Stream the response, showing the thinking block (💭) then the answer,
+    // and stopping at the profile's stop tokens.  `</think>` may arrive as
+    // the special token 248069 OR as raw byte pieces (`</`, `think`, `>`),
+    // so we detect the closing marker in the *surface text* — a tiny tail
+    // buffer that can hold a partial `</think>` across chunk boundaries.
+    let stop_token_ids: Vec<usize> = profile
+        .stop_tokens
+        .iter()
+        .map(|s| s.0)
+        .collect();
+    let mut in_thinking = profile.opens_with_thinking;
+    let mut thinking_prefix_shown = false;
+    let mut thinking_tail = String::new(); // may hold a partial `</think>`
+    let top_p = 0.9;
+    let generated = engine.generate_streaming_with_stops(
+        &tokens,
+        max_tokens,
+        temperature,
+        top_p,
+        &stop_token_ids,
+        |_id, chunk| {
+            if in_thinking {
+                thinking_tail.push_str(chunk);
+                // Check for the full `</think>` marker BEFORE trimming
+                // (it is 8 chars; the trimmed tail is only 7).
+                if let Some(pos) = thinking_tail.find("</think>") {
+                    let (pre, rest) = thinking_tail.split_at(pos);
+                    if !pre.is_empty() {
+                        if !thinking_prefix_shown {
+                            eprint!("💭");
+                            thinking_prefix_shown = true;
+                        }
+                        eprint!("{}", pre);
+                    }
+                    // Drop the marker; the answer resumes on the next line.
+                    thinking_tail = rest["</think>".len()..].to_string();
+                    in_thinking = false;
+                    eprintln!();
+                    let _ = io::stdout().flush();
+                } else {
+                    // Emit all but the last 7 chars (they can't be part of a
+                    // partial `</think>`), keeping the boundary.
+                    let keep = thinking_tail.len().saturating_sub(7);
+                    if keep > 0 {
+                        let (emit, rest) = thinking_tail.split_at(keep);
+                        if !thinking_prefix_shown {
+                            eprint!("💭");
+                            thinking_prefix_shown = true;
+                        }
+                        eprint!("{}", emit);
+                        thinking_tail = rest.to_string();
+                    }
+                }
+                let _ = io::stdout().flush();
+                return true;
+            }
+            if !thinking_tail.is_empty() {
+                print!("{}", thinking_tail);
+                thinking_tail.clear();
+            }
+            print!("{}", chunk);
+            let _ = io::stdout().flush();
+            true
+        },
+    );
+    println!();
+    let _ = io::stdout().flush();
+
+    if debug {
+        eprintln!("[generate] {} tokens out", generated.len());
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

@@ -342,13 +342,18 @@ mod tests {
 
     #[test]
     fn test_q4_0_roundtrip() {
+        // Q4_0 block: 2-byte f16 scale + 16 bytes of nibble-packed quants,
+        // byte-interleaved (two consecutive elements come from one byte).
         let mut data = vec![0u8; 18];
         data[0] = 0x00; data[1] = 0x3C; // scale = 1.0 in f16
-        data[2] = 0x89; // q0=9, q1=8
+        data[2] = 0x89; // q0=9 (low nibble), q1=8 (high nibble)
         let mut out = vec![0.0f32; 32];
         dequantize_q4_0(&data, &mut out);
-        assert!((out[0] - 1.0).abs() < 0.01);  // 9 - 8 = 1
-        assert!((out[16] - 0.0).abs() < 0.01); // 8 - 8 = 0
+        // out[0] = (9 - 8) * 1.0 = 1.0, out[1] = (8 - 8) * 1.0 = 0.0
+        assert!((out[0] - 1.0).abs() < 0.01);
+        assert!((out[1] - 0.0).abs() < 0.01);
+        // Un-touched bytes are all-zero quants: (0 - 8) * 1.0 = -8.0
+        assert!((out[16] + 8.0).abs() < 0.01);
     }
 
     #[test]

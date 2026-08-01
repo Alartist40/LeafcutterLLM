@@ -438,12 +438,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_ornith_template_starts_with_thinking() {
+    fn test_ornith_template_chatml_open_assistant() {
         let p = &ORNITH_PROFILE;
         assert!(p.opens_with_thinking);
         let rendered = render_prompt(p, "", "hi");
-        assert!(rendered.ends_with("\n<think>\n"));
+        // The model emits its own `<think>` opener, so the prompt is an
+        // open ChatML assistant turn (no injected thinking tag).
         assert!(rendered.starts_with("<|im_start|>system\n"));
+        assert!(rendered.ends_with("<|im_start|>assistant\n"));
         // Default system must be used.
         assert!(rendered.contains("Ornith"));
     }
@@ -452,7 +454,12 @@ mod tests {
     fn test_ministral_template_uses_inst() {
         let p = &MINISTRAL_PROFILE;
         let rendered = render_prompt(p, "", "hi");
-        assert_eq!(rendered, "[INST] hi [/INST]");
+        // Default system is prepended inside the [INST] block.
+        assert!(rendered.starts_with("[INST] You are a helpful assistant."));
+        assert!(rendered.ends_with("hi [/INST]"));
+        // A custom system replaces the default.
+        let rendered2 = render_prompt(p, "custom sys", "hi");
+        assert!(rendered2.starts_with("[INST] custom sys\nhi [/INST]"));
     }
 
     #[test]

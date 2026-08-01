@@ -618,9 +618,13 @@ impl GGUFModel {
             // the conv1d kernel (not as a matmul) — it needs f32 .data even
             // though the matmul paths use .q_data.
             if keep_shape_3d || engine_name.contains("ssm_conv1d") {
-                eprintln!("[loader] materializing {} (shape={:?})", engine_name, tensor.shape);
+                if std::env::var("LEAFCUTTER_DEBUG").map(|v| v == "1").unwrap_or(false) {
+                    eprintln!("[loader] materializing {} (shape={:?})", engine_name, tensor.shape);
+                }
                 tensor.materialize_data();
-                eprintln!("[loader] after materialize: data.len={}", tensor.data.len());
+                if std::env::var("LEAFCUTTER_DEBUG").map(|v| v == "1").unwrap_or(false) {
+                    eprintln!("[loader] after materialize: data.len={}", tensor.data.len());
+                }
             }
             weights.insert(engine_name.to_string(), tensor);
         }

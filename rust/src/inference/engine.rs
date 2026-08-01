@@ -53,10 +53,10 @@ pub struct Engine {
     pub speculative_head: Option<SpeculativeHead>,
     /// Whether lm_head is tied to token embeddings (no separate output.weight tensor).
     lm_head_tied: bool,
-    /// Cached dequantized lm_head weights (output.weight or token_embd.weight).
-    /// Populated at Engine::load time. Shape: [vocab_size, hidden_size] as f32.
-    /// Avoids re-dequantizing from mmap on every token (~372ms → ~2ms).
-    cached_lm_head: Option<Vec<f32>>,
+    /// Cached quantized lm_head weights (output.weight or token_embd.weight),
+    /// kept in Q6_K block form instead of a ~3.8 GB f32 dequant cache.
+    /// Populated at Engine::load time. Shape: [vocab_size, hidden_size].
+    cached_lm_head: Option<crate::kernels::q6_k::Matrix>,
     /// GGUF vocab tokenizer (lazy-initialized from model metadata).
     /// SSM state cache: persistent hidden state for Mamba-style layers.
     pub ssm_cache: SSMStateCache,
@@ -242,7 +242,9 @@ impl Engine {
             }
         }
 
-        eprintln!("  Using native backend for {}", arch.name());
+        if std::env::var("LEAFCUTTER_DEBUG").map(|v| v == "1").unwrap_or(false) {
+            eprintln!("  Using native backend for {}", arch.name());
+        }
 
         let mut config = model.config.clone();
         // Verify hidden_size against actual tensor dimensions — metadata may lie
@@ -384,13 +386,12 @@ impl Engine {
             embed_uses_sqrt_scale: is_gemma,
             speculative_head,
             lm_head_tied,
-
+            cached_lm_head,
+            cached_lm_head_size: std::sync::atomic::AtomicUsize::new(0),
             ssm_cache: SSMStateCache::new(),
             deltanet_cache: DeltaNetStateCache::new(),
             gguf_path: path.to_string(),
             cached_tokenizer: std::sync::Mutex::new(None),
-            cached_lm_head: None,
-            cached_lm_head_size: std::sync::atomic::AtomicUsize::new(0),
             seq_offset: 0,
             #[cfg(feature = "llama-ffi")]
             ffi_model: None,
@@ -471,10 +472,12 @@ impl Engine {
                     *conv_info.dimensions.first().unwrap_or(&4) as usize
                 } else { 4 };
 
-                eprintln!(
-                    "  DeltaNet: qk_heads={}, v_heads={}, head_k={}, head_v={}, conv_dim={}, conv_k={}, hidden_in={}",
-                    num_qk_heads, num_v_heads, head_k_dim, head_v_dim, conv_dim, conv_kernel, hidden_in
-                );
+                if std::env::var("LEAFCUTTER_DEBUG").map(|v| v == "1").unwrap_or(false) {
+                    eprintln!(
+                        "  DeltaNet: qk_heads={}, v_heads={}, head_k={}, head_v={}, conv_dim={}, conv_k={}, hidden_in={}",
+                        num_qk_heads, num_v_heads, head_k_dim, head_v_dim, conv_dim, conv_kernel, hidden_in
+                    );
+                }
 
                 return DeltaNetParams {
                     num_qk_heads,
@@ -491,7 +494,6 @@ impl Engine {
         eprintln!("  Warning: Could not infer DeltaNet params, using defaults");
         DeltaNetParams::default()
     }
-
     // -------------------------------------------------------------------------
     // Attention parameter inference from actual weight shapes
     // -------------------------------------------------------------------------
@@ -763,9 +765,13 @@ impl Engine {
         let mut next_token = sample_top_p(&logits, temperature, top_p);
         let mut generated = vec![next_token];
 
+        // Streaming UTF-8 byte buffer: joins multi-byte chars split across
+        // byte-level tokens so emoji etc. aren't emitted as lossy `�`.
+        let mut pending_bytes: Vec<u8> = Vec::new();
+
         // First token — call the callback before recording into anti-doom
         // so the detector sees the very first token in its history.
-        if !self.emit_stream_token(next_token, &mut on_token) {
+        if !self.emit_stream_token(next_token, &mut pending_bytes, &mut on_token) {
             return generated;
         }
         if anti_doom_enabled {
@@ -842,7 +848,7 @@ impl Engine {
             next_token = sample_top_p(&logits, temperature, top_p);
             generated.push(next_token);
 
-            if !self.emit_stream_token(next_token, &mut on_token) {
+            if !self.emit_stream_token(next_token, &mut pending_bytes, &mut on_token) {
                 break;
             }
             if anti_doom_enabled {
@@ -882,12 +888,22 @@ impl Engine {
     /// return whether generation should continue (callback decides).
     /// Token decoding swallows decode errors by returning empty string
     /// so a missing decode path never breaks streaming output.
-    fn emit_stream_token<F>(&self, token_id: usize, cb: &mut F) -> bool
+    ///
+    /// Uses a byte buffer so multi-byte UTF-8 chars (e.g. emoji) that split
+    /// across byte-level tokens are joined before being handed to the
+    /// callback, instead of each partial fragment being lossy-decoded to `�`.
+    fn emit_stream_token<F>(&self, token_id: usize, pending: &mut Vec<u8>, cb: &mut F) -> bool
     where
         F: FnMut(usize, &str) -> bool,
     {
-        let surface = self.decode(&[token_id]);
-        cb(token_id, &surface)
+        if let Some(tok) = self.tokenizer_from_model() {
+            pending.extend_from_slice(&tok.decode_bytes(&[token_id]));
+        } else {
+            // No native tokenizer — fall back to lossy per-token decode.
+            let surface = self.decode(&[token_id]);
+            return cb(token_id, &surface);
+        }
+        emit_complete_utf8(token_id, pending, cb)
     }
 
     /// Tokenize text using the model's native tokenizer (FFI path only).
@@ -1400,16 +1416,20 @@ impl Engine {
     /// Uses cached dequantized weights when available (Engine::load time).
     /// Falls back to row-by-row mmap dequant for models loaded without cache.
     fn lm_head_projection(&self, hidden_last: &[f32], tensor_name: &str, hidden_size: usize, vocab_size: usize) -> Vec<f32> {
-        // Use cached lm_head if available (loaded at Engine::load time).
-        // This avoids re-dequantizing 248K rows from the mmap every token
-        // — the single biggest per-token bottleneck (~372ms → ~2ms).
-        if let Some(ref cached) = self.cached_lm_head {
-            return (0..vocab_size)
-                .map(|token_id| {
-                    let start = token_id * hidden_size;
-                    crate::kernels::simd::simd_dot_product(hidden_last, &cached[start..start + hidden_size])
-                })
-                .collect();
+        // Use cached lm_head Q6_K blocks if available (loaded at Engine::load
+        // time).  The GEMM dequantizes blocks on the fly, avoiding both the
+        // ~3.8 GB f32 cache and the per-row mmap path.
+        if let Some(ref mat) = self.cached_lm_head {
+            let mut logits = vec![0.0f32; vocab_size];
+            crate::kernels::q6_k_gemm::q6_k_matmul_transposed_b(
+                hidden_last,
+                mat,
+                &mut logits,
+                1,
+                hidden_size,
+                vocab_size,
+            );
+            return logits;
         }
 
         // Fallback: row-by-row mmap dequant (original slow path).
@@ -1687,6 +1707,45 @@ pub struct EngineInfo {
 // -------------------------------------------------------------------------
 // Gemma per-layer layouts (Gemma 3/4 family only)
 // -------------------------------------------------------------------------
+/// Drain complete UTF-8 sequences from a streaming byte buffer, handing each
+/// decoded character (or run of them) to the callback.  Incomplete trailing
+/// bytes stay buffered for the next token.  Returns false if the callback
+/// asked generation to stop.
+fn emit_complete_utf8<F>(token_id: usize, pending: &mut Vec<u8>, cb: &mut F) -> bool
+where
+    F: FnMut(usize, &str) -> bool,
+{
+    let mut complete_len = 0usize;
+    let mut i = 0usize;
+    while i < pending.len() {
+        let b = pending[i];
+        let len = if b < 0x80 {
+            1
+        } else if b >= 0xC2 && b <= 0xDF {
+            2
+        } else if b >= 0xE0 && b <= 0xEF {
+            3
+        } else if b >= 0xF0 && b <= 0xF4 {
+            4
+        } else {
+            // Invalid leading byte; treat as complete (lossy anyway).
+            1
+        };
+        if i + len > pending.len() {
+            break;
+        }
+        i += len;
+        complete_len = i;
+    }
+
+    if complete_len == 0 {
+        return true;
+    }
+    let text = String::from_utf8_lossy(&pending[..complete_len]).to_string();
+    pending.drain(..complete_len);
+    cb(token_id, &text)
+}
+
 fn infer_gemma_layouts(
     model: &GGUFModel,
     arch: &ModelArchitecture,
@@ -1820,4 +1879,52 @@ fn infer_gemma_layouts(
             }
         })
         .collect()
+}
+
+// -------------------------------------------------------------------------
+// LM head cache
+// -------------------------------------------------------------------------
+
+/// Load the lm_head tensor (`output.weight`, or `token_embd.weight` when
+/// tied) and keep it in its native Q6_K block form, once, at load time.
+///
+/// The Q6_K GEMM dequantizes blocks on the fly, so this needs only the raw
+/// block bytes (~0.8 GB for a 248K×4096 vocab) instead of a ~3.8 GB f32
+/// dequant cache, while remaining ~2× faster than the per-token mmap
+/// row-by-row path.  Matches llama.cpp's lm_head layout.
+///
+/// Returns `None` if the tensor is missing or its quant type is not Q6_K
+/// (caller then falls back to the mmap row-by-row path).
+fn load_lm_head_cache(model: &GGUFModel, tensor_name: &str) -> Option<crate::kernels::q6_k::Matrix> {
+    let info = model.file.get_tensor_info(tensor_name)?;
+    if info.typ != crate::model::quant::QuantType::Q6_K.code() {
+        return None;
+    }
+    let raw = model.file.get_tensor_raw(tensor_name)?;
+    let shape: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
+    // GGUF stores a matrix as [inner_dim, outer_dim]; for lm_head that's
+    // [hidden_size, vocab_size].  Q6_K blocks are row-major over the outer
+    // (vocab) dim, exactly the layout q6_k_matmul_transposed_b expects
+    // (b.rows = vocab, b.cols = hidden).
+    if shape.len() != 2 {
+        return None;
+    }
+    let hidden_size = shape[0];
+    let vocab_size = shape[1];
+    let matrix = crate::kernels::q6_k::Matrix {
+        rows: vocab_size,
+        cols: hidden_size,
+        blocks: crate::kernels::q6_k::blocks_from_bytes(raw),
+    };
+    if std::env::var("LEAFCUTTER_DEBUG").map(|v| v == "1").unwrap_or(false) {
+        let bytes = matrix.blocks.len() * crate::kernels::q6_k::Block::BYTES;
+        eprintln!(
+            "[lm_head] cached '{}' as Q6_K ({}x{}, {:.2} MiB)",
+            tensor_name,
+            matrix.rows,
+            matrix.cols,
+            bytes as f64 / 1024.0 / 1024.0
+        );
+    }
+    Some(matrix)
 }
