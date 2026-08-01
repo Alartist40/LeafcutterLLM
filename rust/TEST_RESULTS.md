@@ -1,10 +1,32 @@
 # Leafcutter-RS Test Results
-**Date:** 2026-06-16 (refreshed after stability audit pass)
+**Date:** 2026-08-01 (refreshed at project wrap-up)
 **Project:** Full Rust Rewrite of LeafcutterLLM (Option C)
 **Target:** x86_64 (AVX2/FMA)
-**Model:** Qwen3.5-9B-IQ4_NL / Qwen3.5-2B-Q4_K_M GGUF
+**Model:** Ornith-1.0-9B-Q4_K_M / Q6_K GGUF (native GGUF engine)
 
 > Latest summary below; older per-date sections below remain as historical record.
+
+## Test Suite Status as of 2026-08-01 (project wrap-up)
+
+- **161 tests pass** (`cargo test --release --lib`)
+- **0 failures** — the three previously-failing tests were stale expectations and
+  are fixed:
+  - `kernels::tests::test_q4_0_roundtrip` — expected non-interleaved nibbles; Q4_0
+    is byte-interleaved (two consecutive elements per byte). Updated to the verified
+    layout.
+  - `profiles::tests::test_ministral_template_uses_inst` — predated the default
+    system prompt inside `[INST]`.
+  - `profiles::tests::test_ornith_template_starts_with_thinking` — predated the
+    change letting the model emit its own `<think>` opener.
+- **3 ignored**: GPU tests in `backend::wgpu::tests` (+ 1 bench)
+- **`cargo check --lib`**: clean (pre-existing style warnings only)
+- **Functional:** `leafcutter run ornith` produces a coherent thinking block +
+  answer at ~8.1 GB peak RAM, 1.2–1.65 tok/s, with correct emoji/Latin-1
+  streaming (GPT-2 byte-level decode fixed).
+
+---
+
+## Previous Results (2026-06-16)
 
 ## Test Suite Status as of 2026-06-16
 
@@ -35,7 +57,7 @@ cargo build --release
 
 ---
 
-## ✅ Test Suite: 123/123 PASS
+## ✅ Test Suite (historical status as of 2026-06-16)
 
 As of **2026-06-16**, after the audit-pass stability fixes:
 

@@ -5,6 +5,12 @@
 **Reference:** HuggingFace `transformers` 5.9.0 (the source the GGUF weights were converted from — single source of truth).
 **Goal:** Make Leafcutter's native `forward_native` path produce coherent output matching the HF reference within fp32 noise (~1e-3 per layer).
 
+> **Status 2026-08-01 (project wrap-up):** Gemma 4 12B runs all 48 layers
+> through the native path and emits tokens; multi-token coherence is still
+> an open item (see the "Notes / Known issues" entry in CHANGELOG 2026-06-29).
+> The flagship verified model is Ornith 1.0 9B (Qwen3.5 hybrid), which
+> generates coherent chat natively via `leafcutter run ornith`.
+
 This is a **living document**. Every finding is recorded with `file:line` evidence so the team can verify it independently. Nothing here is opinion — every claim should be reproducible from the evidence given.
 
 ---

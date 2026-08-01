@@ -3,6 +3,9 @@
 > **Date:** 2026-07-09  
 > **Auditor:** Kimi K2.6 (Nvidia), using the `security-audit` skill  
 > **Scope:** Full read-only review of `/home/xander/Documents/portfolio/LeafcutterLLM/rust/src/`  
+> **Wrap-up note (2026-08-01):** All 20 findings were routed into the codebase
+> (see CHANGELOG 2026-07-09). Test suite is fully green as of the wrap-up:
+> **161 passed / 0 failed / 3 ignored**.
 > **Status:** Read-only. No code was edited during this audit.  
 > **Methodology:** 12-surface checklist (OWASP-aligned) + Rust perf-critical checklist (9 categories from prior Leafcutter audit).
 

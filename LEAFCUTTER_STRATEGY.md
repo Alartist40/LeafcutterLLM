@@ -8,7 +8,9 @@
 
 **Goal:** Interactive chat with GGUF models via LeafcutterLLM's Rust streaming engine — including small quantized models (Q4_K, Q6_K) so users can run capable models on low storage. The primary use case is *storage-constrained* systems: users who don't need to save storage can just run safetensors; the GGUF path exists to serve quantized models.
 
-**Current state (July 2026):** Phases 1-4 complete. The engine loads GGUF weights (Q8_0, Q4_K_M, Q6_K all verified) and **generates coherent, on-topic text** from Ornith-9B — the model's real reasoning block. Phase 5 (performance) in progress: the 16× I/O slowdown is **fixed** (§10.5) — layer weights now cached in RAM and page eviction gated off — 34.6 s / 20 tokens (was 48.5 s), ~0.78 s/tok steady-state, bit-exact. Remaining gap to Ollama is **compute-bound** (dequant+GEMM, lm_head).
+**Current state (Aug 2026):** Phases 1-5 and 5B **complete**. The engine loads GGUF weights (Q8_0, Q4_K_M, Q6_K all verified) and **generates coherent, on-topic text** from Ornith-9B — the model's real reasoning block — in the interactive `leafcutter run ornith` chat REPL, fully native. Performance: ~0.78 s/tok steady-state compute-bound; lm_head uses a **Q6_K block cache** (~87.8 ms/tok, −3 GB RAM vs the earlier f32 cache). Peak chat RAM **~8.1 GB**, 1.2–1.65 tok/s. Test suite green: **161 pass / 0 fail / 3 ignored**.
+
+**Project status (2026-08-01):** **PROJECT WRAP-UP.** The original tripolar mission — "lighter than airllm, faster + smarter than colibri" — is delivered for the flagship model: Ornith 1.0 9B runs natively, coherently, and interactively. Remaining work is future/optional (see Roadmap in README): zero-copy `load_layer`, SIMD expansion, distributed inference, GPU backends.
 
 ```
 Loaded GGUF ─→ Bridge ─→ Engine ─→ Tokenizer ─→ Chat template ─→ Coherent output
@@ -463,7 +465,7 @@ This means Ornith 9B has: 24 linear layers + 8 full attention layers.
 - Add chat message formatting to the REPL (`<|im_start|>user\n...<|im_end|>`, system prompt, etc.)
 - Wire tokenizer from GGUF metadata or require `tokenizer.json` path
 - Handle `<think>` blocks in model output (strip for display, keep for reasoning)
-- Handle stop tokens (`<|im_end|>` = 248044, `<|endoftext|>` = 248046)
+- Handle stop tokens (`<|im_end|>` = 248046, `<|endoftext|>` = 248044 — verified 2026-08-01)
 
 #### Phase 4: Testing & Hardening
 - Test with `/home/xander/Downloads/models/ornith-1.0-9b-Q8_0.gguf`
@@ -542,7 +544,9 @@ Same prompt (73 tokens), same machine (AMD Ryzen 7 5800HS, 8C/16T, AVX2, CPU-onl
 
 Leafcutter wall times (20 max tokens): 48.5 s with prefetch, 78.7 s without (prefetch = 1.6×). Thread count (4 vs 16) made **no** difference — the bottleneck is I/O, not compute.
 
-**Post-fix (Phase 5 cache landed):** 20 max tokens = **34.6 s** wall (was 48.5 s). First token ~19.8 s (cold load of all 32 layers once), then **~0.78 s/tok** steady-state (was ~2.4 s/tok). `LEAFCUTTER_NO_CACHE=1` reproduces the old behavior (55.8 s/20 tok) → cache is the ~1.6× win, and it is **bit-exact** (identical generated text with and without cache). Remaining gap to Ollama (0.195 s/tok) is now **compute-bound**, dominated by dequant+GEMM kernels — profile shows ~1-3 ms per layer matmul plus **167 ms/token for `lm_head_separate_forward`** (dequantizes the full 248K×4096 vocab table every token; candidate for a fused softmax/partial-dequant or output-layer cache).
+**Post-fix (Phase 5 cache landed):** 20 max tokens = **34.6 s** wall (was 48.5 s). First token ~19.8 s (cold load of all 32 layers once), then **~0.78 s/tok** steady-state (was ~2.4 s/tok). `LEAFCUTTER_NO_CACHE=1` reproduces the old behavior (55.8 s/20 tok) → cache is the ~1.6× win, and it is **bit-exact** (identical generated text with and without cache). Remaining gap to Ollama (0.195 s/tok) is now **compute-bound**, dominated by dequant+GEMM kernels plus lm_head.
+
+**lm_head update (2026-08-01):** f32 `output.weight` cache implemented in engine.rs (`load_lm_head_cache`, 3.79 GiB) → 20-token run = **28.96 s** (was 34.6 s), bit-exact. But lm_head is **memory-bandwidth-bound at ~180 ms/token** (reads 4 GB f32/token) — NOT the hoped ~2 ms. Quantized Q6_K GEMM (`q6_k_matmul_transposed_b`) measured **87.8 ms avg**, 2× faster and −3 GB RAM. Both approaches still leave lm_head as the dominant per-token cost; Top-K preselection remains the big win (167→~0.2 ms est.).
 
 ### 10.5 Root-Cause: Weights Re-Loaded From Disk Every Token
 
@@ -598,7 +602,7 @@ Considerations (from llama.cpp, do not guess):
 | Setting | Value |
 |---------|-------|
 | System prompt | `You are Ornith, an open-source agentic coding assistant. Think step by step in a reasoning block, then act. Use the provided tools when they help. Be concise, correct, and direct: write working code and explain only what is non-obvious.` |
-| Stop token | `<\|im_end\|>` (id 248044) |
+| Stop token | `<\|im_end\|>` (id 248046) |
 | Template | `{{ .Prompt }}` (raw — no wrapping; renderer handles formatting) |
 | Renderer | `ornith` (custom — likely wraps in `<\|im_start\|>user...`) |
 | Temperature | 0.6 |
@@ -632,7 +636,8 @@ Engine integration: `WeightProvider` trait, `GGUFWeightProvider`, `StreamingOrni
 ### ✅ Phase 3 — Chat Template & Tokenizer (COMPLETE, July 2026)
 - Chat message formatting verified against Ollama's `ornith` renderer (ollama/model/renderers/ornith.go → qwen35.go): system + user + `\n<|im_start|>assistant\n<think>` matches byte-for-byte
 - GGUF-native tokenizer wired (`GgufBpeTokenizer::from_gguf`, vocab=248320); HF tokenizer (248070) auto-rejected on vocab mismatch
-- Stop token `<|im_end|>` (id 248044) is the EOS; generation stops at it
+- Stop token `<|im_end|>` (id **248046**, verified via `check_ornith_vocab` against the GGUF tokenizer table) is the ChatML EOS; generation stops at it. `<|endoftext|>` is a *different* token at id 248044. (Earlier doc versions wrongly said `<|im_end|>` = 248044 — corrected 2026-08-01.)
+- Verified special-token IDs from the GGUF tokenizer table: `248044=<|endoftext|>`, `248045=<|im_start|>`, `248046=<|im_end|>`, `248047=<|object_ref_start|>`, `248068=<think>`, `248069=</think>`
 - `<think>` reasoning blocks are generated and should be stripped from display (ollama PARSER ornith does this)
 - System prompt matches Ollama Modelfile exactly
 
@@ -666,10 +671,49 @@ The strategy doc was stale on two items:
 1. **Top-K preselection** — the `par_iter` over all 248K rows is wasted when you only need the top 20. Implementation: iterate sequentially once, maintaining a min-heap of the top-N (top_k=40) rows. Only dequant a row when it might enter the heap. The iterative scan means no par_iter overhead, but ~1000× fewer dequants → lm_head goes from 167 ms to ~0.2 ms.
 2. **Output-layer weight cache** — if memory allows, store `output.weight` dequantized as f32 (248320 × 4096 × 4 = ~4 GB). With the layer cache already at ~5.6 GB, total would be ~9.6 GB. On a 16 GB machine this fits, but on 8 GB it doesn't. Make it optional (`LEAFCUTTER_CACHE_HEAD=1`).
 
+**lm_head measurements (2026-08-01, after implementing f32 output cache):**
+- **f32 output cache IMPLEMENTED** — `load_lm_head_cache()` in engine.rs dequantizes `output.weight` (Q6_K [4096, 248320], 834 MB raw) once into f32 (`cached_lm_head`, 1,017,118,720 elements = 3.79 GiB) at model load; 20-token run dropped from 34.6 s → **28.96 s**, output bit-exact vs no-cache (`LEAFCUTTER_NO_CACHE=1` gate in loader.rs proves layer-cache bit-exactness).
+- **BUT lm_head is still ~180 ms/token** (NOT the hoped ~2 ms). It is **memory-bandwidth-bound**: reads 4 GB of f32 per token; dequant is no longer the cost — the dot product over 248K×4096 f32 is.
+- **Quantized Q6_K GEMM alternative measured: 87.8 ms avg** via `q6_k_matmul_transposed_b` (bench binary `bench_lmhead_q.rs`, since deleted) — 2× faster than f32 cache AND uses ~3 GB less RAM. Note: `q6_k_matmul` (non-transposed variant) panicked at q6_k_gemm.rs:226 in the bench, so the transposed path is the proven one.
+- **Decision needed**: keep f32 cache (simple, 28.96 s, +3.79 GB) vs swap to quantized Q6_K block cache (~87.8 ms/tok lm_head, −3 GB RAM). Both uncommitted (git status: `M rust/src/bin/prof_lm_head.rs`, `M rust/src/inference/engine.rs`).
+
 **GPU detection is still CPU-only.** AMD Radeon Vega iGPU (Cezanne) is present. Monitoring: leave as a Phase-6 optional polish, not blocking Phase 5.
+
+### ✅ Phase 5B — Ollama-Like UX (COMPLETE, 2026-08-01)
+
+**Trigger:** User tested `generate --raw "Hello"` and was unhappy: (1) noisy output (per-layer `materializing` spam, banners), (2) wants an Ollama-like flow where *they* type their own prompt and the model responds properly (not a raw/premade prompt), (3) response quality was bad and no thinking block was shown. Clarified: "I dont need it to show me the layers, just the responds streaming, and the thinking as well."
+
+**Root-cause diagnosis:**
+1. `--raw` **bypasses the chat template entirely** (main.rs:1544) — Ornith is a ChatML reasoning model; fed raw `Hello` it does raw text-continuation (`...I'm a student in the University of Malaya...`), not an understanding.
+2. Even without `--raw`, `cmd_generate_native` uses `apply_chat_template_from_gguf` (chat_template.rs:58) which ends at `<|im_start|>assistant\n` with **NO `<think>`** opener. The correct template is `profiles::render_chat_prompt` (profiles.rs:425-426) which appends `\n<think>\n` for `opens_with_thinking` models — but `generate` doesn't use it.
+3. `generate` is **non-streaming + noisy**: batches at the end (main.rs:1597 `engine.generate()`); loader prints `[loader] materializing ssm_conv1d.weight` ×24 (loader.rs:621-623, ungated), plus `[lm_head] cached...`, `⚠️ HF tokenizer vocab mismatch`, `📝 Prompt tokens`, `🌿 banner`, `DeltaNet: qk_heads=...`.
+
+**Key enabler:** the fast `Engine` already has everything needed — `generate_streaming_with_stops` (engine.rs:729) does prefill + KV cache + layer cache + per-token callback, and the thinking-block callback pattern (swallow `<think>`=248068/`</think>`=248069, print thinking as `💭…`) already exists in `cmd_run` (main.rs:996-1029).
+
+**Plan (all shipped):**
+- **A. Native streaming chat REPL on the fast Engine** — `run --engine native` now streams via the fast `Engine`:
+  1. Prompt: `profiles::resolve_profile(arch)` → `render_chat_prompt(&profile, system, &history)` — adds `<think>` for Ornith, matches Ollama exactly.
+  2. Streaming: `engine.generate_streaming_with_stops(tokens, max, temp=0.6, top_p=0.95, &stop_ids, cb)` with the existing thinking-block callback.
+  3. Stop tokens from profile: `<|im_end|>`=**248046**, `<|endoftext|>`=248044 (verified via GGUF tokenizer).
+  4. Multi-turn: keep `history: Vec<(role, content)>`, re-render each turn.
+  5. Sampling = ornith profile defaults (temp 0.6, top_k 20, top_p 0.95).
+- **B. Quiet by default** — loader/engine debug logs gated behind `LEAFCUTTER_DEBUG=1` / `-v`; only the model-load header (banner + arch + layer count) shows. Stream only generated text.
+- **C. `generate` fixed for correctness** (one-shot path) — non-`--raw` uses `render_chat_prompt` (with `<think>`) and routes through `generate_streaming_with_stops` so output streams and stops at `<|im_end|>`.
+- **D. Acceptance test PASSED** — `leafcutter run ornith` → thinking block streams as `💭…`, then the answer, clean stop, quiet output. Example session:
+  ```
+  >>> hey there
+  💭The user is just saying "hey there"...
+  Hey! 👋 I'm Ornith — your open-source agentic coding assistant...
+  ornith-1.0-9b-Q4_K_M.gguf | out=105 | 63.46s | 1.65 tok/s | RAM 8.1 GB
+  ```
+
+**Post-Phase-5B wrap-up (same session):** two correctness bugs found by the user and fixed:
+- **GPT-2 byte-level decode corruption** — `Hey! 👋` printed as `Hey! ��` because multi-byte chars split across byte-level tokens were lossy-decoded per token. Fixed with `decode_bytes()` + a streaming UTF-8 buffer (`emit_complete_utf8`) in engine.rs; emoji/Latin-1 now render correctly.
+- **lm_head f32 cache → Q6_K block cache** — the 3.79 GiB f32 cache was swapped for native Q6_K blocks (~0.8 GB) computed via `q6_k_matmul_transposed_b`. Peak chat RAM dropped **11.1 → 8.1 GB** and lm_head is ~2× faster (87.8 ms vs ~180 ms). Bit-identical logits.
+
+**Verified tokenizer facts (2026-08-01, via GGUF tokenizer table):** `248044=<|endoftext|>`, `248045=<|im_start|>`, `248046=<|im_end|>`, `248047=<|object_ref_start|>`, `248068=<think>`, `248069=</think>`. profiles.rs ornith stop tokens (248046/248044) are **correct**.
 
 ### Phase 6 — Polish
 - BF16 dequantization in tensor.rs matmul
 - Memory-mapped weight access with page eviction (MADV_DONTNEED) — RE-EVALUATE: this actively kills performance (§10.5)
-- Handle edge cases: multi-turn chat, streaming output, tool calls
 - Handle edge cases: multi-turn chat, streaming output, tool calls

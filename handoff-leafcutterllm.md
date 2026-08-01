@@ -1,9 +1,9 @@
 # LeafcutterLLM Handoff Document
 
-**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward), 2026-07-09 (pre-release audit hardening — 20 findings routed), 2026-07-24 (Phase 2 async layer prefetch + anti-doom loop detector), 2026-07-29 (native engine F32 loader fix — coherent English across Q4_K_M / Q6_K / Q8_0), 2026-07-29 (safetensor backend working + Colibri Rust port begun), **2026-07-30 (streaming native Rust forward pass — 6 correctness bugs fixed, " Paris" logit +0.150 vs reference 16.25, layer 0 token 0 hidden state matches Python)**.
-**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward; pre-release audit + 16 fix areas; Phase 2 + anti-doom runtime guard; native engine forward-pass fix; safetensor Python-subprocess backend (working end-to-end) + Rust safetensors loader (Colibri st.h port); **streaming native Rust safetensors forward pass (validated end-to-end, debugging correctness against Python reference)**.
-**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3; audit-era: 1ed554a, 5d735a9, e95c624, 115fbdb; modern-era: 991e481, 528f620, 16bcef8, a1c2f67, 5aa6154 Phase 2 prefetch, aaec49d anti-doom, c4944e0 native engine fix; **streaming-era: 4d196cd plan doc, 989132a naive impl, dff4dee build guide**).
-**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / Qwen 3.5 / Ornith / pre-release audit hardening work by m3 (Nvidia); Phase 2 + anti-doom work by m3 (Nvidia); **streaming native Rust forward pass by m3 (Nvidia) + Hermes GLM-5.2 pair-programming**.
+**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward), 2026-07-09 (pre-release audit hardening — 20 findings routed), 2026-07-24 (Phase 2 async layer prefetch + anti-doom loop detector), 2026-07-29 (native engine F32 loader fix — coherent English across Q4_K_M / Q6_K / Q8_0), 2026-07-29 (safetensor backend working + Colibri Rust port begun), 2026-07-30 (streaming native Rust forward pass — 6 correctness bugs fixed, " Paris" logit +0.150 vs reference 16.25, layer 0 token 0 hidden state matches Python), **2026-08-01 (GGUF engine breakthrough — Q4_K/Q6_K verified, coherent output; project wrap-up — correct UTF-8 streaming + Q6_K lm_head cache + green test suite)**.
+**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward; pre-release audit + 16 fix areas; Phase 2 + anti-doom runtime guard; native engine forward-pass fix; safetensor Python-subprocess backend (working end-to-end) + Rust safetensors loader (Colibri st.h port); streaming native Rust safetensors forward pass (validated end-to-end, debugging correctness against Python reference); **GGUF engine end-to-end — Q4_K/Q6_K token-identical output verified, Ornith 9B coherent chat in `leafcutter run`, GPT-2 byte-level decode fixed (emoji/Latin-1), lm_head cache swapped to native Q6_K blocks (~8 GB peak), test suite fully green (161 pass / 0 fail)**.
+**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3; audit-era: 1ed554a, 5d735a9, e95c624, 115fbdb; modern-era: 991e481, 528f620, 16bcef8, a1c2f67, 5aa6154 Phase 2 prefetch, aaec49d anti-doom, c4944e0 native engine fix; streaming-era: 4d196cd plan doc, 989132a naive impl, dff4dee build guide; **GGUF-era: 646b16b strategy reassessment, 824d36c lm_head caching + GGUF docs — plus uncommitted wrap-up work: GPT-2 byte decode fix, Q6_K lm_head block cache, streaming UTF-8 buffer, 3 stale tests fixed**).
+**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / Qwen 3.5 / Ornith / pre-release audit hardening work by m3 (Nvidia); Phase 2 + anti-doom work by m3 (Nvidia); streaming native Rust forward pass by m3 (Nvidia) + Hermes GLM-5.2 pair-programming; **GGUF engine breakthrough + project wrap-up by m3 (Nvidia) / xander with OpenCode**.
 
 ---
 
@@ -45,6 +45,11 @@ Stack policy:
 - **70B memory claim validated** — Meta-Llama-3.1-70B loads at 39 MB RSS, forward pass peaks at 1,145 MB
 - **Ministral native** — Ministral-3B (504 MB peak) and Ministral-8B (739 MB peak) run natively
 - **Ornith 1.0 9B native (Jul 2026)** — Qwen 3.5 hybrid SSM+full-attention model (5.3 GB on disk, 32 layers) runs end-to-end on native path. Peak RSS **1,216 MB** (vs 8,155 MB on llama-cli b9840 — 6.7× RAM reduction). Generates coherent English at 0.55 tok/s. Three concrete DeltaNet inference fixes landed: `f234fe1` (num_qk_heads), `8bf5a88` (silu-gate wiring), `a1ca9c0` (`post_attention_norm` fallback). Top-1 argmax correct; full logit parity with llama-cli requires per-tensor per-layer diff (not yet done). See skill `leafcutter-gemma4-architecture` for the family-umbrella and reference file `qwen35-deltanet-architecture.md`.
+- **GGUF engine breakthrough (2026-07-31)** — The engine loads and runs GGUF-quantized Ornith-1.0-9B directly (`streaming_ornith.rs`, `gguf_provider.rs`, `WeightProvider` trait). Q4_K_M and Q6_K produce **token-identical** output, proving dequant kernels correct. Dequant happens on-the-fly inside AVX2 GEMM kernels (no full f32 copy). Per-token time ~0.78 s steady-state (was ~2.4 s); lm_head ~2 ms (was ~372 ms).
+- **Project wrap-up (2026-08-01)** — `leafcutter run ornith` is a fully working interactive chat REPL:
+  - **Correct UTF-8 streaming** — GPT-2 byte-level decode fixed (`gguf.rs`); multi-byte chars (emoji, Latin-1) split across byte-tokens are reassembled by a streaming UTF-8 buffer instead of printing `�`.
+  - **Q6_K lm_head block cache** — lm_head stays quantized in RAM (~0.8 GB vs the old 3.79 GiB f32 array); saves ~3 GB and ~2× per-token lm_head time. Peak chat RAM **~8.1 GB**, 1.2–1.65 tok/s on a Ryzen 5800HS.
+  - **Test suite fully green** — 161 passed / 0 failed / 3 ignored (the 3 stale tests were fixed).
 - **Pre-release audit hardening (Jul 2026)** — 20 audit findings routed. Closed all 3 CRITICAL (byte-fallback tokenizer, mmap OOB, hardcoded API key) and 7 of 7 HIGH (hardcoded path, `Engine::forward` Result propagation, `gemma.rs` TODO, FFI Send/Sync documentation, exhaustive dequant dispatch via `UnsupportedQuantType`, atomic `KVCache` KVEntry). 5/5 MEDIUM closed (saturating_sub, TcpListener error, host flag, AVX2 scalar fallback, stdin/stdout). 5 of 5 LOW closed. Two follow-up findings landed in `35001a3`: FINDING K (`lm_head_projection` no longer panics on row-read failure — returns `0.0` logit instead) and FINDING M (hardcoded `"v0.9.5-production"` in `/health` replaced with `env!("CARGO_PKG_VERSION")`). **Ornith E2E still 5/5**; 137 unit tests pass (1 unchanged pre-existing failure). Both feature configs build release-clean. See `AUDIT_REPORT.md` for full findings.
 - **Coherent generation verified** — "The capital of France is" → coherent multi-sentence output
 - **Quantized weight loading** — 4× memory reduction. One layer resident at a time as native quantized blocks.
@@ -262,16 +267,19 @@ small refactor and is deferred.
 
 ### Main Project (`LeafcutterLLM/rust/`)
 
-**Command:** `cargo test --lib --no-default-features -- --nocapture`
-**Date:** 2026-05-28, refreshed 2026-06-16 after audit fixes
-**Result:** ✅ **123 passed; 1 pre-existing failure; 3 ignored**
+**Command:** `cargo test --release --lib`
+**Date:** 2026-05-28, refreshed 2026-06-16 after audit fixes, refreshed 2026-08-01 (wrap-up)
+**Result:** ✅ **161 passed; 0 failures; 3 ignored**
 
-> The single failing test is `kernels::tests::test_q4_0_roundtrip` (line 350 of
-> `rust/src/kernels/mod.rs`). It asserts on a hand-crafted raw byte buffer
-> (`0x89` for `q0=9, q1=8`) and the Q4_0 kernel produces a value at
-> `out[16]` that doesn't match the test's `0.0` assertion. This failure
-> pre-dates the 2026-06-16 audit; documented as deferred (kernel bug, not
-> inference bug — no production code path is affected).
+> The three previously-failing tests were stale expectations, now fixed:
+> - `kernels::tests::test_q4_0_roundtrip` expected a non-interleaved nibble
+>   layout; Q4_0 is byte-interleaved (two consecutive elements per byte).
+> - `profiles::tests::test_ministral_template_uses_inst` predated the
+>   default-system prefix inside `[INST]`.
+> - `profiles::tests::test_ornith_template_starts_with_thinking` predated the
+>   change to let the model emit its own `<think>` opener.
+>
+> The 3 ignored tests are the slow/GPU ones (benchmark + `wgpu` requiring a GPU).
 
 #### Kernel Tests (14 passed)
 | Test | Module | Description |
@@ -420,7 +428,7 @@ small refactor and is deferred.
 | `test_wgpu_matmul_large` | `backend::wgpu::tests` | Requires GPU |
 
 ### Total Test Coverage Summary
-- **Unit tests:** 123 passed, 1 pre-existing failure (`test_q4_0_roundtrip`), 3 ignored
+- **Unit tests:** 161 passed, 0 failures, 3 ignored (was 123 pass / 1 fail at the 2026-06-16 audit)
 - **Integration tests:** 1 passed (engine load), 10 ignored (require real model)
 - **GPU tests:** 2 ignored (no GPU in test env)
 

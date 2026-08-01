@@ -31,9 +31,7 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 
 **Key advantage:** Leafcutter is the only open-source engine combining Rust memory safety, **automatic backend routing** (native → FFI fallback), native quantized weight loading with transposed-B GEMM, BitNet quantization, and a built-in OpenAI-compatible HTTP API in a single binary.
 
-## Current Capabilities (Validated 2026-06-16)
-
-
+## Current Capabilities (Validated 2026-08-01)
 
 | Model | Size | Backend | Status | Peak RAM | tok/sec |
 |-------|------|---------|--------|----------|---------|
@@ -43,13 +41,14 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 | Ministral-3-3B Q4_K_M | 2.0 GB | **Native** | ✅ Forward + generation | **504 MB** | 1.09 |
 | Qwen3.5-0.8B | 0.5 GB | **FFI** | ✅ Coherent generation | ~3 GB | 14.68 |
 | Qwen3.5-9B | 5.0 GB | **FFI** | ✅ Coherent + reasoning | ~6 GB | 2.38 |
-| **Ornith 1.0 9B Q4_K_M** (Qwen 3.5 hybrid) | 5.3 GB | **Native** | ✅ Forward + coherent generation (max_diff=0.000015 vs reference) | **1,216 MB** | 0.55 |
+| **Ornith 1.0 9B Q4_K_M** (Qwen 3.5 hybrid) | 5.3 GB | **Native** | ✅ Coherent reasoning chat (max_diff=0.000015 vs reference) | **~8.1 GB** | 1.2–1.65 |
 | **Ornith 1.0 9B Q6_K** (Qwen 3.5 hybrid) | 7.4 GB | **Native** | ✅ Forward + coherent generation (max_diff=0.000013 vs reference) | TBD | TBD |
 | Synthetic 80-layer | 27 MB | **Native** | ✅ Layer streaming stress test | **30 MB** | N/A |
 
 * 534 MB measured on x86_64 with `madvise(MADV_DONTNEED)` layer streaming (Llama-3.2-3B Q4_K_XL).
 * 1,145 MB measured on x86_64 with real 70B Q4_K_S model, 1-token forward pass.
-* **1,216 MB measured on x86_64 with Ornith 1.0 9B Q4_K_M, 5-token generate at TEMPERATURE=0** (was ~8 GB on llama-cli b9840 for the same prompt — ~6.7× reduction). Hybrid SSM + full-attention interleaved (24 Linear + 8 Full, `full_attention_interval=4`). **Native engine now matches the pure-Rust reference layer-by-layer to fp32 epsilon (max_diff ≤ 0.000015)** — the previous ~4× top-1 logit gap was traced to an F32 loader bug (swap+transpose applied to GGUF-native row-major data) and fixed in `src/model/loader.rs`. See CHANGELOG 2026-07-29.
+* **~8.1 GB measured on x86_64 with Ornith 1.0 9B Q4_K_M in the interactive `leafcutter run ornith` chat REPL** — includes the 5.3 GB model + Q6_K lm_head block cache (~0.8 GB) + KV/SSM caches. The lm_head cache was swapped from a 3.79 GiB f32 array to native Q6_K blocks (see CHANGELOG 2026-08-01), cutting ~3 GB and ~2× off per-token lm_head time.
+* **Native engine now matches the pure-Rust reference layer-by-layer to fp32 epsilon (max_diff ≤ 0.000015)** — the previous ~4× top-1 logit gap was traced to an F32 loader bug (swap+transpose applied to GGUF-native row-major data) and fixed in `src/model/loader.rs`. See CHANGELOG 2026-07-29.
 * 39 MB load-only RSS for 70B native — model stays entirely on disk via mmap.
 * Auto-FFI fallback routes exotic quants (IQ1_M, Q2_K, etc.) to llama.cpp, which uses its own mmap model (higher RSS than native layer streaming).
 
@@ -202,7 +201,7 @@ cargo build --release --features llama-ffi
 | **Yi** | Yi-1.5-6B/9B | ✅ Native |
 | **Gemma** | Gemma-2B/4B/7B/9B | ✅ Native |
 | **Phi** | Phi-3/4 | ✅ Native |
-| **Qwen3.5/3.6** | Qwen3.5-0.8B through 27B | ❌ Requires FFI |
+| **Qwen3.5/3.6** | Qwen3.5-0.8B through 27B | ✅ Native (Ornith 9B verified end-to-end) / FFI for others |
 | **DeepSeek** | DeepSeek-V3 | ❌ Requires FFI |
 | **Exotic quants** | IQ1_M, Q2_K, etc. | ❌ Requires FFI |
 
@@ -231,25 +230,34 @@ Results will be saved in the `results/` directory with detailed JSON metrics.
 cargo test --lib
 ```
 
-As of 2026-06-16: **123 tests pass, 1 pre-existing failure, 3 ignored**. (The
-single failure is `kernels::tests::test_q4_0_roundtrip`, a hand-crafted
-raw-byte test that pre-dates the 2026-06-16 audit pass; no production
-inference path is affected. See `CHANGELOG.md` for the audit detail.)
+As of 2026-08-01: **161 tests pass, 0 failures, 3 ignored**. The three
+previously-failing tests (`kernels::tests::test_q4_0_roundtrip`,
+`profiles::tests::test_ministral_template_uses_inst`,
+`profiles::tests::test_ornith_template_starts_with_thinking`) were stale
+hand-crafted expectations that predated the byte-interleaved Q4_0 layout
+and the ChatML template changes; they now match the current, verified
+behavior. See `CHANGELOG.md` for the audit detail.
 
-# Current Release: v0.9.6 (2026-06-16)
+# Current Release: v0.9.0+ (2026-08-01)
 
-> v0.9.6 is a **stability + correctness** pass on top of v0.9.5. No new
-> capability was added; the inference math is unchanged. What changed:
-> 10 hard panics / silent correctness bugs / performance smells
-> identified by an audit were fixed (see `CHANGELOG.md` v0.9.6 entry).
-> All paths that used to panic on bad input now return clear errors.
+> Native engine **ships in a working chat REPL** for the Qwen3.5 / Ornith
+> hybrid architecture — the flagship capability of the project. Ornith
+> 1.0 9B runs `leafcutter run ornith` with coherent reasoning output,
+> correct UTF-8/emoji streaming, and ~8 GB peak RAM on a laptop.
+> Everything is in a single `leafcutter` binary with no Python or CUDA
+> dependency.
 
-## What's New in v0.9.6
-✅ **No more silent crashes** — `embed_lookup_mmap` no longer OOBs when tokenizer metadata is missing; unknown quant types log and return null instead of `panic!`
-✅ **`top_p` actually plumbed through the API** — `/generate` and `/v1/chat/completions` were silently throwing the request value away
-✅ **BPE tokenizers no longer destroy whitespace** — multi-space and multiline text round-trips correctly now
-✅ **Tokenizer + lm_head caches** — every token step is meaningfully faster on long generations
-✅ **123 tests pass** (1 pre-existing kernel failure, unchanged)
+## What's New (2026-08-01 wrap-up)
+✅ **GPT-2 byte-level decode fixed** — emoji and Latin-1 chars no longer
+render as `�`. Multi-byte chars split across byte-tokens are reassembled
+by a streaming UTF-8 buffer.
+✅ **Q6_K lm_head cache** — lm_head weights stay quantized in RAM as Q6_K
+blocks (~0.8 GB vs the old 3.79 GiB f32 cache). Faster *and* ~3 GB lighter.
+✅ **Coherent Ornith chat end-to-end** — `leafcutter run ornith` produces
+a thinking trace + clean English answer, matching llama.cpp to fp32 epsilon.
+✅ **161 tests pass** (all three pre-existing failures fixed).
+✅ **Native Qwen3.5 / Ornith is no longer "FFI-only"** — the native Rust
+path now routes the hybrid DeltaNet+Attention model without llama.cpp.
 
 ## v0.9.5 (Previous Production)
 
@@ -349,8 +357,8 @@ Response (token or text)
 
 | Path | Trigger | Models | Memory | Speed |
 |------|---------|--------|--------|-------|
-| **Native optimized** | Supported arch + supported quants | Llama, Mistral, Qwen2 | ~1GB for 70B | ~0.12 t/s (3B) |
-| **Explicit FFI** | Architecture = qwen3.5/3.6 | Qwen3.5, Qwen3.6 | Standard | 2–14 t/s |
+| **Native optimized** | Supported arch + supported quants | Llama, Mistral, Qwen2, Gemma, **Qwen3.5/Ornith** | ~1GB for 70B; ~8GB for 9B chat | ~1.2–1.65 t/s (9B) |
+| **Explicit FFI** | Architecture = qwen3.5/3.6 (opt-in, other sizes) | Qwen3.5, Qwen3.6 | Standard | 2–14 t/s |
 | **Auto-FFI fallback** | Unsupported quant types | Any IQ1_M, Q2_K, etc. | Standard | Varies |
 
 ### System Diagram (Native Path)
@@ -383,12 +391,18 @@ Response (token or text)
 | `src/inference/engine.rs` | Unified engine: native + FFI routing, generation loop |
 | `src/inference/attention.rs` | Multi-head attention with RoPE + GQA + fused QKV |
 | `src/inference/deltanet.rs` | Gated Delta Net forward pass (linear attention) |
+| `src/inference/mla.rs` | Multi-Latent Attention (DeepSeek/GLM) forward |
+| `src/inference/moe.rs` | MoE routed + shared expert forward |
+| `src/inference/anti_doom.rs` | Doom-loop detector + sampler suppression |
 | `src/inference/ffn.rs` | SiLU-gated feedforward network |
+| `src/inference/sampler.rs` | top-p / temperature sampling |
 | `src/llama_ffi/mod.rs` | Safe Rust wrappers around llama.cpp C API |
 | `src/kernels/mod.rs` | Quantized dequantization: Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_NL |
+| `src/kernels/q4_k_gemm.rs`, `q6_k_gemm.rs`, `q5_k_gemm.rs`, `iq4_nl_gemm.rs` | Quantized GEMM kernels (dequant-in-GEMM) |
+| `src/tokenizer/gguf.rs` | GPT-2 byte-level BPE tokenizer (encode/decode/merge) |
 | `src/model/loader.rs` | GGUF layer-streaming loader + quantized weight loading |
 | `src/model/gguf.rs` | GGUF v3 parser with mmap |
-| `src/model/tensor.rs` | Tensor data structure + matmul + RMSNorm + softmax |
+| `src/model/arch.rs` | Architecture detection + per-arch layer mapping |
 | `src/api/mod.rs` | Axum HTTP router (OpenAI-compatible) |
 | `src/bin/test_generation.rs` | Generation quality test binary |
 | `src/bin/benchmark_models.rs` | Performance benchmark suite |
@@ -698,8 +712,8 @@ Outputs per-call timings for `[PROFILE] lm_head_separate_forward`, `[PROFILE] ma
 and `[PROFILE] load_layer` to stderr. Use this to identify which layer type is
 the bottleneck for your model.
 
-As of 2026-07-23, the typical decode breakdown on a 9B Q4_K_M model is:
-- `lm_head_separate_forward`: ~20% of wall (after SIMD fix)
+As of 2026-08-01, the typical decode breakdown on a 9B Q4_K_M model is:
+- `lm_head_separate_forward`: ~10% of wall (Q6_K block GEMM, was ~20% with f32 cache)
 - `load_layer` (Q4_K → f32 dequant per forward pass): ~50% of wall
 - per-layer matmuls (Q4_K, Q6_K): ~30% of wall
 
@@ -764,19 +778,21 @@ If you use LeafcutterLLM in research or production, please cite:
 
 ## Roadmap
 
-# Current Release: v0.9.0 (2026-05-19)
+# Current Release: v0.9.0+ (2026-08-01)
 
 ## What's New
+✅ **Native Qwen3.5 / Ornith chat** — DeltaNet + Attention hybrid runs fully native (no llama.cpp) with coherent reasoning output.
 ✅ **Dual-backend engine** — Native Rust + llama.cpp FFI with automatic routing.
 ✅ **Auto-FFI fallback** — Unsupported quants (IQ1_M, Q2_K, etc.) automatically route to llama.cpp.
-✅ **Architecture detection** — Qwen3.5/3.6 auto-routed to FFI; Llama/Mistral/Qwen2 stay native.
+✅ **Architecture detection** — Qwen3.5/3.6 auto-routed to FFI; Llama/Mistral/Qwen2/Qwen3.5-Ornith stay native.
 ✅ **Native DeltaNet** — Gated linear attention implemented for hybrid SSM+Transformer architectures.
 ✅ **70B on 4GB validated** — Layer streaming + madvise proven on real 70B model.
 ✅ **GGUF format support** — Run llama.cpp models directly.
+✅ **Correct UTF-8 streaming** — emoji/Latin-1 byte-split handling; byte-identical GPT-2 decode.
 
 ### v0.10.0 (Next)
-- [ ] **Native Qwen3.5 coherence** — Debug DeltaNet + Attention layer interaction for full native support.
-- [ ] **SIMD quantized GEMM** — NEON/AVX2 paths for Q4_K, Q5_K, Q6_K, IQ4_NL.
+- [ ] **Zero-copy load_layer** — raw Q4_K bytes into GEMM (drop the per-pass `Vec<Block>` parse; ~50% of wall time).
+- [ ] **SIMD quantized GEMM** — extend AVX2 to remaining paths (Q5_K/Q6_K/iQ4_NL); NEON on ARM.
 - [ ] **Distributed inference** across multiple Raspberry Pi nodes.
 - [ ] **Metal Performance Shaders (MPS)** for macOS acceleration.
 

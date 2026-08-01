@@ -1,7 +1,10 @@
 # LeafcutterLLM Strategy — Streaming Native Rust Forward Pass
 
 > **Date:** 2026-07-30
-> **Status:** COMPLETE — 7 bugs fixed, Rust f32 matches Python f32 exactly
+> **Status:** SUPERSEDED — see `LEAFCUTTER_STRATEGY.md` (2026-08-01) for the current
+> state. This doc covers the safetensors/Python-subprocess streaming forward pass,
+> which is now historical: the native **GGUF** engine (`leafcutter run ornith`)
+> supersedes it and produces coherent chat natively (no Python, no safetensors).
 > **Goal:** Beat AirLLM in speed. Run large models on small hardware. Pure Rust, minimal deps.
 > **Workflow:** Hermes writes detailed plans + code. You build, test, report. Hermes diagnoses.
 

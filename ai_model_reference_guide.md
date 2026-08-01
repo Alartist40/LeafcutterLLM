@@ -1,5 +1,12 @@
 # Comprehensive AI Model Architecture & GGUF Reference Guide
 
+> **Wrap-up note (2026-08-01):** Reference guide used during development. The
+> architectures shipped end-to-end on the native GGUF engine are Llama, Mistral/
+> Ministral, Qwen2, Gemma, Phi, and **Qwen3.5 / Ornith (DeltaNet hybrid)** —
+> see `LEAFCUTTER_STRATEGY.md` for the current state. The Qwen3.5/Ornith
+> architecture details here match the verified implementation (see
+> `qwen35-deltanet-architecture.md`).
+
 ## Table of Contents
 1. [Transformer Fundamentals](#1-transformer-fundamentals)
 2. [Llama Architecture (Full Code)](#2-llama-architecture)

@@ -1,21 +1,18 @@
 //! Benchmark: profile a few forward calls with LEAFCUTTER_PROFILE to see
 //! the lm_head timing breakdown.
 use leafcutter::inference::engine::Engine;
-use leafcutter::model::gguf::GGUFile;
-use leafcutter::tokenizer::gguf_bpe::GgufBpeTokenizer;
 use std::time::Instant;
 
 fn main() {
     let gguf = "/home/xander/Downloads/models/ornith-1.0-9b-Q4_K_M.gguf";
-    let tok = "/home/xander/Downloads/models/tokenizer.json";
 
     eprintln!("Loading model...");
     let t0 = Instant::now();
-    let mut engine = Engine::new(gguf, tok).expect("Engine::new");
+    let mut engine = Engine::load(gguf).expect("Engine::load");
     eprintln!("Loaded in {:.2}s", t0.elapsed().as_secs_f64());
 
     let prompt = "Hello";
-    let ids = engine.tokenize(prompt);
+    let ids = engine.tokenize(prompt, false);
     eprintln!("Tokenized '{}': {:?}", prompt, ids);
 
     // Warm up
@@ -36,7 +33,6 @@ fn main() {
     indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
     eprintln!("\nTop-5:");
     for (i, (id, logit)) in indexed.iter().take(5).enumerate() {
-        let _ = engine; // need decode
         eprintln!("  {}. id={} logit={:.3}", i + 1, id, logit);
     }
 }

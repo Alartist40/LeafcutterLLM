@@ -1,7 +1,14 @@
 # LeafcutterLLM Rust Rewrite — Test Report
 
-## Date: 2026-05-19 (initial) | refreshed 2026-06-16 (stability audit pass)
+## Date: 2026-05-19 (initial) | refreshed 2026-06-16 (stability audit pass) | 2026-08-01 (project wrap-up)
 
+> **Wrap-up 2026-08-01:** test suite is **fully green** — `cargo test --release --lib`
+> → **161 passed, 0 failed, 3 ignored**. The three previously-failing tests were
+> stale expectations, now fixed: `kernels::tests::test_q4_0_roundtrip`
+> (byte-interleaved Q4_0 layout), `profiles::tests::test_ministral_template_uses_inst`
+> (default system prefix), `profiles::tests::test_ornith_template_starts_with_thinking`
+> (model emits its own `<think>`). See CHANGELOG 2026-08-01.
+>
 > **Audit pass 2026-06-16:** 10 of 11 stability findings fixed (see
 > CHANGELOG.md v0.9.6). 123 tests pass, 1 pre-existing kernel test
 > failure (`kernels::tests::test_q4_0_roundtrip`) unchanged.

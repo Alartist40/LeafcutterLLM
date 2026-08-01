@@ -5,6 +5,63 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-08-01 (Project wrap-up: correct UTF-8 streaming + Q6_K lm_head cache, test suite green)
+
+### Fixed — GPT-2 byte-level decode (emoji / Latin-1 corruption)
+
+Streamed output no longer renders emoji and Latin-1 characters as `�`.
+
+- **Root cause:** the byte-level BPE vocab stores every byte as a Unicode
+  codepoint. The old decoder assumed every char in `U+0100–U+01FF` maps back
+  via `cp - 256`. The real GPT-2 byte-map (llama.cpp
+  `unicode_utf8_to_byte_map`, `src/unicode.cpp:172`) only byte-encodes the 68
+  "non-printable" bytes (0x00–0x20, 0x7F–0xA0, 0xAD) into `U+0100–U+0143`;
+  printable ranges map to themselves. A naive `cp - 256` corrupted genuine
+  Latin-1/Latin-Extended chars (e.g. `¡`, `£`) and multi-byte chars stored as
+  bytes in the vocab.
+- **Fix:** `GgufTokenizer::decode` and `GgufBpeTokenizer::decode` in
+  `src/tokenizer/gguf.rs` now apply the correct reverse map; new
+  `decode_bytes()` exposes the raw UTF-8 byte stream.
+- **Streaming fix:** `emit_stream_token` now feeds raw bytes into a persistent
+  buffer and only emits once a complete UTF-8 sequence is available
+  (`emit_complete_utf8`). A 4-byte char like `👋` (`F0 9F 91 8B`) that splits
+  across two byte-level tokens is reassembled instead of printing `��`.
+
+### Changed — lm_head cache: f32 → native Q6_K blocks
+
+The lm_head weight cache was dequantizing `output.weight` (Q6_K `[4096,
+248320]`) into a ~3.79 GiB f32 array at load time. It now keeps the tensor in
+its native Q6_K block form (~0.8 GB) and computes logits via
+`q6_k_matmul_transposed_b` (dequant-in-GEMM).
+
+- Saves ~3 GB of RAM (Ornith 9B chat: 11.1 GB → ~8.1 GB measured).
+- Faster per-token lm_head (~88 ms vs ~180 ms f32-cache dot).
+- Bit-identical logits (the Q6_K dequant in both paths is the same formula).
+- Only works for Q6_K-typed tensors; tied `token_embd.weight` (Q4_K) falls
+  back to the per-row mmap path.
+
+### Fixed — 3 stale tests, test suite now fully green
+
+- `kernels::tests::test_q4_0_roundtrip` — expected a non-interleaved nibble
+  layout; Q4_0 is byte-interleaved (two consecutive elements per byte).
+  Updated to the correct, verified layout.
+- `profiles::tests::test_ministral_template_uses_inst` — predated the
+  default-system prefix inside `[INST]`.
+- `profiles::tests::test_ornith_template_starts_with_thinking` — predated the
+  change to let the model emit its own `<think>` opener (no pre-injected tag).
+
+**Result: `cargo test --release --lib` → 161 passed, 0 failed, 3 ignored.**
+
+### Performance (measured 2026-08-01, `leafcutter run ornith`)
+
+| Metric | Before | After |
+|--------|--------|-------|
+| Peak RAM (9B chat) | 11.1 GB | **8.1 GB** |
+| lm_head per token | ~180 ms (f32 cache dot) | ~88 ms (Q6_K GEMM) |
+| Decode emoji/Latin-1 | `�` / `��` | Correct |
+
+---
+
 ## [Unreleased] — 2026-07-31 (GGUF engine breakthrough — Q4_K/Q6_K verified, coherent output)
 
 ### Added — GGUF model support (llama.cpp weight format)

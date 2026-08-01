@@ -3,6 +3,11 @@
 **Date:** 2026-07-25
 **Platform:** Ryzen 5800HS (8c/16t), 15 GB RAM, NVMe SSD
 **Model:** Llama-3.3-70B-Instruct Q4_K_M (42.5 GB on disk, 80 layers × ~530 MB raw per layer)
+
+> **Status 2026-08-01 (project wrap-up):** Historical performance record. The
+> shipped flagship is the native GGUF engine for Ornith 9B (`leafcutter run
+> ornith`, ~8.1 GB peak, 1.2–1.65 tok/s). Prefetch (default ON) and anti-doom
+> (default ON) remain enabled in the engine.
 **Workload:** `./target/release/test_generation --prompt "The capital of France is" --tokens 3 --temperature 0.0 --raw`
 
 ## Raw timings

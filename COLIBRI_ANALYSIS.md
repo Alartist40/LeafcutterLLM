@@ -4,6 +4,13 @@
 **Author:** Analysis of [JustVugg/colibri](https://github.com/JustVugg/colibri) @ commit 6368e1a  
 **Source path:** `/home/xander/Documents/reference/colibri/`
 
+> **Wrap-up note (2026-08-01):** Lessons from this analysis that shipped —
+> LFRU hybrid cache (`LEAFCUTTER_CACHE=lfru`), pread+DONTNEED streaming,
+> `madvise(MADV_DONTNEED)` layer eviction. The "faster + smarter than colibri"
+> mission is delivered for the flagship model (Ornith 9B native GGUF chat).
+> The Colibri port itself was not undertaken (superseded by the native GGUF
+> engine).
+
 ---
 
 ## 1. What Colibrì Actually Is

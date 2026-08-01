@@ -6,6 +6,11 @@ These notes are a reference for future Colibri work. They're NOT being
 acted on this session — we're building the native Rust safetensors
 forward pass instead (Path B).
 
+> **Update 2026-08-01 (project wrap-up):** Still not acted on — the GGUF
+> native engine became the shipped path. Colibri lessons already harvested
+> (LFRU cache, pread+DONTNEED streaming, expert streaming design) are
+> documented in `LEAFCUTTER_STRATEGY.md` and `COLIBRI_ANALYSIS.md`.
+
 ## Why Colibri matters
 
 - **Pure C engine**, ~6,744 lines in colibri.c + ~2,498 lines of headers.

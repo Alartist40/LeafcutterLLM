@@ -5,6 +5,12 @@
 directly, no Python dependency. 5-10x faster than the Python subprocess
 backend, fewer dependencies than AirLLM, smaller binary than Colibri.
 
+> **Update 2026-08-01 (project wrap-up):** This safetensors path is
+> superseded by the native **GGUF** engine (`gguf_provider.rs` +
+> `streaming_ornith.rs`), which ships in `leafcutter run ornith`. The
+> engine now reads `.gguf` files directly and produces coherent chat with
+> no Python. Historical record retained below.
+
 ## Status
 
 ### ✅ Done (verified working)

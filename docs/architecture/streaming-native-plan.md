@@ -5,7 +5,10 @@
 ## I. Streaming Native Rust Forward Pass — Implementation Plan
 
 > **Date:** 2026-07-30
-> **Status:** ACTIVE — pipeline validated, debugging correctness
+> **Status:** COMPLETE / SUPERSEDED — see `LEAFCUTTER_STRATEGY.md` (2026-08-01).
+> This safetensors streaming plan was validated but then superseded by the native
+> **GGUF** engine, which is what `leafcutter run ornith` uses today (coherent chat,
+> ~8.1 GB peak RAM, 1.2–1.65 tok/s). Historical record retained below.
 > **Goal:** Beat AirLLM in speed. Run large models on small hardware. Pure Rust, minimal deps.
 
 ### Progress (2026-07-30 end of day)

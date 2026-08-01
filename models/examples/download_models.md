@@ -2,6 +2,15 @@
 
 Here are some recommended models to get started with LeafcutterLLM.
 
+> **Tip (2026-08-01):** Ornith 1.0 9B (Qwen3.5 hybrid) is the fully verified
+> flagship — run `leafcutter run ornith` with the Q4_K_M GGUF for coherent
+> native chat at ~8.1 GB peak RAM. GGUF files are the recommended format.
+
+## Ornith 1.0 9B (Qwen3.5 hybrid) — flagship, native
+*Qwen 3.5 hybrid (DeltaNet linear attention + full attention interleaved)*
+- Ornith-1.0-9b Q4_K_M (5.3 GB) — verified: `leafcutter run ornith`
+- Ornith-1.0-9b Q6_K (7.4 GB) — verified forward + coherent generation
+
 ## TinyLlama (1.1B Parameters)
 *Great for Raspberry Pi Zero 2W or Pi 3*
 - [TinyLlama-1.1B-Chat-v1.0 (GGUF Q4_K_M)](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF)

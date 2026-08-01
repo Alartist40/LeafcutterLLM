@@ -1,8 +1,28 @@
 # LeafcutterLLM — Milestones & Testing Record
 
-**Last updated:** 2026-07-24 (Phase 2 prefetch + anti-doom)
-**Git commit:** To be pushed
-**Total tests:** **150 passed**, **1 pre-existing failure** (`kernels::tests::test_q4_0_roundtrip` — hand-crafted raw-byte test, predates 2026-06-16 audit; no production path affected), **3 ignored** (GPU tests)
+**Last updated:** 2026-08-01 (project wrap-up)
+**Git commit:** Uncommitted wrap-up work (GPT-2 byte decode fix, Q6_K lm_head block cache, streaming UTF-8 buffer, 3 stale tests fixed)
+**Total tests:** **161 passed**, **0 failures**, **3 ignored** (GPU/bench tests) — `cargo test --release --lib`
+
+---
+
+## 2026-08-01 — Project wrap-up (native Ornith chat, decode fix, Q6_K lm_head cache)
+
+- **Native GGUF engine end-to-end** — `leafcutter run ornith` streams the
+  full Qwen3.5 hybrid model natively: thinking block as `💭…`, clean answer,
+  correct stop tokens. Verified `hey there` → coherent greeting, `2+2` →
+  correct arithmetic. Peak chat RAM **~8.1 GB**, 1.2–1.65 tok/s.
+- **GPT-2 byte-level decode fixed** — emoji/Latin-1 were printed as `�`
+  because multi-byte chars split across byte-level tokens were lossy-decoded
+  per token. Added `GgufTokenizer::decode_bytes()` + streaming UTF-8 buffer
+  (`emit_complete_utf8`) in engine.rs; multi-byte chars reassemble correctly.
+- **lm_head cache: f32 → Q6_K blocks** — `cached_lm_head` now holds native
+  Q6_K blocks (~0.8 GB vs 3.79 GiB f32) computed via
+  `q6_k_matmul_transposed_b`. Bit-identical logits; ~2× faster; RAM 11.1 → 8.1 GB.
+- **3 stale tests fixed** — `test_q4_0_roundtrip` (byte-interleaved Q4_0
+  layout), `test_ministral_template_uses_inst` (default system prefix),
+  `test_ornith_template_starts_with_thinking` (model emits its own `<think>`).
+- **Test count**: `cargo test --release --lib` → **161 passed, 0 failed, 3 ignored**.
 
 ---
 

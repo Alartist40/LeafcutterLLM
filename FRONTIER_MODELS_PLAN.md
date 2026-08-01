@@ -2,7 +2,11 @@
 
 > **Date:** 2026-06-19
 > **Author:** m3 (Nvidia)
-> **Status:** Active build-out. Native support for Kimi K2.6 and GLM-5.2 (both DeepSeek-style MoE + MLA).
+> **Status:** Scaffold complete (MLA + MoE engine paths built, 3 tests) but **not
+> the shipped focus as of 2026-08-01**. The wrap-up milestone shipped the native
+> **GGUF** engine for Qwen3.5/Ornith instead (coherent chat). Kimi K2.6 / GLM-5.2
+> still need full shard pieces on disk for real-model validation. Historical plan
+> retained below.
 
 ---
 
