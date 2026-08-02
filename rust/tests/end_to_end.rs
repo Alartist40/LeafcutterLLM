@@ -6,6 +6,7 @@
 
 use leafcutter::inference::engine::Engine;
 use leafcutter::tokenizer::Tokenizer;
+use leafcutter::tokenizer::BaseTokenizer;
 use std::time::Instant;
 
 #[test]
@@ -50,7 +51,7 @@ fn test_end_to_end_generation() {
 
     // Decode
     let all_tokens: Vec<usize> = tokens.iter().chain(generated.iter()).copied().collect();
-    let decoded = tok.decode(&all_tokens, false);
+    let decoded = tok.decode(&all_tokens);
     println!("   Decoded: '{}'", decoded);
 
     // Sanity checks
@@ -92,7 +93,7 @@ fn test_simple_prompt_no_template() {
     println!("No-template prompt: 'Hello' → {:?}", tokens);
     let gen = engine.generate(&tokens, 5, 0.0, 1.0);
     println!("Generated (no template, greedy): {:?}", gen);
-    let decoded = tok.decode(&gen, false);
+    let decoded = tok.decode(&gen);
     println!("Decoded: '{}'", decoded);
 }
 

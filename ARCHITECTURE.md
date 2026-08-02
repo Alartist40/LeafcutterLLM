@@ -221,6 +221,12 @@ Any engine change must keep them:
 
 - [x] **Colony dispatch brain** — `src/detect.rs`: hardware probe (CPU/RAM/GPU),
       model probe (GGUF vs safetensors), tier decision; wired into `run` + `list`.
+- [x] **Persistent model sources** — `src/config.rs`: OS-aware config file
+      (`~/.config/leafcutter/config.json`, `%APPDATA%`, `~/Library/Application
+      Support`), `leafcutter source add|remove|list` CLI + `/source` REPL command;
+      `resolve_models_dirs()` now cwd-independent (no more `cd` required).
+- [x] **OS/arch detection** — `detect::current_os()`/`current_arch()` shown in the
+      run banner; basis for the cross-platform installer/container story.
 - [x] **Tier 3 coherence proof** — Llama-3.3-70B through the adaptive streaming
       path generated coherent English (`"The capital of France is a city like no
       other,"`) at **11.5 GB peak RSS** (bounded cache; the 42 GB model never went

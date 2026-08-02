@@ -1,7 +1,8 @@
 //! LeafcutterLLM v0.9.0 — Unified CLI
 //!
 //! Friendly commands (no FFI needed, native engine):
-//!   leafcutter list                      List available GGUF models
+//!   leafcutter list                      List available models (auto-detects dirs)
+//!   leafcutter source add <dir>          Point at a folder of models (persisted)
 //!   leafcutter run <model>               Start streaming chat (Ollama-style)
 //!   leafcutter help                      Show all commands
 //!
@@ -46,7 +47,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// List available GGUF models (auto-detects ./models or ~/Downloads/models)
+    /// List available GGUF models (auto-detects ./models, ~/Downloads/models, and /source dirs)
     List,
     /// Start a streaming chat session with a model (Ollama-style, native engine)
     Run {
@@ -168,6 +169,22 @@ enum Commands {
         #[arg(short, long, default_value = "~/models")]
         dir: PathBuf,
     },
+    /// Manage the model source directories (Ollama-style `/source`)
+    Source {
+        /// Operation: add <dir>, remove <dir>, or list
+        #[command(subcommand)]
+        op: SourceOp,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum SourceOp {
+    /// Add a directory where models live (persists to ~/.config/leafcutter)
+    Add { dir: String },
+    /// Remove a previously added source directory
+    Remove { dir: String },
+    /// List configured source directories
+    List,
 }
 
 #[tokio::main]
@@ -240,6 +257,9 @@ async fn main() {
         Some(Commands::ListModels { dir }) => {
             cmd_list_models(&dir);
         }
+        Some(Commands::Source { op }) => {
+            cmd_source(op);
+        }
         None => {
             // No subcommand: print help and exit. Never bake a hardcoded
             // user path into the binary.
@@ -254,41 +274,32 @@ async fn main() {
 // Friendly commands — work without FFI (native engine only)
 // ═════════════════════════════════════════════════════════════════════════════
 
-/// Resolve the models directory: LEAF_MODELS_DIR env, then ./models, then ~/Downloads/models
-fn resolve_models_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("LEAF_MODELS_DIR") {
-        let expanded = shellexpand::tilde(&dir);
-        return PathBuf::from(expanded.as_ref());
-    }
-    let candidates = ["./models", "~/Downloads/models"];
-    for c in &candidates {
-        let expanded = shellexpand::tilde(c);
-        let p = PathBuf::from(expanded.as_ref());
-        if p.exists() {
-            return p;
-        }
-    }
-    // Default to ./models even if it doesn't exist (for error message)
-    PathBuf::from("./models")
+/// Resolve all models directories: LEAF_MODELS_DIR env, then config-file
+/// `/source` dirs, then the defaults. cwd-independent for `leafcutter`
+/// installed on PATH (default lives in ~/.local/share/leafcutter/models).
+fn resolve_models_dirs() -> Vec<PathBuf> {
+    leafcutter::config::model_dirs()
 }
 
-/// Scan models dir for .gguf files and safetensors model dirs, returning
-/// (path, size) pairs sorted by name.
-fn scan_models(dir: &PathBuf) -> Vec<(PathBuf, u64)> {
+/// Scan every models dir for .gguf files and safetensors model dirs,
+/// returning (path, size) pairs sorted by name.
+fn scan_models(dirs: &[PathBuf]) -> Vec<(PathBuf, u64)> {
     let mut models = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let is_gguf = path.extension().and_then(|s| s.to_str()) == Some("gguf");
-            let is_st_dir =
-                path.is_dir() && leafcutter::detect::looks_like_safetensors_dir(&path);
-            if is_gguf || is_st_dir {
-                let size = if is_st_dir {
-                    leafcutter::detect::model_dir_size(&path)
-                } else {
-                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
-                };
-                models.push((path, size));
+    for dir in dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let is_gguf = path.extension().and_then(|s| s.to_str()) == Some("gguf");
+                let is_st_dir =
+                    path.is_dir() && leafcutter::detect::looks_like_safetensors_dir(&path);
+                if is_gguf || is_st_dir {
+                    let size = if is_st_dir {
+                        leafcutter::detect::model_dir_size(&path)
+                    } else {
+                        std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+                    };
+                    models.push((path, size));
+                }
             }
         }
     }
@@ -520,9 +531,9 @@ fn find_model(name: &str) -> Option<PathBuf> {
     if p.exists() && (is_gguf || p.is_dir()) {
         return Some(p);
     }
-    // Scan models dir
-    let dir = resolve_models_dir();
-    let models = scan_models(&dir);
+    // Scan models dirs
+    let dirs = resolve_models_dirs();
+    let models = scan_models(&dirs);
 
     // Index number (e.g. "0", "1", "2")
     if let Ok(idx) = name.parse::<usize>() {
@@ -549,13 +560,16 @@ fn find_model(name: &str) -> Option<PathBuf> {
 }
 
 fn cmd_list_auto() {
-    let dir = resolve_models_dir();
-    eprintln!("Leaves in: {}", dir.display());
+    let dirs = resolve_models_dirs();
+    eprintln!("Leaves in:");
+    for d in &dirs {
+        eprintln!("  - {}", d.display());
+    }
     eprintln!();
-    let models = scan_models(&dir);
+    let models = scan_models(&dirs);
     if models.is_empty() {
         eprintln!("No models found.");
-        eprintln!("Download a GGUF model or a safetensors model folder and place it in: {}", dir.display());
+        eprintln!("Point the tool at your models with: leafcutter source add <dir>");
         eprintln!("Or set LEAF_MODELS_DIR=/path/to/models");
         return;
     }
@@ -566,6 +580,46 @@ fn cmd_list_auto() {
     }
     eprintln!();
     eprintln!("Run: leafcutter run <name>");
+}
+
+fn cmd_source(op: SourceOp) {
+    use leafcutter::config;
+    match op {
+        SourceOp::Add { dir } => {
+            let expanded = shellexpand::tilde(&dir).as_ref().to_string();
+            let p = PathBuf::from(&expanded);
+            if !p.exists() || !p.is_dir() {
+                eprintln!("Source dir does not exist (or is not a directory): {}", expanded);
+                std::process::exit(1);
+            }
+            match config::add_model_dir(&expanded) {
+                added if added => {
+                    eprintln!("Added source: {}", expanded);
+                    eprintln!("Run `leafcutter list` to see models from there.");
+                }
+                _ => eprintln!("Already in sources: {}", expanded),
+            }
+        }
+        SourceOp::Remove { dir } => {
+            let expanded = shellexpand::tilde(&dir).as_ref().to_string();
+            match config::remove_model_dir(&expanded) {
+                removed if removed => {
+                    eprintln!("Removed source: {}", expanded);
+                }
+                _ => eprintln!("Not in sources: {}", expanded),
+            }
+        }
+        SourceOp::List => {
+            let dirs = resolve_models_dirs();
+            if dirs.is_empty() {
+                eprintln!("No source directories configured.");
+                return;
+            }
+            for (i, d) in dirs.iter().enumerate() {
+                println!("  [{}] {}", i, d.display());
+            }
+        }
+    }
 }
 
 fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize) {
@@ -654,7 +708,7 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
     eprintln!("  ║  Arch:     {:<34}║", truncate_str(&info.architecture, 34));
     eprintln!("  ║  Layers:   {:<34}║", format!("{} layers, {} hidden", info.total_layers, info.hidden_size));
     eprintln!("  ║  Size:     {:<34}║", format!("{:.1} MB", file_mb));
-    eprintln!("  ║  Hardware: {:<34}║", format!("{} cores · {:.0} GiB free · GPU {}", hw.cpu_cores, hw.ram_available_mb as f64 / 1024.0, hw.gpu.label()));
+    eprintln!("  ║  Hardware: {:<34}║", format!("{} · {} cores · {:.0} GiB free", hw.os, hw.cpu_cores, hw.ram_available_mb as f64 / 1024.0));
     eprintln!("  ║  Tier:     {:<34}║", format!("{} — {}", tier.number(), tier.label()));
     eprintln!("  ║  Profile:  {:<34}║", truncate_str(profile.name, 34));
     eprintln!("  ║  Temp:     {:<34}║", format!("{:.2}  (top_p={:.2})", temp, top_p));
@@ -878,6 +932,45 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
                     eprintln!("  Peak RAM:    {}", format_rss(peak));
                     continue;
                 }
+                "/source" => {
+                    // Manage model source directories (persisted in ~/.config/leafcutter).
+                    use leafcutter::config;
+                    match parts.get(1).copied() {
+                        None | Some("list") => {
+                            for d in resolve_models_dirs() {
+                                eprintln!("  {}", d.display());
+                            }
+                        }
+                        Some("add") => {
+                            if let Some(dir) = parts.get(2) {
+                                let expanded = shellexpand::tilde(dir).as_ref().to_string();
+                                if config::add_model_dir(&expanded) {
+                                    eprintln!("[added source: {}]", expanded);
+                                } else {
+                                    eprintln!("[already in sources: {}]", expanded);
+                                }
+                            } else {
+                                eprintln!("Usage: /source add <dir>");
+                            }
+                        }
+                        Some("remove") => {
+                            if let Some(dir) = parts.get(2) {
+                                let expanded = shellexpand::tilde(dir).as_ref().to_string();
+                                if config::remove_model_dir(&expanded) {
+                                    eprintln!("[removed source: {}]", expanded);
+                                } else {
+                                    eprintln!("[not in sources: {}]", expanded);
+                                }
+                            } else {
+                                eprintln!("Usage: /source remove <dir>");
+                            }
+                        }
+                        Some(other) => {
+                            eprintln!("Unknown /source op: {}  (add <dir> | remove <dir> | <list>)", other);
+                        }
+                    }
+                    continue;
+                }
                 _ => {
                     eprintln!("Unknown command: {}  (try /help)", cmd);
                     continue;
@@ -1014,6 +1107,7 @@ fn print_help(temp: f32, top_p: f32, max_tokens: usize, profile: &leafcutter::pr
     eprintln!("  /info             Show loaded model info");
     eprintln!("  /stats            Show rolling session statistics");
     eprintln!("  /clear            Clear conversation + flush caches");
+    eprintln!("  /source           List model source dirs (/source add <dir>)");
     eprintln!("  /help, /?         Show this help");
     eprintln!("  /bye, /quit       Exit");
     eprintln!();
@@ -1148,11 +1242,12 @@ fn cmd_run_ollama(
 async fn cmd_serve(model_path: &str, port: u16, host: &str, engine_type: &str, benchmark: bool) {
     // If no model specified, try to auto-detect the largest one
     let model_path = if model_path.is_empty() {
-        let dir = resolve_models_dir();
-        let models = scan_models(&dir);
+        let dirs = resolve_models_dirs();
+        let models = scan_models(&dirs);
         if models.is_empty() {
-            eprintln!("No model specified and no .gguf models found in {}", dir.display());
+            eprintln!("No model specified and no .gguf models found.");
             eprintln!("Usage: leafcutter serve --model <path>");
+            eprintln!("Or: leafcutter source add <dir>  to point at your models");
             std::process::exit(1);
         }
         let (largest, _) = models.iter().max_by_key(|(_, s)| s).unwrap();

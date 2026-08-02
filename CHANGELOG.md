@@ -5,6 +5,29 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-08-02 (Ollama-style UX: /source, persistent config, OS/arch)
+
+### Added — `leafcutter source`, persistent config, cwd-independent model discovery
+
+- **New:** `src/config.rs` — OS-aware config file (`~/.config/leafcutter/config.json`
+  on Linux, `%APPDATA%` on Windows, `~/Library/Application Support` on macOS)
+  storing `model_dirs` and `last_model`. `model_dirs()` resolution order:
+  `LEAF_MODELS_DIR` env → config dirs → defaults (`./models`, `~/Downloads/models`).
+- **New:** `leafcutter source add|remove|list <dir>` CLI subcommand and the
+  `/source add|remove|list` REPL slash command — point the tool at any folder
+  of models without editing files or recompiling.
+- **Changed:** `resolve_models_dir()` → `resolve_models_dirs()` returning all
+  configured dirs; `scan_models`/`find_model`/`serve` auto-detect now scan every
+  source dir, and the binary no longer requires `cd` to the models directory.
+- **New:** `detect::current_os()` / `detect::current_arch()` surfaced in the run
+  banner (`Hardware: linux · 16 cores · 10 GiB free`) — basis for the
+  cross-platform installer story.
+- **Fixed:** `Dockerfile`/`Containerfile` referenced the dead `leaf` binary name
+  and the removed `server --batch-size` command; now build `leafcutter` and run
+  `serve --host 0.0.0.0 --port 8081` with `LEAF_MODELS_DIR=/models`.
+
+---
+
 ## [Unreleased] — 2026-08-02 (Q8_K-activation integer-dot GEMV for the streaming hot path)
 
 ### Changed — m == 1 GEMV now quantizes the activation to Q8_K and dots in integers

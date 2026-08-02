@@ -1,15 +1,17 @@
 # Dockerfile for LeafcutterLLM — safe sandboxed testing environment.
 #
-# Multi-stage build: builder compiles the `leaf` CLI, runtime is a
+# Multi-stage build: builder compiles the `leafcutter` CLI, runtime is a
 # minimal image with just the binary + models volume.
 #
 # Build:
 #   docker build -t leafcutter .
 # Run (mount your models dir):
-#   docker run -it -v ~/Downloads/models:/models leafcutter leaf list
-#   docker run -it -v ~/Downloads/models:/models leafcutter leaf run Ministral-3-3B
+#   docker run -it -v ~/Downloads/models:/models leafcutter list
+#   docker run -it -v ~/Downloads/models:/models leafcutter run Ministral-3-3B
 #
-# The container ships WITHOUT models — mount them at runtime.
+# The container ships WITHOUT models — mount them at runtime. The binary is
+# pure native (no GPU/wgpu requirement at runtime), so it runs in containers
+# and falls back to the CPU tier automatically.
 
 # ── stage 1: builder ─────────────────────────────────────────────
 FROM rust:1.97-slim AS builder
@@ -24,9 +26,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy the Rust project
 COPY rust/ ./rust/
 
-# Build the leaf CLI in release mode (no FFI — pure native)
+# Build the leafcutter CLI in release mode (no FFI — pure native)
 WORKDIR /build/rust
-RUN cargo build --release --no-default-features --bin leaf
+RUN cargo build --release --no-default-features --bin leafcutter
 
 # ── stage 2: runtime ─────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -37,14 +39,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates libgcc-s1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the leaf binary
-COPY --from=builder /build/rust/target/release/leaf /usr/local/bin/leaf
+# Copy the leafcutter binary
+COPY --from=builder /build/rust/target/release/leafcutter /usr/local/bin/leafcutter
 
 # Default models directory inside the container — mount your host
 # models dir here at runtime: -v ~/Downloads/models:/models
 RUN mkdir -p /models
 ENV LEAF_MODELS_DIR=/models
 
-# Default entrypoint is the leaf CLI
-ENTRYPOINT ["leaf"]
+# Default entrypoint is the leafcutter CLI
+ENTRYPOINT ["leafcutter"]
 CMD ["help"]

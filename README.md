@@ -75,17 +75,20 @@ Then run:
 # Reload shell
 source ~/.bashrc  # or ~/.zshrc
 
-# List your models
-leafcutter list-models --dir ~/models
+# List your models (auto-detects ./models, ~/Downloads/models, /source dirs)
+leafcutter list
 
-# Generate text
+# Point at a folder of models (persisted to ~/.config/leafcutter)
+leafcutter source add ~/Downloads/models
+
+# Interactive chat (Ollama-style)
+leafcutter run <model>
+
+# One-shot generate
 leafcutter generate --model ~/models/model.gguf --prompt "Hello world"
 
-# Interactive chat
-leafcutter chat --model ~/models/model.gguf
-
 # Start API server
-leafcutter server --model ~/models/model.gguf --port 8081
+leafcutter serve --model ~/models/model.gguf --port 8081
 ```
 
 **Requirements:** Linux/macOS, 2GB+ RAM, any 64-bit CPU. No GPU needed.
@@ -147,8 +150,13 @@ This clones the repo, builds the `leafcutter` binary, and installs it to `/usr/l
 ### Using Leafcutter
 
 ```bash
-# List available models (leaves) — auto-detects ./models or ~/Downloads/models
+# List available models (leaves) — auto-detects ./models, ~/Downloads/models, and /source dirs
 leafcutter list
+
+# Point the tool at a folder of models (persisted to ~/.config/leafcutter)
+leafcutter source add /mnt/mods
+leafcutter source remove /mnt/mods
+leafcutter source list
 
 # Start chatting (Ollama-style, streaming token output)
 leafcutter run Ministral-3-3B
@@ -166,9 +174,12 @@ In the chat REPL:
 - `/bye` or `/quit` to exit
 - `/clear` to reset conversation context
 - `/temp 0.5` to change temperature mid-session
+- `/set max 512` to change max tokens; `/set system You are...` to set the system prompt
+- `/show stats` to see rolling token/s + peak RAM
+- `/source list`, `/source add <dir>`, `/source remove <dir>` to manage model sources mid-session
 - `/help` for all commands
 
-Put your `.gguf` models in `./models/` or `~/Downloads/models/`, or set `LEAF_MODELS_DIR=/path/to/models`.
+Models auto-detect from `./models`, `~/Downloads/models`, any `/source` dirs you add, or `LEAF_MODELS_DIR=/path/to/models`.
 
 All engine optimizations carry through: async layer prefetch (default ON), anti-doom loop detection (default ON), zero-copy mmap, SIMD matmul.
 
@@ -557,8 +568,8 @@ a container image to `ghcr.io` on every push to `main`.
 
 ```bash
 docker pull ghcr.io/alartist40/leafcutterllm:latest
-docker run -it -v ~/Downloads/models:/models ghcr.io/alartist40/leafcutterllm:latest leaf list
-docker run -it -v ~/Downloads/models:/models ghcr.io/alartist40/leafcutterllm:latest leaf run Ministral-3-3B
+docker run -it -v ~/Downloads/models:/models ghcr.io/alartist40/leafcutterllm:latest list
+docker run -it -v ~/Downloads/models:/models ghcr.io/alartist40/leafcutterllm:latest run Ministral-3-3B
 ```
 
 ### Build image locally
@@ -573,14 +584,14 @@ docker build -t leafcutter:latest .
 
 ```bash
 podman run --rm -it \
-  -p 8080:8080 \
+  -p 8081:8081 \
   -v /path/to/models:/models \
-  -e MODEL_PATH=/models/tinyllama \
+  -e LEAF_MODELS_DIR=/models \
   leafcutter:latest \
-    --model /models/tinyllama \
-    --port 8080 \
-    --batch-size 8
+    serve --host 0.0.0.0 --port 8081
 ```
+
+The runtime image ships without models — mount them at `/models` (or use `leafcutter source add` inside the container). The binary is pure native and needs no GPU at runtime, so it works in containers and picks the CPU tier automatically.
 
 ### Docker Compose (optional)
 
@@ -590,22 +601,20 @@ services:
   leafcutter:
     build: .
     ports:
-      - "8080:8080"
+      - "8081:8081"
     volumes:
       - ./models:/models
     environment:
-      MODEL_PATH: /models/tinyllama
+      LEAF_MODELS_DIR: /models
     command: >
-      --model /models/tinyllama
-      --port 8080
-      --batch-size 8
+      serve --host 0.0.0.0 --port 8081
 ```
 
 ---
 
 ## API Reference
 
-### HTTP Server (`leafcutter server`)
+### HTTP Server (`leafcutter serve`)
 
 #### POST `/generate`
 

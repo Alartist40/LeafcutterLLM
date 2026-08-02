@@ -57,6 +57,10 @@ pub struct HardwareInfo {
     pub ram_total_mb: u64,
     pub ram_available_mb: u64,
     pub gpu: GpuKind,
+    /// Host OS (linux, macos, windows, ...).
+    pub os: &'static str,
+    /// CPU architecture (x86_64, aarch64, ...).
+    pub arch: &'static str,
 }
 
 impl HardwareInfo {
@@ -69,7 +73,40 @@ impl HardwareInfo {
             ram_total_mb: total,
             ram_available_mb: avail,
             gpu: probe_gpu(),
+            os: current_os(),
+            arch: current_arch(),
         }
+    }
+}
+
+/// Host OS as a short label. Compile-time; works on Linux, macOS, Windows,
+/// FreeBSD, and inside containers (it's just the kernel the binary runs on).
+pub fn current_os() -> &'static str {
+    if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "freebsd") {
+        "freebsd"
+    } else {
+        "unknown"
+    }
+}
+
+/// CPU architecture as a short label (the binary's build target).
+pub fn current_arch() -> &'static str {
+    if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "arm") {
+        "arm"
+    } else if cfg!(target_arch = "riscv64") {
+        "riscv64"
+    } else {
+        "unknown"
     }
 }
 
