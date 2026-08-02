@@ -189,6 +189,24 @@ impl ModelArchitecture {
                 ("ssm_state.weight",       "ssm_state.weight"),
                 ("ssm_gate.weight",        "ssm_gate.weight"),
             ],
+            ModelArchitecture::Qwen2 => &[
+                // Attention — Qwen2 uses separate Q/K/V projections WITH
+                // per-projection biases (unlike Llama, which has none).
+                ("attn_q.weight",  "self_attn.q_proj.weight"),
+                ("attn_k.weight",  "self_attn.k_proj.weight"),
+                ("attn_v.weight",  "self_attn.v_proj.weight"),
+                ("attn_output.weight", "self_attn.o_proj.weight"),
+                ("attn_q.bias",    "self_attn.q_proj.bias"),
+                ("attn_k.bias",    "self_attn.k_proj.bias"),
+                ("attn_v.bias",    "self_attn.v_proj.bias"),
+                // FFN
+                ("ffn_gate.weight", "mlp.gate_proj.weight"),
+                ("ffn_up.weight",   "mlp.up_proj.weight"),
+                ("ffn_down.weight", "mlp.down_proj.weight"),
+                // Norms
+                ("attn_norm.weight", "input_layernorm.weight"),
+                ("ffn_norm.weight",  "post_attention_layernorm.weight"),
+            ],
             ModelArchitecture::Gemma => &[
                 // Attention — Gemma's G layers use separate Q/K/V; S layers fuse Q+V
                 ("attn_q.weight", "self_attn.q_proj.weight"),

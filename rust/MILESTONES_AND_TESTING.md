@@ -1,8 +1,32 @@
 # LeafcutterLLM — Milestones & Testing Record
 
-**Last updated:** 2026-08-01 (project wrap-up)
-**Git commit:** Uncommitted wrap-up work (GPT-2 byte decode fix, Q6_K lm_head block cache, streaming UTF-8 buffer, 3 stale tests fixed)
-**Total tests:** **161 passed**, **0 failures**, **3 ignored** (GPU/bench tests) — `cargo test --release --lib`
+**Last updated:** 2026-08-02 (Q8_K-activation GEMV for the streaming hot path)
+**Git commit:** Uncommitted (GPT-2 byte decode fix, Q6_K lm_head block cache, streaming UTF-8 buffer, Q8_K integer-dot GEMV, 8 new tests)
+**Total tests:** **169 passed**, **0 failures**, **3 ignored** (GPU/bench tests) — `cargo test --release --lib`
+
+---
+
+## 2026-08-02 — Q8_K-activation integer-dot GEMV (m == 1 default)
+
+- **Q8_K activation quantization** — `src/kernels/q8_k.rs`: `block_q8_K`
+  byte-identical to llama.cpp, `quantize_row_q8_k` (llama.cpp ref algorithm),
+  scalar Q4_K/Q6_K integer-dot references verified against f32 dequant+dot
+  within 1e-3.
+- **AVX2 integer dots** — `src/kernels/q8_k_gemm.rs`: per-column Q4_K×Q8_K
+  (`_mm256_maddubs_epi16` + scale/min unpack + `dmin` correction) and Q6_K×Q8_K
+  (-32 offset folded into `32 * sum(scales * bsums)`), ported from llama.cpp
+  `ggml_vec_dot_q4_K_q8_K` / `ggml_vec_dot_q6_K_q8_K`. Verified vs scalar refs
+  within 1e-3.
+- **Default m == 1 GEMV** — the activation is quantized to Q8_K once per matmul
+  then every output column dots in integers (rayon for n >= 4096). Opt-out:
+  `LEAFCUTTER_Q8_GEMV=0`.
+- **Real-model validation** — greedy-argmax first-token probes identical on all
+  4 prompts; full 248,320-logit vector diff vs f32 path: max 0.19, RMS 0.038;
+  end-to-end streaming coherent.
+- **Perf (isolated kernel bench, AVX2):** Q4_K FFN 1.51→1.27 ms (-16%), Q6_K
+  1.80→1.31 ms (-27%), Q6_K lm_head 36.6→33.5 ms (-8.5%). End-to-end
+  `token-fwd` ≈ 290 ms/token; gains masked by machine-load variance in full runs.
+- **Test count**: `cargo test --release --lib` → **169 passed, 0 failed, 3 ignored**.
 
 ---
 

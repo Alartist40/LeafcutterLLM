@@ -61,8 +61,10 @@ enum Commands {
         /// Max tokens per response
         #[arg(long, default_value_t = 256)]
         max_tokens: usize,
-        /// Engine backend: "native" (default) or "ollama" (HTTP API)
-        #[arg(long, default_value = "native")]
+        /// Engine backend: "auto" (default — detect format & hardware),
+        /// "native" (GGUF Rust engine), "safetensor" (Python reference),
+        /// or "ollama" (HTTP API)
+        #[arg(long, default_value = "auto")]
         engine: String,
         /// Ollama host (when --engine ollama is selected)
         #[arg(long, default_value = "http://127.0.0.1:11434")]
@@ -270,16 +272,23 @@ fn resolve_models_dir() -> PathBuf {
     PathBuf::from("./models")
 }
 
-/// Scan models dir for .gguf files, return (path, size) pairs sorted by name
+/// Scan models dir for .gguf files and safetensors model dirs, returning
+/// (path, size) pairs sorted by name.
 fn scan_models(dir: &PathBuf) -> Vec<(PathBuf, u64)> {
     let mut models = Vec::new();
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
-                if let Ok(meta) = std::fs::metadata(&path) {
-                    models.push((path, meta.len()));
-                }
+            let is_gguf = path.extension().and_then(|s| s.to_str()) == Some("gguf");
+            let is_st_dir =
+                path.is_dir() && leafcutter::detect::looks_like_safetensors_dir(&path);
+            if is_gguf || is_st_dir {
+                let size = if is_st_dir {
+                    leafcutter::detect::model_dir_size(&path)
+                } else {
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+                };
+                models.push((path, size));
             }
         }
     }
@@ -505,9 +514,10 @@ fn cmd_run_safetensor(model_arg: &str, mut temp: f32, _top_p: f32, mut max_token
 
 /// Find a model by fuzzy name match (case-insensitive substring)
 fn find_model(name: &str) -> Option<PathBuf> {
-    // Direct path
+    // Direct path: a .gguf file, or an existing directory (safetensors model folder)
     let p = PathBuf::from(shellexpand::tilde(name).as_ref());
-    if p.exists() && p.extension().and_then(|s| s.to_str()) == Some("gguf") {
+    let is_gguf = p.extension().and_then(|s| s.to_str()) == Some("gguf");
+    if p.exists() && (is_gguf || p.is_dir()) {
         return Some(p);
     }
     // Scan models dir
@@ -544,14 +554,15 @@ fn cmd_list_auto() {
     eprintln!();
     let models = scan_models(&dir);
     if models.is_empty() {
-        eprintln!("No .gguf models found.");
-        eprintln!("Download a model and place it in: {}", dir.display());
+        eprintln!("No models found.");
+        eprintln!("Download a GGUF model or a safetensors model folder and place it in: {}", dir.display());
         eprintln!("Or set LEAF_MODELS_DIR=/path/to/models");
         return;
     }
     for (i, (path, size)) in models.iter().enumerate() {
         let name = path.file_name().unwrap().to_string_lossy();
-        println!("  [{}] {:<50} {}", i, name, format_size(*size));
+        let kind = if path.is_dir() { "[safetensors]" } else { "" };
+        println!("  [{}] {:<50} {} {}", i, name, format_size(*size), kind);
     }
     eprintln!();
     eprintln!("Run: leafcutter run <name>");
@@ -573,6 +584,30 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
     };
     let path_str = path.to_string_lossy().to_string();
 
+    // ── Colony dispatch ─────────────────────────────────────────────
+    // A single `leafcutter run` opens a window to any model: safetensors
+    // directories route to the reference Python backend; GGUF stays on the
+    // native Rust engine (which self-tunes cache vs streaming by RAM).
+    use leafcutter::detect::{choose_tier, probe_hardware, probe_model, ModelKind, Tier};
+    let probe = probe_model(&path);
+    match probe.kind {
+        ModelKind::Safetensors => {
+            eprintln!(
+                "  🌿 [safetensors dir] → reference Python backend ({:.1} MB)",
+                probe.size_mb()
+            );
+            cmd_run_safetensor(&path_str, temp, top_p, max_tokens);
+            return;
+        }
+        ModelKind::Unknown => {
+            eprintln!(
+                "  ⚠️  Model format of '{}' is not recognised (not .gguf, no safetensors shards).",
+                path.display()
+            );
+        }
+        ModelKind::Gguf => {}
+    }
+
     let mut engine = match Engine::load(&path_str) {
         Ok(e) => e,
         Err(e) => {
@@ -582,6 +617,13 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
     };
 
     let info = engine.info();
+
+    // ── Colony dispatch info: hardware + tier for the banner ────────
+    let hw = probe_hardware();
+    let prefer_gpu =
+        std::env::var("LEAFCUTTER_PREFER_GPU").map(|v| v == "1").unwrap_or(false);
+    let tier = choose_tier(hw.gpu, hw.ram_available_mb, probe.size_bytes, prefer_gpu);
+    let _ = Tier::Gpu; // (Tier 1 reported when a GPU backend ships)
 
     // Resolve the per-architecture profile (Ollama Modelfile-style).
     let gguf_for_profile = GGUFile::open(&path_str).ok();
@@ -612,6 +654,8 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
     eprintln!("  ║  Arch:     {:<34}║", truncate_str(&info.architecture, 34));
     eprintln!("  ║  Layers:   {:<34}║", format!("{} layers, {} hidden", info.total_layers, info.hidden_size));
     eprintln!("  ║  Size:     {:<34}║", format!("{:.1} MB", file_mb));
+    eprintln!("  ║  Hardware: {:<34}║", format!("{} cores · {:.0} GiB free · GPU {}", hw.cpu_cores, hw.ram_available_mb as f64 / 1024.0, hw.gpu.label()));
+    eprintln!("  ║  Tier:     {:<34}║", format!("{} — {}", tier.number(), tier.label()));
     eprintln!("  ║  Profile:  {:<34}║", truncate_str(profile.name, 34));
     eprintln!("  ║  Temp:     {:<34}║", format!("{:.2}  (top_p={:.2})", temp, top_p));
     eprintln!("  ║  Max tok:  {:<34}║", format!("{}", max_tokens));
@@ -1542,18 +1586,29 @@ fn cmd_list_models(dir: &PathBuf) {
     if let Ok(entries) = std::fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("gguf") {
+            let is_gguf = path.extension().and_then(|s| s.to_str()) == Some("gguf");
+            let is_st_dir =
+                path.is_dir() && leafcutter::detect::looks_like_safetensors_dir(&path);
+            if is_gguf || is_st_dir {
                 found = true;
-                let size = std::fs::metadata(&path)
-                    .map(|m| format_size(m.len()))
-                    .unwrap_or_else(|_| "?".into());
-                println!("  {:<50} {}", path.file_name().unwrap_or_default().to_string_lossy(), size);
+                let size = if is_st_dir {
+                    leafcutter::detect::model_dir_size(&path)
+                } else {
+                    std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0)
+                };
+                let kind = if is_st_dir { "[safetensors]" } else { "" };
+                println!(
+                    "  {:<44} {} {}",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    format_size(size),
+                    kind
+                );
             }
         }
     }
 
     if !found {
-        eprintln!("No .gguf models found in {}", dir.display());
+        eprintln!("No models found in {}", dir.display());
         eprintln!("Download models with: cynapse model download <hf-id> <filename>");
     }
 }

@@ -5,6 +5,59 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-08-02 (Q8_K-activation integer-dot GEMV for the streaming hot path)
+
+### Changed — m == 1 GEMV now quantizes the activation to Q8_K and dots in integers
+
+For single-token streaming (FFN gate/up, lm_head), every output column was
+computed by dequantizing each Q4_K/Q6_K weight block to f32 and running 256 f32
+FMAs. It now quantizes the activation vector to Q8_K once per matmul and
+computes each column dot in the integer domain with `_mm256_maddubs_epi16`
+(16 MACs per instruction), ported from llama.cpp's `ggml_vec_dot_q4_K_q8_K` /
+`ggml_vec_dot_q6_K_q8_K`.
+
+- **New:** `src/kernels/q8_k.rs` — `block_q8_K` ({f32 d, i8 qs[256], i16
+  bsums[16]}) byte-identical to llama.cpp, `quantize_row_q8_k` (llama.cpp
+  `quantize_row_q8_K_ref`: iscale = -127/max, bsums per 16), scalar Q4_K/Q6_K
+  integer-dot references.
+- **New:** `src/kernels/q8_k_gemm.rs` — AVX2 per-column Q4_K×Q8_K (scale/min
+  unpack from the 12-byte scales field, `dmin` correction, scale-shuffle
+  broadcast) and Q6_K×Q8_K (the -32 offset folded into `32 * sum(scales *
+  bsums)`) kernels, plus m==1 dispatchers (rayon for n >= 4096).
+- **Dispatch:** `q4_k_matmul_transposed_b` / `q6_k_matmul_transposed_b` use the
+  Q8_K path for m == 1 by default; the f32 fused GEMV remains as the opt-out
+  (`LEAFCUTTER_Q8_GEMV=0`).
+- **Correctness:** AVX2 kernels match their scalar references within 1e-3; the
+  scalar integer-dot math matches the f32 dequant+dot reference within 1e-3.
+  Real-model validation: greedy-argmax first-token probes identical on all 4
+  prompts; full 248,320-logit vector diff vs the f32 path has max abs diff 0.19
+  and RMS 0.038 (logit magnitudes ~12); end-to-end streaming still coherent.
+- **Tests:** 169 passed, 0 failed, 3 ignored (was 161). Two existing
+  "fused matches transposed-b" tests were reworked: the f32 fused kernel is
+  verified tightly against the f32 reference, and the Q8 default dispatch is
+  verified exactly against the Q8 scalar reference (the Q8-vs-f32 divergence is
+  inherent activation quantization and is validated on the real model).
+
+### Performance (isolated kernel micro-benchmark, AVX2, m == 1)
+
+| Matmul (k=4096) | f32 fused | Q8_K integer | Δ |
+|------------------|-----------|--------------|---|
+| Q4_K n=12288 (FFN gate/up) | 1.51 ms | 1.27 ms | -16% |
+| Q6_K n=12288 | 1.80 ms | 1.31 ms | -27% |
+| Q6_K n=248320 (lm_head) | 36.6 ms | 33.5 ms | -8.5% |
+
+End-to-end streaming `token-fwd` ≈ 290 ms/token (best case ~3.4 tok/s); gains
+are partly masked by machine load variance. RAM unchanged (~6 GB steady state;
+the Q8_K activation buffer is a few KB per matmul, freed each call).
+
+### Added — diagnostic bins
+
+- `src/bin/logit_diff.rs` — prints top-K (or with `--all`, the full vector) of a
+  single forward pass for diffing two runs (e.g. Q8 on/off).
+- `src/bin/gemv_bench.rs` — isolated Q4_K/Q6_K f32-vs-Q8_K GEMV micro-benchmark.
+
+---
+
 ## [Unreleased] — 2026-08-01 (Project wrap-up: correct UTF-8 streaming + Q6_K lm_head cache, test suite green)
 
 ### Fixed — GPT-2 byte-level decode (emoji / Latin-1 corruption)

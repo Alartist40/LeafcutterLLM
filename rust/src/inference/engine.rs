@@ -71,6 +71,10 @@ pub struct Engine {
     /// Cached lm_head projection buffer size; avoids per-token resize on
     /// thread-local buffers in `lm_head_projection`.
     cached_lm_head_size: std::sync::atomic::AtomicUsize,
+    /// Whether the mmap pages have been released after the layer cache warmed.
+    /// All 32 layer weight sets are then served from the RAM layer cache, so
+    /// the file-backed pages are a redundant second copy (~model size).
+    pages_dropped: bool,
     /// Current sequence position offset for RoPE. Tracks total tokens processed
     /// across forward calls within a generation session.
     pub seq_offset: usize,
@@ -204,6 +208,7 @@ impl Engine {
             gguf_path: path.to_string(),
             cached_tokenizer: std::sync::Mutex::new(None),
             cached_lm_head_size: std::sync::atomic::AtomicUsize::new(0),
+            pages_dropped: true,
             seq_offset: 0,
             #[cfg(feature = "llama-ffi")]
             ffi_model: Some(model),
@@ -340,11 +345,20 @@ impl Engine {
         // Don't keep embed in RAM — use mmap per-row lookup instead.
         special_weights.remove("model.embed_tokens.weight");
 
-        // LM head: load once, cache as f32 (~4 GB for 248K×4096).
-        // Avoids re-dequantizing from mmap every token (~372ms → ~2ms).
+        // LM head: cache the Q6_K blocks once (~0.8 GB for Ornith) to avoid
+        // re-dequantizing from mmap every token (~372ms → ~2ms).  Only for
+        // models that fit in RAM: a huge output.weight (e.g. 70B ≈ 8.8 GB
+        // resident) would blow the "large model on small hardware" budget, so
+        // it falls back to the per-row mmap path instead.  Override with
+        // `LEAFCUTTER_CACHE_HEAD=0`.
         let lm_head_tied = !model.file.get_tensor_info("output.weight").is_some();
         let lm_head_tensor_name = if lm_head_tied { "token_embd.weight" } else { "output.weight" };
-        let cached_lm_head = load_lm_head_cache(&model, lm_head_tensor_name);
+        let cache_head = std::env::var("LEAFCUTTER_CACHE_HEAD").map(|v| v != "0").unwrap_or(true);
+        let cached_lm_head = if cache_head && model.model_fits_available_ram() {
+            load_lm_head_cache(&model, lm_head_tensor_name)
+        } else {
+            None
+        };
         special_weights.remove(lm_head_tensor_name);
 
         // Embedding lookup is done on-demand via mmap per-row dequantization.
@@ -392,6 +406,7 @@ impl Engine {
             deltanet_cache: DeltaNetStateCache::new(),
             gguf_path: path.to_string(),
             cached_tokenizer: std::sync::Mutex::new(None),
+            pages_dropped: false,
             seq_offset: 0,
             #[cfg(feature = "llama-ffi")]
             ffi_model: None,
@@ -1108,18 +1123,9 @@ impl Engine {
 
                     if has_standard_attn {
                         let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
-                        if std::env::var("LEAFCUTTER_DEBUG_LAYERS").is_ok() {
-                            let l2 = attn_out.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
-                            eprintln!("  [layer {layer_idx}] attn_out l2={l2:.3}");
-                        }
                         hidden = hidden.add(&attn_out);
                     } else if has_deltanet {
                         let deltanet_out = deltanet_forward(&normed, &layer_weights, &self.deltanet_params, &mut self.deltanet_cache, layer_idx);
-                        if std::env::var("LEAFCUTTER_DEBUG_LAYERS").is_ok() {
-                            let l2 = deltanet_out.data.iter().map(|&v| v * v).sum::<f32>().sqrt();
-                            let max = deltanet_out.data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                            eprintln!("  [layer {layer_idx}] deltanet_out l2={l2:.3} max={max:.4}");
-                        }
                         hidden = hidden.add(&deltanet_out);
                     } else if has_ssm {
                         let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
@@ -1148,15 +1154,11 @@ impl Engine {
                 // next iteration reuses them via `get_layer`. The old Arc
                 // reference is released when we reassign below.
 
-                // MADV_DONTNEED on the whole mmap is OFF by default (Phase 5):
-                // evicting the model from the OS page cache every layer forced
-                // a full disk re-read per token (~16× slowdown). Layers are now
-                // served from the RAM cache, so the mmap only needs the embed
-                // table + first-load paths. Opt back in for RAM-constrained
-                // systems with LEAFCUTTER_DROP_PAGES=1.
-                if std::env::var("LEAFCUTTER_DROP_PAGES").map(|v| v == "1").unwrap_or(false) {
-                    self.model.file.drop_pages_from_cache();
-                }
+                // MADV_DONTNEED on the whole mmap is NOT applied per layer:
+                // evicting pages every layer would force disk re-reads while
+                // the cache is still cold. Instead the pages are dropped ONCE
+                // after the first forward pass (see end of this fn), when every
+                // layer is already resident in the RAM layer cache.
 
                 if let Some(h) = prefetch.take() {
                     layer_weights = h.join()
@@ -1182,6 +1184,24 @@ impl Engine {
             }
             Ok(())
         })?;
+
+        // ── One-shot mmap page release ──────────────────────────────────
+        // After the first forward pass every layer's weights live in the RAM
+        // layer cache, so the file-backed mmap pages are a redundant second
+        // copy. Release them once (MADV_DONTNEED) to free ~model-size RSS.
+        // The embed table + lm_head rows still fault in on demand (~KB/token).
+        //
+        // Only safe when the FULL model is resident in the layer cache.  For
+        // huge models that exceed the cache budget, evicted layers stream from
+        // the mmap every token, so we must keep the kernel page cache warm.
+        // Skipped when the layer cache is disabled (LEAFCUTTER_NO_CACHE=1) —
+        // in that mode weights are re-read from the mmap every token.
+        let cache_enabled = std::env::var("LEAFCUTTER_NO_CACHE").map(|v| v != "1").unwrap_or(true);
+        if !self.pages_dropped && cache_enabled && self.model.all_layers_cached() {
+            self.model.file.drop_pages_from_cache();
+            self.pages_dropped = true;
+        }
+
         // Final norm        // Final norm        // Final norm
         let final_norm = self
             .special_weights

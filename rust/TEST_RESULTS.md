@@ -1,10 +1,31 @@
 # Leafcutter-RS Test Results
-**Date:** 2026-08-01 (refreshed at project wrap-up)
+**Date:** 2026-08-02 (refreshed after Q8_K-activation GEMV work)
 **Project:** Full Rust Rewrite of LeafcutterLLM (Option C)
 **Target:** x86_64 (AVX2/FMA)
 **Model:** Ornith-1.0-9B-Q4_K_M / Q6_K GGUF (native GGUF engine)
 
 > Latest summary below; older per-date sections below remain as historical record.
+
+## Test Suite Status as of 2026-08-02
+
+- **169 tests pass** (`cargo test --release --lib`), **0 failures**, **3 ignored**
+  (GPU tests in `backend::wgpu::tests`). Up from 161 on 2026-08-01: +8 tests added
+  for the new Q8_K integer-dot GEMV path.
+- **New kernels:** `src/kernels/q8_k.rs` (Q8_K block + quantizer + scalar Q4_K/Q6_K
+  dot references) and `src/kernels/q8_k_gemm.rs` (AVX2 per-column integer dots +
+  m==1 dispatchers). AVX2 kernels verified against their scalar references within
+  1e-3; scalar integer-dot math verified against the f32 dequant+dot reference
+  within 1e-3.
+- **Logits equivalence on real model** (Ornith-1.0-9B): greedy-argmax first-token
+  probes unchanged on all 4 prompts; full 248,320-element logit vector diff vs the
+  pre-Q8 f32 path: max abs diff 0.19, RMS 0.038 (logit magnitude ~12). End-to-end
+  generation still coherent ("What is 2+2?" → "4").
+- **m == 1 GEMV now defaults to the Q8_K integer-dot path** (opt-out:
+  `LEAFCUTTER_Q8_GEMV=0`). f32 fused GEMV retained as fallback + opt-out.
+- **Functional:** `leafcutter run ornith` streams coherent thinking + answer,
+  steady-state RSS ~6 GB, with correct emoji/Latin-1 streaming.
+
+---
 
 ## Test Suite Status as of 2026-08-01 (project wrap-up)
 

@@ -76,6 +76,20 @@ pub fn apply_rotary_emb(x: &mut Tensor, seq_len: usize, num_heads: usize, head_d
     }
 }
 
+/// Add a per-channel bias vector to every row of an [S, D] tensor.
+/// `bias` must have length D (the second dimension of `x`).
+fn add_bias_inplace(x: &mut Tensor, bias: &Tensor) {
+    let n_rows = x.data.len() / x.shape[1];
+    let d = x.shape[1];
+    debug_assert_eq!(bias.data.len(), d, "bias len {} != row width {}", bias.data.len(), d);
+    for r in 0..n_rows {
+        let base = r * d;
+        for c in 0..d {
+            x.data[base + c] += bias.data[c];
+        }
+    }
+}
+
 /// Apply per-head RMSNorm to Q or K before RoPE.
 /// Input is flat [seq_len * num_heads * head_dim], output is same shape.
 fn apply_per_head_rms_norm(data: &[f32], num_heads: usize, head_dim: usize, weight: &Tensor, eps: f32) -> Vec<f32> {
@@ -147,11 +161,23 @@ pub fn attention_forward(
         let v_proj = weights.get("self_attn.v_proj.weight")
             .or_else(|| weights.get("attn_v.weight"))
             .expect("Missing v_proj");
-        (
-            hidden_states.matmul(q_proj),
-            hidden_states.matmul(k_proj),
-            hidden_states.matmul(v_proj),
-        )
+
+        // Qwen2 (and other bias-carrying families) add a per-projection bias
+        // to Q/K/V after the matmul.  Llama-family GGUFs carry no such bias
+        // tensors, so the lookup simply misses and we skip the add.
+        let mut q = hidden_states.matmul(q_proj);
+        let mut k = hidden_states.matmul(k_proj);
+        let mut v = hidden_states.matmul(v_proj);
+        if let Some(bias) = weights.get("self_attn.q_proj.bias") {
+            add_bias_inplace(&mut q, bias);
+        }
+        if let Some(bias) = weights.get("self_attn.k_proj.bias") {
+            add_bias_inplace(&mut k, bias);
+        }
+        if let Some(bias) = weights.get("self_attn.v_proj.bias") {
+            add_bias_inplace(&mut v, bias);
+        }
+        (q, k, v)
     };
 
     // -------------------------------------------------------------------------

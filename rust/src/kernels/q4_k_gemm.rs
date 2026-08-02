@@ -8,6 +8,7 @@
 //! Q4_K weights are dequantized on-the-fly inside the kernel using
 //! a 256-element stack buffer (1024 bytes) per block.
 
+use super::q4_k::get_scale_min_k4;
 use super::q4_k::Matrix as Q4KMatrix;
 
 // ============================================================================
@@ -177,6 +178,20 @@ pub unsafe fn q4_k_matmul_neon(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usize
 pub fn q4_k_matmul_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
     assert_eq!(b.cols, k, "B cols ({}) must match k ({}) in transposed mode", b.cols, k);
     assert_eq!(b.rows, n, "B rows ({}) must match n ({}) in transposed mode", b.rows, n);
+
+    // Fused GEMV fast path (the token-generation hot case): no temp buffer.
+    if m == 1 {
+        // Q8_K-activation integer-dot path is the default (faster); the f32
+        // fused GEMV below remains as the opt-out (`LEAFCUTTER_Q8_GEMV=0`).
+        let disabled = std::env::var("LEAFCUTTER_Q8_GEMV").map(|v| v == "0").unwrap_or(false);
+        if !disabled {
+            crate::kernels::q8_k_gemm::q4_k_matmul_transposed_b_q8(a, b, c, m, k, n);
+            return;
+        }
+        q4_k_gemv_transposed_b(a, b, c, k, n);
+        return;
+    }
+
     let bpr = b.blocks_per_row(); // = k / 256
 
     for v in c.iter_mut() { *v = 0.0; }
@@ -200,28 +215,34 @@ pub fn q4_k_matmul_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usiz
         }
     };
 
-    // For large matrices, parallelize over output columns.
+    // For large matrices, parallelize over output columns into a flat
+    // per-column buffer (no Vec<Vec<f32>> allocation churn), then scatter
+    // into the row-major output. Each column j owns a contiguous m-slice.
     // Threshold: n >= 4096 ensures enough work per thread to amortize Rayon overhead.
     if n >= 4096 {
         use rayon::prelude::*;
-        let col_results: Vec<Vec<f32>> = (0..n)
-            .into_par_iter()
-            .map(|j| {
-                TEMP_BUF.with(|buf| {
-                    let mut temp = buf.borrow_mut();
-                    temp.resize(k, 0.0);
-                    COL_BUF.with(|cbuf| {
-                        let mut col = cbuf.borrow_mut();
-                        col.resize(m, 0.0);
-                        compute_col(j, &mut temp, &mut col);
-                        col.clone()
-                    })
-                })
-            })
-            .collect();
+        let mut col_results = vec![0.0f32; n * m];
+        col_results.par_chunks_mut(m).enumerate().for_each(|(j, col)| {
+            TEMP_BUF.with(|buf| {
+                let mut temp = buf.borrow_mut();
+                temp.resize(k, 0.0);
+                let row_base = j * bpr;
+                for block_idx in 0..bpr {
+                    let block = &b.blocks[row_base + block_idx];
+                    let base = block_idx * 256;
+                    block.dequantize(&mut temp[base..base + 256]);
+                }
+                for i in 0..m {
+                    col[i] = crate::kernels::simd::simd_dot_product(
+                        &a[i * k..(i + 1) * k],
+                        &temp,
+                    );
+                }
+            });
+        });
         for j in 0..n {
             for i in 0..m {
-                c[i * n + j] = col_results[j][i];
+                c[i * n + j] = col_results[j * m + i];
             }
         }
     } else {
@@ -239,6 +260,129 @@ pub fn q4_k_matmul_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usiz
                 }
             })
         });
+    }
+}
+
+// ============================================================================
+// Fused GEMV (m == 1) — the token-generation hot path
+// ============================================================================
+//
+// For a single query vector a[0..k] (m=1), compute c[j] = dot(a, B[j, :]) for
+// every output column j. Dequantization and the dot product are FUSED: each
+// block's 256 values are dequantized straight into ymm registers and FMA'd
+// against the corresponding a-slice, so nothing is round-tripped through a
+// f32 temp buffer. This is the biggest win for streaming decode.
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn q4_k_gemv_col_avx2(a: &[f32], b: &Q4KMatrix, col: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let bpr = b.blocks_per_row();
+    let row_base = col * bpr;
+    let nibble_mask = _mm_set1_epi8(0x0F);
+    let mut acc = _mm256_setzero_ps();
+    let mut a_off = 0usize;
+
+    for block_idx in 0..bpr {
+        let block = &b.blocks[row_base + block_idx];
+        for group in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(group * 2, &block.scales);
+            let (sc2, m2) = get_scale_min_k4(group * 2 + 1, &block.scales);
+            let dl1 = block.d * sc1 as f32;
+            let dl2 = block.d * sc2 as f32;
+            let min1 = block.dmin * m1 as f32;
+            let min2 = block.dmin * m2 as f32;
+            let dl1_v = _mm256_set1_ps(dl1);
+            let dl2_v = _mm256_set1_ps(dl2);
+            let min1_v = _mm256_set1_ps(min1);
+            let min2_v = _mm256_set1_ps(min2);
+
+            for chunk in 0..4 {
+                let off = chunk * 8;
+                let raw = _mm_loadl_epi64(block.qs.as_ptr().add(group * 32 + off) as *const __m128i);
+
+                // Low nibbles: dequant = dl1 * (qs & 0x0F) - min1
+                let lo = _mm_and_si128(raw, nibble_mask);
+                let lo_f32 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(lo));
+                let deq_lo = _mm256_fmsub_ps(dl1_v, lo_f32, min1_v);
+                let a_lo = _mm256_loadu_ps(a.as_ptr().add(a_off + off));
+                acc = _mm256_fmadd_ps(a_lo, deq_lo, acc);
+
+                // High nibbles: dequant = dl2 * (qs >> 4 & 0x0F) - min2
+                let hi = _mm_and_si128(_mm_srli_epi16(raw, 4), nibble_mask);
+                let hi_f32 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(hi));
+                let deq_hi = _mm256_fmsub_ps(dl2_v, hi_f32, min2_v);
+                let a_hi = _mm256_loadu_ps(a.as_ptr().add(a_off + 32 + off));
+                acc = _mm256_fmadd_ps(a_hi, deq_hi, acc);
+            }
+            a_off += 64;
+        }
+    }
+
+    // Horizontal 8-lane reduce
+    let lo = _mm256_castps256_ps128(acc);
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let s = _mm_add_ps(lo, hi);
+    let s = _mm_hadd_ps(s, s);
+    let s = _mm_hadd_ps(s, s);
+    _mm_cvtss_f32(s)
+}
+
+/// Scalar fused GEMV reference (matches dequantize_scalar bit-for-bit).
+fn q4_k_gemv_col_scalar(a: &[f32], b: &Q4KMatrix, col: usize) -> f32 {
+    let bpr = b.blocks_per_row();
+    let row_base = col * bpr;
+    let mut acc = 0.0f32;
+    let mut a_off = 0usize;
+
+    for block_idx in 0..bpr {
+        let block = &b.blocks[row_base + block_idx];
+        let mut q_off = 0usize;
+        for group in 0..4 {
+            let (sc1, m1) = get_scale_min_k4(group * 2, &block.scales);
+            let (sc2, m2) = get_scale_min_k4(group * 2 + 1, &block.scales);
+            let dl1 = block.d * sc1 as f32;
+            let dl2 = block.d * sc2 as f32;
+            let min1 = block.dmin * m1 as f32;
+            let min2 = block.dmin * m2 as f32;
+            for l in 0..32 {
+                acc += a[a_off + l] * (dl1 * (block.qs[q_off + l] & 0x0F) as f32 - min1);
+                acc += a[a_off + l + 32] * (dl2 * (block.qs[q_off + l] >> 4) as f32 - min2);
+            }
+            a_off += 64;
+            q_off += 32;
+        }
+    }
+    acc
+}
+
+/// Fused GEMV dispatch for m == 1. Writes into c[0..n].
+pub fn q4_k_gemv_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], k: usize, n: usize) {
+    assert_eq!(b.cols, k, "B cols ({}) must match k ({}) in transposed mode", b.cols, k);
+    assert_eq!(b.rows, n, "B rows ({}) must match n ({}) in transposed mode", b.rows, n);
+    let use_avx2 = cfg!(target_arch = "x86_64")
+        && std::arch::is_x86_feature_detected!("avx2")
+        && std::arch::is_x86_feature_detected!("fma");
+
+    if n >= 4096 {
+        use rayon::prelude::*;
+        if use_avx2 {
+            c.par_iter_mut().enumerate().for_each(|(j, out)| {
+                *out = unsafe { q4_k_gemv_col_avx2(a, b, j) };
+            });
+        } else {
+            c.par_iter_mut().enumerate().for_each(|(j, out)| {
+                *out = q4_k_gemv_col_scalar(a, b, j);
+            });
+        }
+    } else if use_avx2 {
+        for (j, out) in c.iter_mut().enumerate() {
+            *out = unsafe { q4_k_gemv_col_avx2(a, b, j) };
+        }
+    } else {
+        for (j, out) in c.iter_mut().enumerate() {
+            *out = q4_k_gemv_col_scalar(a, b, j);
+        }
     }
 }
 
@@ -346,6 +490,43 @@ mod tests {
         for i in 0..c_dispatched.len() {
             assert!((c_dispatched[i] - expected[i]).abs() < 1e-2,
                 "dispatched mismatch at {}: got {}, expected {}", i, c_dispatched[i], expected[i]);
+        }
+    }
+
+    #[test]
+    fn test_q4_k_gemv_fused_matches_transposed_b() {
+        // The m == 1 dispatch defaults to the Q8_K-activation integer-dot
+        // path. Verify the dispatch exactly matches the Q8_K scalar
+        // reference, and stays within a loose envelope of the f32 fused
+        // GEMV (the Q8_K activation quantization is an approximation whose
+        // absolute error is data-dependent; real-model closeness is checked
+        // separately via logit_diff).
+        let m = 1;
+        let k = 1024;
+        let n = 2048;
+        let a: Vec<f32> = (0..(m * k)).map(|i| (i as f32).sin() * 0.7).collect();
+        let b_q4 = make_test_matrix(n, k);
+
+        let mut a_blocks = vec![crate::kernels::q8_k::Q8KBlock::default(); k / QK_K];
+        crate::kernels::q8_k::quantize_row_q8_k(&a, &mut a_blocks);
+
+        // (a) exact Q8_K scalar reference per column.
+        let mut c_q8_scalar = vec![0.0f32; m * n];
+        for j in 0..n {
+            let row_base = j * (k / QK_K);
+            c_q8_scalar[j] = crate::kernels::q8_k::q4_k_dot_q8_k_scalar(
+                &b_q4.blocks[row_base..row_base + (k / QK_K)],
+                &a_blocks,
+            );
+        }
+
+        // (b) Q8_K default dispatch must match the Q8_K scalar reference.
+        let mut c_dispatch = vec![0.0f32; m * n];
+        q4_k_matmul_transposed_b(&a, &b_q4, &mut c_dispatch, m, k, n);
+        for i in 0..n {
+            let tol = 1e-3 + 1e-3 * c_q8_scalar[i].abs();
+            assert!((c_q8_scalar[i] - c_dispatch[i]).abs() < tol,
+                "q8 dispatch mismatch at col {}: scalar={}, dispatch={}", i, c_q8_scalar[i], c_dispatch[i]);
         }
     }
 

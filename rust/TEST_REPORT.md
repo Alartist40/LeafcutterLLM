@@ -1,7 +1,16 @@
 # LeafcutterLLM Rust Rewrite — Test Report
 
-## Date: 2026-05-19 (initial) | refreshed 2026-06-16 (stability audit pass) | 2026-08-01 (project wrap-up)
+## Date: 2026-05-19 (initial) | refreshed 2026-06-16 (stability audit pass) | 2026-08-01 (project wrap-up) | 2026-08-02 (Q8_K GEMV)
 
+> **2026-08-02:** `cargo test --release --lib` → **169 passed, 0 failed, 3 ignored**.
+> Added the Q8_K-activation integer-dot GEMV path (`src/kernels/q8_k.rs`,
+> `src/kernels/q8_k_gemm.rs`): the m==1 streaming matmul quantizes the
+> activation to Q8_K once per matmul and dots in integers via
+> `_mm256_maddubs_epi16` (ported from llama.cpp). AVX2 kernels verified vs their
+> scalar references within 1e-3; real-model logits verified (argmax stable on
+> all 4 probes; full-vector diff max 0.19, RMS 0.038). Isolated kernel bench:
+> Q4_K FFN -16%, Q6_K -27%, Q6_K lm_head -8.5%. See CHANGELOG 2026-08-02.
+>
 > **Wrap-up 2026-08-01:** test suite is **fully green** — `cargo test --release --lib`
 > → **161 passed, 0 failed, 3 ignored**. The three previously-failing tests were
 > stale expectations, now fixed: `kernels::tests::test_q4_0_roundtrip`

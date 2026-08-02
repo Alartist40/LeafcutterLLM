@@ -3,11 +3,11 @@
 //! Only one layer's weights are resident in RAM at any time.
 
 use super::arch::{CapabilityReport, ModelArchitecture};
-use super::gguf::{GGUFile, GGUError};
+use super::gguf::{calculate_tensor_size, GGUFile, GGUError};
 use super::quant::QuantType;
 use super::tensor::Tensor;
 use crate::kernels;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
@@ -69,7 +69,53 @@ pub struct GGUFModel {
     /// The cache holds the raw quantized blocks (`Tensor.q_data`), NOT f32
     /// dequantized copies — so Q4_K/Q6_K stay ~file-size in RAM and GEMM
     /// kernels dequantize on the fly.
-    layer_cache: std::sync::Mutex<std::collections::HashMap<usize, std::sync::Arc<HashMap<String, Tensor>>>>,
+    ///
+    /// The cache is **memory-bounded**: `cache_budget_bytes` caps how much
+    /// quantized weight it will hold.  When a model fits comfortably in RAM
+    /// (e.g. Ornith-9B), the budget is unlimited and every layer stays cached
+    /// (fast).  For huge models (e.g. 70B Q4_K_M ≈ 42 GB on a 15 GB box) the
+    /// budget is capped at the available RAM, so the oldest layers are evicted
+    /// as new ones load — the engine degrades gracefully into layer streaming
+    /// instead of OOMing.  Override with `LEAFCUTTER_CACHE_MB`.
+    layer_cache: std::sync::Mutex<LayerCacheInner>,
+    /// Cache budget in bytes (0 = unlimited).  Computed at load from the
+    /// available RAM and the model size.
+    cache_budget_bytes: usize,
+}
+
+/// Insertion-ordered layer cache backing `GGUFModel.layer_cache`.
+struct LayerCacheInner {
+    map: HashMap<usize, std::sync::Arc<HashMap<String, Tensor>>>,
+    /// Layer indices in insertion order (oldest first) — the eviction order.
+    order: VecDeque<usize>,
+}
+
+impl LayerCacheInner {
+    fn new() -> Self {
+        Self { map: HashMap::new(), order: VecDeque::new() }
+    }
+
+    /// Total estimated bytes of cached quantized weights.
+    fn cached_bytes(&self) -> usize {
+        self.map
+            .values()
+            .map(|arc| arc.values().map(|t| t.quantized_memory_bytes()).sum::<usize>())
+            .sum()
+    }
+}
+
+/// Read available RAM from /proc/meminfo (MiB).  0 if unavailable.
+fn available_memory_mb() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+        / 1024
 }
 
 impl GGUFModel {
@@ -77,24 +123,71 @@ impl GGUFModel {
         let file = GGUFile::open(path)?;
         let architecture = ModelArchitecture::detect(&file);
         let config = Self::extract_config(&file, architecture);
+
+        let total_model_bytes: usize = file
+            .tensors
+            .iter()
+            .map(|t| calculate_tensor_size(&t.dimensions, t.typ))
+            .sum();
+
+        let cache_budget_bytes = Self::compute_cache_budget_bytes(total_model_bytes);
+
         Ok(Self {
             file,
             config,
             architecture,
-            layer_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            layer_cache: std::sync::Mutex::new(LayerCacheInner::new()),
+            cache_budget_bytes,
         })
+    }
+
+    /// Layer-cache budget in bytes (0 = unlimited).
+    pub fn layer_cache_budget_bytes(&self) -> usize {
+        self.cache_budget_bytes
+    }
+
+    /// True when the whole model fits the budget (i.e. every layer can be
+    /// resident and the mmap pages can be safely dropped after the first pass).
+    pub fn model_fits_available_ram(&self) -> bool {
+        self.cache_budget_bytes == 0
+    }
+
+    /// Compute the layer-cache budget from `LEAFCUTTER_CACHE_MB` (if set),
+    /// else from the available RAM:
+    ///   - model ≤ available RAM − 1 GiB margin  →  unlimited (0)
+    ///   - otherwise                              →  available RAM − 1 GiB
+    fn compute_cache_budget_bytes(total_model_bytes: usize) -> usize {
+        if let Ok(v) = std::env::var("LEAFCUTTER_CACHE_MB") {
+            if let Ok(mb) = v.parse::<usize>() {
+                return mb.saturating_mul(1024 * 1024);
+            }
+        }
+        let avail_mb = available_memory_mb();
+        if avail_mb == 0 {
+            return 0; // meminfo unavailable → unlimited (backward compatible)
+        }
+        let budget_mb = avail_mb.saturating_sub(1024); // 1 GiB for KV + activations
+        let budget_bytes = budget_mb * 1024 * 1024;
+        if total_model_bytes <= budget_bytes {
+            0 // model fits → cache everything
+        } else {
+            budget_bytes
+        }
     }
 
     /// Number of resident layer-weights in the cache (for monitoring).
     pub fn cached_layers(&self) -> usize {
-        self.layer_cache.lock().map(|c| c.len()).unwrap_or(0)
+        self.layer_cache.lock().map(|c| c.map.len()).unwrap_or(0)
     }
 
     /// Total estimated bytes of cached quantized weights (for monitoring).
     pub fn cached_bytes(&self) -> usize {
-        self.layer_cache.lock().map(|c| {
-            c.values().map(|arc| arc.values().map(|t| t.quantized_memory_bytes()).sum::<usize>()).sum::<usize>()
-        }).unwrap_or(0)
+        self.layer_cache.lock().map(|c| c.cached_bytes()).unwrap_or(0)
+    }
+
+    /// True when every layer's weights are currently resident in the cache.
+    pub fn all_layers_cached(&self) -> bool {
+        self.cached_layers() == self.config.num_hidden_layers
     }
 
     /// Load a layer's weights, cached across calls.
@@ -102,13 +195,17 @@ impl GGUFModel {
     /// First call per layer parses + dequantizes from the mmap (as before);
     /// subsequent calls return the cached `Arc` — O(1), no disk I/O, no
     /// re-dequantization. This is the Phase 5 fix for the 16× slowdown.
+    ///
+    /// The cache is memory-bounded: when `cache_budget_bytes` is set, the
+    /// oldest layers are evicted as new ones are inserted so RSS stays under
+    /// the budget (huge-model streaming mode).
     pub fn get_layer(&self, idx: usize) -> Result<std::sync::Arc<HashMap<String, Tensor>>, GGUError> {
         if std::env::var("LEAFCUTTER_NO_CACHE").map(|v| v == "1").unwrap_or(false) {
             return Ok(std::sync::Arc::new(self.load_layer(idx)?));
         }
         {
             let cache = self.layer_cache.lock().map_err(|_| GGUError::UnsupportedQuantType("cache poisoned".into(), 0))?;
-            if let Some(arc) = cache.get(&idx) {
+            if let Some(arc) = cache.map.get(&idx) {
                 return Ok(std::sync::Arc::clone(arc));
             }
         }
@@ -117,21 +214,38 @@ impl GGUFModel {
         let arc = std::sync::Arc::new(weights);
         let mut cache = self.layer_cache.lock().map_err(|_| GGUError::UnsupportedQuantType("cache poisoned".into(), 0))?;
         // Re-check under lock in case a concurrent caller built it first.
-        cache.entry(idx).or_insert_with(|| std::sync::Arc::clone(&arc));
+        if !cache.map.contains_key(&idx) {
+            cache.map.insert(idx, std::sync::Arc::clone(&arc));
+            cache.order.push_back(idx);
+        }
+        // Enforce the memory budget (skip when budget is 0 = unlimited).
+        let budget = self.cache_budget_bytes;
+        if budget > 0 {
+            while cache.map.len() > 1 && cache.cached_bytes() > budget {
+                if let Some(old) = cache.order.pop_front() {
+                    cache.map.remove(&old);
+                } else {
+                    break;
+                }
+            }
+        }
         Ok(arc)
     }
 
     /// Optional: evict a layer from the cache to bound RSS (e.g. huge models).
     pub fn evict_layer(&self, idx: usize) {
         if let Ok(mut cache) = self.layer_cache.lock() {
-            cache.remove(&idx);
+            if cache.map.remove(&idx).is_some() {
+                cache.order.retain(|&i| i != idx);
+            }
         }
     }
 
     /// Clear the whole layer cache (e.g. before a fresh conversation).
     pub fn clear_layer_cache(&self) {
         if let Ok(mut cache) = self.layer_cache.lock() {
-            cache.clear();
+            cache.map.clear();
+            cache.order.clear();
         }
     }
 
