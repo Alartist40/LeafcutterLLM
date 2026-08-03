@@ -27,10 +27,6 @@ name = "list_tensors"
 path = "src/bin/list_tensors.rs"
 
 [[bin]]
-name = "check_meta"
-path = "src/bin/check_meta.rs"
-
-[[bin]]
 name = "check_shapes"
 path = "src/bin/check_shapes.rs"
 
@@ -49,10 +45,6 @@ path = "src/bin/test_generation.rs"
 [[bin]]
 name = "test_llama"
 path = "src/bin/test_llama.rs"
-
-[[bin]]
-name = "scan_corruption"
-path = "src/bin/scan_corruption.rs"
 
 [[bin]]
 name = "ref_layers"
