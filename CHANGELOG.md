@@ -5,6 +5,57 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-08-03 (Ministral-2512 chat-template fix; YaRN RoPE gap; Cargo cleanup)
+
+### Fixed — chat template now uses the GGUF's embedded Jinja template
+
+`native cmd_run` (the `/run` REPL path) was calling `render_chat_prompt()` from
+`profiles.rs`, which hardcodes an obsolete Mistral `[INST] user [/INST]` format
+and **forces a "Think step by step" system prompt** that Ministral-2512 never
+saw in training. Result: the model produced grammar-fixation gibberish.
+
+- `src/main.rs` (native run path, ~line 984): when the GGUF carries
+  `tokenizer.chat_template`, route through `apply_chat_template_from_gguf()`
+  with the user's actual `system_prompt` (empty by default), so the model's
+  own template and its default-system-message apply. Fall back to the profile
+  templates when no Jinja is embedded.
+- `src/tokenizer/chat_template.rs::TemplateFamily::detect()`: also match
+  `[SYSTEM_PROMPT]` literally (some Unsloth GGUFs ship a Ministral template
+  that has `[SYSTEM_PROMPT]` but not the word `think`, which the old
+  heuristic missed and mis-classified as plain Mistral).
+- `TemplateFamily::Ministral::render()`: default system message rewritten to
+  match Ministral-3-3B-Instruct-2512's identity + `[THINK]...[/THINK]` format
+  (was a generic "How you should think and answer" — close but not exact).
+
+### Known limitation — YaRN RoPE not yet implemented (Ministral still garbles)
+
+Chat template is now correct, but Ministral-2512 with `rope_parameters:
+{rope_type: yarn, factor: 16, original_max_position_embeddings: 16384,
+beta_fast: 32, beta_slow: 1, mscale: 1}` still produces garbage tokens
+(verified with `LEAFCUTTER_DEBUG_PROMPT=1`). The engine treats it as
+standard RoPE with `rope_theta=10000`, so position embeddings are wrong by
+~16× and attention breaks. See `NEXT_STEPS.md` for the implementation plan.
+
+### Changed — Cargo.toml `[[bin]]` cleanup
+
+Removed two pre-existing broken `[[bin]]` declarations (`check_meta`,
+`scan_corruption`) whose `.rs` files never existed in git history — a
+leftover from a year of dev. The manifest now matches `src/bin/` exactly.
+
+### Verified working models (after chat-template fix)
+
+- ✅ **ornith-1.0-9b** (Qwen3.5 hybrid DeltaNet): 1.37–1.67 tok/s, coherent,
+  `[THINK]...[/THINK]` reasoning blocks render correctly.
+- ✅ **qwen2.5** (Qwen2 with attention biases fix): 4.07 tok/s native vs 0.188
+  tok/s AirLLM — 21.6× faster; coherent.
+- ❌ **Ministral-3-3B-Instruct-2512** (Mistral3 / YaRN): chat template correct
+  now but **forward pass produces garbage** because YaRN RoPE is unsupported
+  (status: blocked on RoPE-YaRN implementation).
+- ⚠️ **qwen3-0.6**, **unlimited ocr** (safetensors): routed through Python
+  reference backend, not native engine — requires `transformers` installed.
+
+---
+
 ## [Unreleased] — 2026-08-02 (Ollama-style UX: /source, persistent config, OS/arch)
 
 ### Added — `leafcutter source`, persistent config, cwd-independent model discovery

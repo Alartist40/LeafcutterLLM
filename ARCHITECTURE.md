@@ -227,6 +227,16 @@ Any engine change must keep them:
       `resolve_models_dirs()` now cwd-independent (no more `cd` required).
 - [x] **OS/arch detection** — `detect::current_os()`/`current_arch()` shown in the
       run banner; basis for the cross-platform installer/container story.
+- [x] **GGUF chat-template preference** — `cmd_run` now uses
+      `apply_chat_template_from_gguf()` when the GGUF carries
+      `tokenizer.chat_template` (fixes Ministral-2512's `[SYSTEM_PROMPT]` format
+      that the hardcoded profile templates got wrong). See `NEXT_STEPS.md`.
+- [ ] **RoPE-YaRN support** — Ministral-3-3B-Instruct-2512, Llama-3.x-1M, and
+      other long-context models use YaRN (`factor=16`, `beta_fast=32`,
+      `beta_slow=1`, `mscale=1`). Engine currently treats them as standard
+      RoPE → forward pass produces garbage. Implementation reference:
+      llama.cpp `ggml_compute_forward_rope_yarn()` + `mscale` attention scaling.
+      **Status:** BLOCKING Ministral-2512 correctness.
 - [x] **Tier 3 coherence proof** — Llama-3.3-70B through the adaptive streaming
       path generated coherent English (`"The capital of France is a city like no
       other,"`) at **11.5 GB peak RSS** (bounded cache; the 42 GB model never went
