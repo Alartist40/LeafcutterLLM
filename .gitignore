@@ -25,6 +25,8 @@ rust/src/bin/list_*.rs
 rust/src/bin/diag_*.rs
 rust/src/bin/*.bak
 rust/synthetic_*.py
+rust/src/bin/*.tmp
+rust/src/bin/prefill_*.rs
 
 # Build artifacts
 coverage.out

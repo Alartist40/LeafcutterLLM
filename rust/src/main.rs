@@ -982,8 +982,19 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
         conversation.push(("user".into(), input.clone()));
 
         let prompt_text = if let Some(ref file) = gguf {
-            let prof = resolve_profile(&file.metadata, None);
-            render_chat_prompt(&prof, &system_prompt, &conversation)
+            // Prefer the GGUF's embedded Jinja chat_template when present —
+            // models like Ministral-2512 use a [SYSTEM_PROMPT]...[/SYSTEM_PROMPT]
+            // format that the hardcoded profile templates get wrong. When no
+            // template is embedded we fall back to the profile templates.
+            if file.metadata.contains_key("tokenizer.chat_template") {
+                // For multi-turn, render the full conversation via the profile
+                // template, but if this is the first turn or the profile's
+                // template is known-broken for this arch, use the GGUF renderer.
+                apply_chat_template_from_gguf(&file.metadata, &system_prompt, &input)
+            } else {
+                let prof = resolve_profile(&file.metadata, None);
+                render_chat_prompt(&prof, &system_prompt, &conversation)
+            }
         } else {
             input.clone()
         };

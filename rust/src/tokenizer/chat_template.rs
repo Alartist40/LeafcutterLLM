@@ -22,7 +22,10 @@ impl TemplateFamily {
     /// Detect family from raw Jinja2 template string.
     pub fn detect(template: &str) -> Self {
         let t = template.to_lowercase();
-        if t.contains("system_prompt") && t.contains("think") {
+        // Ministral-2512 uniquely uses a [SYSTEM_PROMPT]…[/SYSTEM_PROMPT] tag.
+        // The "Unsloth template fixes" GGUF embeds the same family (the literal
+        // word "think" may be absent), so match on the SYSTEM_PROMPT tag first.
+        if t.contains("[system_prompt]") || (t.contains("system_prompt") && t.contains("think")) {
             TemplateFamily::Ministral
         } else if t.contains("start_header_id") || t.contains("end_header_id") {
             TemplateFamily::Llama3
@@ -63,15 +66,19 @@ impl TemplateFamily {
                 system, user
             ),
             TemplateFamily::Ministral => {
-                // Ministral uses [SYSTEM_PROMPT]…[/SYSTEM_PROMPT][INST]…[/INST]
+                // Ministral-2512 uses [SYSTEM_PROMPT]…[/SYSTEM_PROMPT][INST]…[/INST].
+                // The model was trained with a specific default system message; when
+                // none is supplied we use the Ministral-3-3B-Instruct-2512 default
+                // (truncated to the essential identity + thinking-format instructions).
                 let sys = if system.is_empty() {
-                    "# HOW YOU SHOULD THINK AND ANSWER\n\n\
-                     First draft your thinking process (inner monologue) until you arrive at a response. \
-                     Format your response using Markdown. Write both your thoughts and the response in the same language as the input.\n\n\
+                    "You are Ministral-3-3B-Instruct-2512, an AI assistant.\n\
+                     # HOW YOU SHOULD THINK AND ANSWER\n\n\
+                     First draft your thinking process (inner monologue). \
+                     Format your response using Markdown, in the same language as the input.\n\n\
                      Your thinking process must follow the template below:\
                      [THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. \
-                     Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]\
-                     Here, provide a self-contained response."
+                     Be as long as you want until you are confident to generate the response.[/THINK]\
+                     Then, provide a self-contained response."
                         .to_string()
                 } else {
                     system.to_string()
