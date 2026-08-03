@@ -421,7 +421,7 @@ fn test_llama_embed_dump() {
     let mut engine = Engine::load(model_path).unwrap();
     
     for (label, tokens) in [("nobos", vec![9906usize]), ("bos", vec![128000usize, 9906])] {
-        let hidden = engine.embed_lookup_mmap(&tokens);
+        let hidden = engine.embed_lookup_mmap(&tokens).unwrap();
         let bytes: Vec<u8> = hidden.data.iter().flat_map(|&f| f.to_le_bytes()).collect();
         let path = format!("/tmp/leafcutter_embed_{}.bin", label);
         std::fs::write(&path, &bytes).unwrap();

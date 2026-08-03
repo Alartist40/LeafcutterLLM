@@ -25,6 +25,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 - **Fixed:** `Dockerfile`/`Containerfile` referenced the dead `leaf` binary name
   and the removed `server --batch-size` command; now build `leafcutter` and run
   `serve --host 0.0.0.0 --port 8081` with `LEAF_MODELS_DIR=/models`.
+- **Fixed:** `Containerfile` omitted `rust/.cargo/config.toml`, so container builds
+  lost `target-cpu=native` (AVX2/FMA) and ran ~20× slower. Container now runs at
+  full native speed (0.93 vs 0.90 tok/s on Ministral-3-3B).
+- **Pruned:** 210 one-off debug/diagnostic binaries moved out of `rust/src/bin/`
+  into `rust/src/bin_archive/` (git history retains them). Kept the 19 declared
+  `[[bin]]` targets; `cargo build`/`cargo test` are now ~10× faster.
 
 ---
 

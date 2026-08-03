@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY rust/Cargo.toml rust/Cargo.lock ./
 COPY rust/src ./src
+COPY rust/.cargo ./.cargo
 
 # Build native-only server (no llama.cpp FFI required)
 RUN cargo build --release --no-default-features --bin leafcutter

@@ -417,6 +417,9 @@ Response (token or text)
 | `src/api/mod.rs` | Axum HTTP router (OpenAI-compatible) |
 | `src/bin/test_generation.rs` | Generation quality test binary |
 | `src/bin/benchmark_models.rs` | Performance benchmark suite |
+| `src/config.rs` | Persistent model source config (`leafcutter source …`, `~/.config/leafcutter`) |
+| `src/detect.rs` | OS/arch/CPU/RAM/GPU probe + tier dispatch (banner shows `linux · 16 cores · 10 GiB free`) |
+| `src/bin_archive/` | 210 retired one-off debug/diagnostic binaries (kept for reference; not compiled) |
 
 ---
 
