@@ -10,6 +10,28 @@ use crate::kernels;
 use std::collections::{HashMap, VecDeque};
 
 #[derive(Debug, Clone)]
+pub struct YarnParams {
+    /// 1.0 / yarn_ext_factor (e.g. 1/16 for Ministral).
+    /// Computed internally; callers should not set this.
+    pub freq_scale: f32,
+    /// The original training context length (e.g. 16384 for Ministral).
+    pub orig_ctx: usize,
+    /// YaRN beta_fast (rotations whose wavelength < 2π·β_fast are interpolated).
+    pub beta_fast: f32,
+    /// YaRN beta_slow (rotations whose wavelength > 2π·β_slow are extrapolated).
+    pub beta_slow: f32,
+    /// GGUF `rope_attn_factor` (= mscale as defined by HF YaRN).
+    /// Llama.cpp pre-divides by (1 + 0.1·log(factor)) at the call site,
+    /// so the kernel's mscale-bake restores the original mscale.
+    /// For Ministral (factor=16, attn_factor=1.0) this is identity.
+    pub attn_factor: f32,
+    /// yarn_ext_factor (1.0 = YaRN active, 0.0 = no YaRN interpolation).
+    /// Stored separately for clarity even though it's redundant with
+    /// `freq_scale = 1 / factor`.
+    pub ext_factor: f32,
+}
+
+#[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub hidden_size: usize,
     pub num_hidden_layers: usize,
@@ -30,6 +52,10 @@ pub struct ModelConfig {
     pub norm_eps: f32,
     /// EOS token ID (read from GGUF metadata; defaults to 2 for backward compat)
     pub eos_token: usize,
+    /// RoPE-YaRN parameters. `None` when the model uses standard RoPE
+    /// (i.e. `rope_scaling.type == "yarn"` is absent). Models like
+    /// Ministral-3-3B-Instruct-2512 require this for coherent generation.
+    pub rope_yarn: Option<YarnParams>,
 }
 
 impl Default for ModelConfig {
@@ -50,6 +76,7 @@ impl Default for ModelConfig {
             rope_dim: 0,
             norm_eps: 1e-5,
             eos_token: 2,
+            rope_yarn: None,
         }
     }
 }
@@ -516,6 +543,82 @@ impl GGUFModel {
             ])
             .map(|v| v as usize)
             .unwrap_or(2);
+
+        // RoPE-YaRN parameters. Triggered when `rope_scaling.type == "yarn"`
+        // is set in metadata. The Ministral-3-3B-Instruct-2512 GGUF stores
+        // its keys under `mistral3.rope.scaling.*` with these names:
+        //   factor              (the yarn_ext_factor, e.g. 16)
+        //   original_context_length
+        //   yarn_beta_fast / yarn_beta_slow
+        //   yarn_log_multiplier (= mscale / attn_factor)
+        // Other models (Llama-3.x-1M, DeepSeek-V2) store under
+        // `<prefix>.rope.scaling.{yarn_ext_factor,yarn_orig_ctx,...}`.
+        let scaling_type = file
+            .metadata
+            .get(&format!("{}.rope.scaling.type", prefix))
+            .or_else(|| file.metadata.get("llama.rope.scaling.type"))
+            .or_else(|| file.metadata.get("mistral3.rope.scaling.type"))
+            .and_then(|v| if let crate::model::gguf::GGUFValue::String(s) = v { Some(s.as_str()) } else { None })
+            .unwrap_or("");
+        let yarn_active = scaling_type == "yarn";
+        if yarn_active {
+            // Resolve yarn_ext_factor. Prefer llama.cpp's `yarn_ext_factor`
+            // key; fall back to HuggingFace's `factor`.
+            let yarn_ext_factor = Self::get_meta_f32(file, &[
+                &format!("{}.rope.scaling.yarn_ext_factor", prefix),
+                "llama.rope.scaling.yarn_ext_factor",
+                &format!("{}.rope.scaling.factor", prefix),
+                "mistral3.rope.scaling.factor",
+                "qwen2.rope.scaling.factor",
+            ])
+            .unwrap_or(1.0);
+            let orig_ctx = Self::get_meta_int(file, &[
+                &format!("{}.rope.scaling.yarn_orig_ctx", prefix),
+                "llama.rope.scaling.yarn_orig_ctx",
+                &format!("{}.rope.scaling.original_context_length", prefix),
+                "mistral3.rope.scaling.original_context_length",
+                "qwen2.rope.scaling.original_context_length",
+            ])
+            .map(|v| v as usize)
+            .unwrap_or(cfg.max_seq_len.max(2048));
+            let beta_fast = Self::get_meta_f32(file, &[
+                &format!("{}.rope.scaling.yarn_beta_fast", prefix),
+                "llama.rope.scaling.yarn_beta_fast",
+                "mistral3.rope.scaling.yarn_beta_fast",
+                "qwen2.rope.scaling.yarn_beta_fast",
+            ])
+            .unwrap_or(32.0);
+            let beta_slow = Self::get_meta_f32(file, &[
+                &format!("{}.rope.scaling.yarn_beta_slow", prefix),
+                "llama.rope.scaling.yarn_beta_slow",
+                "mistral3.rope.scaling.yarn_beta_slow",
+                "qwen2.rope.scaling.yarn_beta_slow",
+            ])
+            .unwrap_or(1.0);
+            // mscale-equivalent. HuggingFace's `yarn_log_multiplier`
+            // matches llama.cpp's `attn_factor`.
+            let attn_factor = Self::get_meta_f32(file, &[
+                &format!("{}.rope.scaling.attn_factor", prefix),
+                "llama.rope.scaling.attn_factor",
+                "mistral3.rope.scaling.attn_factor",
+                &format!("{}.rope.scaling.yarn_log_multiplier", prefix),
+                "mistral3.rope.scaling.yarn_log_multiplier",
+                "qwen2.rope.scaling.yarn_log_multiplier",
+            ])
+            .unwrap_or(1.0);
+            cfg.rope_yarn = Some(YarnParams {
+                freq_scale: 1.0 / yarn_ext_factor,
+                orig_ctx,
+                beta_fast,
+                beta_slow,
+                attn_factor,
+                ext_factor: yarn_ext_factor,
+            });
+            eprintln!(
+                "[loader] RoPE-YaRN active: factor={}, orig_ctx={}, beta_fast={}, beta_slow={}, attn_factor={}",
+                yarn_ext_factor, orig_ctx, beta_fast, beta_slow, attn_factor
+            );
+        }
 
         cfg
     }

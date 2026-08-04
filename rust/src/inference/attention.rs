@@ -13,6 +13,24 @@ use crate::model::tensor::Tensor;
 use crate::cache::KVCache;
 use rayon::prelude::*;
 
+#[derive(Debug, Clone, Default)]
+pub struct YarnParams {
+    /// 1.0 / yarn_ext_factor (e.g. 1/16 for Ministral-3).
+    pub freq_scale: f32,
+    /// Original training context length (e.g. 16384 for Ministral-3).
+    pub orig_ctx: usize,
+    /// YaRN beta_fast (default 32).
+    pub beta_fast: f32,
+    /// YaRN beta_slow (default 1).
+    pub beta_slow: f32,
+    /// mscale-equivalent (HuggingFace's `yarn_log_multiplier`).
+    /// llama.cpp pre-divides this by `(1 + 0.1*log(factor))` and the kernel
+    /// multiplies back, so the effective value baked into cos/sin equals this.
+    pub attn_factor: f32,
+    /// yarn_ext_factor (e.g. 16.0). Stored for debugging/logging.
+    pub ext_factor: f32,
+}
+
 pub struct AttentionParams {
     pub num_heads: usize,
     pub num_kv_heads: usize,
@@ -23,6 +41,9 @@ pub struct AttentionParams {
     pub use_fused_qkv: bool,
     pub use_gate: bool,
     pub window_size: usize, // 0 = disabled (full causal), >0 = sliding window
+    /// Optional YaRN parameters. When `Some`, `apply_rotary_emb` uses
+    /// YaRN-scaled inv_freq instead of vanilla RoPE.
+    pub yarn: Option<YarnParams>,
 }
 
 impl Default for AttentionParams {
@@ -37,6 +58,7 @@ impl Default for AttentionParams {
             use_fused_qkv: false,
             use_gate: false,
             window_size: 0,
+            yarn: None,
         }
     }
 }

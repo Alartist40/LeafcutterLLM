@@ -28,6 +28,9 @@ rust/synthetic_*.py
 rust/src/bin/*.tmp
 rust/src/bin/prefill_*.rs
 
+# Binary debug dumps (committed accidentally, purged from git history via filter-repo)
+*.bin
+
 # Build artifacts
 coverage.out
 rust/target/
