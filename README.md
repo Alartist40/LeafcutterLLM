@@ -37,8 +37,8 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 |-------|------|---------|--------|----------|---------|
 | Llama-3.2-3B-Instruct | 1.9 GB | **Native** | ✅ Forward + generation | **534 MB** | ~0.12 |
 | Meta-Llama-3.1-70B-Instruct | 40.3 GB | **Native** | ✅ Load + forward | **1,145 MB** | ~0.007 |
-| Ministral-3-8B Q4_K_M | 4.9 GB | **Native** | ⚠️ Forward pass works, **generation garbled** (RoPE-YaRN unsupported) | 739 MB | — |
-| Ministral-3-3B Q4_K_M | 2.0 GB | **Native** | ⚠️ Forward pass works, **generation garbled** (RoPE-YaRN unsupported) | 504 MB | — |
+| Ministral-3-8B Q4_K_M | 4.9 GB | **Native** | ✅ Coherent generation (RoPE-YaRN, 2026-08-05) | 739 MB | — |
+| Ministral-3-3B Q4_K_M | 2.0 GB | **Native** | ✅ Coherent generation (RoPE-YaRN, 2026-08-05) | 504 MB | — |
 | Qwen3.5-0.8B | 0.5 GB | **FFI** | ✅ Coherent generation | ~3 GB | 14.68 |
 | Qwen3.5-9B | 5.0 GB | **FFI** | ✅ Coherent + reasoning | ~6 GB | 2.38 |
 | **Ornith 1.0 9B Q4_K_M** (Qwen 3.5 hybrid) | 5.3 GB | **Native** | ✅ Coherent reasoning chat (max_diff=0.000015 vs reference) | **~8.1 GB** | 1.2–1.65 |
@@ -54,9 +54,9 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 
 **Key technique:** After computing each layer, `madvise(MADV_DONTNEED)` drops the layer's mmap pages from OS cache. Next layer faults back from disk. RSS stays bounded to ~1 layer + engine overhead (~500 MB for 3B, ~2.4 GB for 70B).
 
-### Known Limitations (as of 2026-08-03)
+### Known Limitations (as of 2026-08-05)
 
-- **RoPE-YaRN not supported** — Ministral-3-3B-Instruct-2512, Llama-3.x-1M, and other long-context models use YaRN position encoding (`factor=16`, `beta_fast=32`, `beta_slow=1`, `mscale=1`). Engine treats them as standard RoPE with `theta=10000`, so forward pass produces garbage tokens. **Chat template is correct** (fixed 2026-08-03) — only the attention position math is wrong. See `NEXT_STEPS.md` for the implementation plan.
+- **RoPE-YaRN supported for Ministral-3 family** — implemented `freq_scale = 1/factor`, `ext_factor = 1.0`, beta_fast/slow, and mscale (effective attn_factor) exactly per llama.cpp. Llama-3.x-1M (factor=8) still unvalidated; Qwen2/Ornith/llama pass (no-op branch). See `NEXT_STEPS.md` for the full implementation note.
 - **No GPU offload** — Tier 1 (full GPU) and Tier 2 partial offload (`--gpu-layers N`) not implemented. CPU only. Probe and dispatch exist (`detect::GpuKind`, `LEAFCUTTER_PREFER_GPU`).
 - **Prompt prefill gap** — `chat`/`run` may discard all but the last prompt token in the streaming path; correctness gap on long prompts (not perf).
 

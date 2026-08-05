@@ -5,6 +5,43 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [Unreleased] — 2026-08-05 (RoPE-YaRN fixed; Ministral-3 coherent)
+
+### Fixed — RoPE-YaRN now matches llama.cpp exactly (Ministral-3 coherent)
+
+Ministral-3-3B-Instruct-2512 produced garbled output because the loader
+conflated two distinct YaRN concepts:
+- `rope.scaling.factor` (GGUF, =16) is the **interpolation** factor;
+  `freq_scale = 1/factor = 1/16`.
+- `yarn_ext_factor` (hardcoded **1.0** for YARN type in llama.cpp
+  `llama-context.cpp:189-190`) is the **extrapolation** factor.
+
+Previously `ext_factor` was loaded from `scaling.factor` (=16.0), so the
+ramp-mix term `theta = theta_interp*(1-16·ramp) + theta_extrap·16·ramp`
+blew up the rotary angles.
+
+Changes:
+- `src/model/loader.rs`: read `scaling_factor` and `yarn_ext_factor`
+  separately; `freq_scale = 1/scaling_factor`; `ext_factor` defaults to 1.0.
+  Debug banner now prints `factor`, `freq_scale`, `ext_factor`, beta_*, attn_factor.
+- `src/inference/attention.rs`: YaRN math (`rope_yarn_ramp`,
+  `rope_yarn_corr_dim`, `rope_yarn_corr_dims`) matches llama.cpp
+  `ggml-cpu/ops.cpp:5822-5844`; `attn_factor` (mscale) used directly because
+  llama.cpp pre-divides by `1+0.1*log(factor)` and the kernel multiplies it
+  back — effective mscale is the raw GGUF value (1.0 for Ministral).
+- `src/inference/engine.rs`: `infer_attention_params` passes
+  `config.rope_yarn.clone()` to both attention branches.
+- `src/inference/gemma.rs`: `yarn: None` (no-op for non-YaRN archs).
+
+Verified:
+- ✅ **Ministral-3-3B**: `server /v1/chat/completions` → `2+2=4.`; matches
+  Ollama on the same GGUF.
+- ✅ **ornith-1.0-9b** and **qwen2.5** unaffected (`rope_yarn=None` no-op).
+- ✅ `cargo test --release --lib`: 183 passed, 0 failed, 3 ignored.
+- Commit `997308a`.
+
+---
+
 ## [Unreleased] — 2026-08-03 (Ministral-2512 chat-template fix; YaRN RoPE gap; Cargo cleanup)
 
 ### Fixed — chat template now uses the GGUF's embedded Jinja template
@@ -51,6 +88,7 @@ leftover from a year of dev. The manifest now matches `src/bin/` exactly.
 - ❌ **Ministral-3-3B-Instruct-2512** (Mistral3 / YaRN): chat template correct
   now but **forward pass produces garbage** because YaRN RoPE is unsupported
   (status: blocked on RoPE-YaRN implementation).
+  → **RESOLVED 2026-08-05** — YaRN implemented, output coherent (see above).
 - ⚠️ **qwen3-0.6**, **unlimited ocr** (safetensors): routed through Python
   reference backend, not native engine — requires `transformers` installed.
 

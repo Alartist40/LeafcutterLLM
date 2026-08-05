@@ -20,24 +20,33 @@
   OS/arch detection, container at full native speed.
 - Chat templates: `cmd_run` prefers the GGUF's embedded Jinja template.
 
-**Broken today:**
-- **Ministral-3-3B-Instruct-2512** (and Ministral-3-8B): forward pass works but
-  generation is **garbage**. Chat template is now correct
-  (`[SYSTEM_PROMPT]…[/SYSTEM_PROMPT][INST]…[/INST]`). The remaining cause is
-  **RoPE-YaRN unsupported** — the engine uses standard RoPE (`theta=10000`)
-  but this model needs YaRN (`factor=16`, `beta_fast=32`, `beta_slow=1`,
-  `mscale=1`, original_max_position_embeddings=16384).
+**Fixed (2026-08-05):**
+- **Ministral-3-3B-Instruct-2512 YaRN**: `freq_scale = 1/factor = 1/16`,
+  `ext_factor = 1.0` (hardcoded for YARN in llama.cpp), beta_fast/slow 32/1,
+  `attn_factor` = raw GGUF value (llama.cpp pre-divides by `1+0.1*log(factor)`
+  and the kernel multiplies it back, so the effective mscale is the GGUF value).
+  Key fix: the loader previously conflated the GGUF's `scaling.factor` (the
+  interpolation factor, 16) with `yarn_ext_factor` (the extrapolation factor,
+  1.0) — that made the ramp-mix term blow up the rotary angles. Now coherent:
+  server `/v1/chat/completions` returns `2+2=4.`. Ornith + Qwen2.5 unaffected
+  (`rope_yarn=None` no-op), 183/183 tests green. Commit `997308a`.
 
-**Test signals (how to tell when it's fixed):**
+**Test signals (how to verify):**
+- `leafcutter server -m Ministral-3-3B-… -p 8081` then
+  `curl /v1/chat/completions` → coherent text (matches Ollama on the same GGUF).
 - `LEAFCUTTER_DEBUG_PROMPT=1 leafcutter run Ministral-3-3B-… --max-tokens 16`
-  must produce a coherent greeting (not token soup). The prompt itself is
-  already correct; only the forward pass is wrong.
-- Cross-check with Ollama on the same GGUF (Ollama bundles a working YaRN
-  implementation): identical prompt → Ollama gives coherent text.
+  must produce a coherent greeting (not token soup).
 
 ---
 
-## 1. P0 — Implement RoPE-YaRN (unblocks Ministral family)
+## 1. P0 — Implement RoPE-YaRN (unblocks Ministral family) — DONE
+
+> Status: **COMPLETE** (commit `997308a`). The root cause was that the loader
+> set `ext_factor` from the GGUF's `scaling.factor` key (=16) instead of
+> llama.cpp's hardcoded YARN ext_factor (=1.0). Both `freq_scale = 1/factor`
+> and the per-dim ramp mixing now match llama.cpp `ops.cpp:5822-5844`.
+> Verified: Ministral-3-3B coherent via server + `generate`; Ornith + Qwen2.5
+> no-op regression; 183/183 lib tests pass.
 
 ### 1.1 What YaRN is (one paragraph)
 YaRN ("Yet another RoPE extensioN") rescales RoPE position encodings so a
@@ -190,6 +199,25 @@ for correctness; defer until CPU perf is good.
   `check_meta_full.rs`) and re-declare. Otherwise leave them out.
 - `prefill_only.rs`, `split_model.rs.tmp` were transient debug artifacts —
   already cleaned.
+
+---
+
+## 9. P1 — Cynapse integration (Leafcutter as Cynapse's model backend)
+
+Cynapse is being rebuilt in Rust at `/home/xander/Documents/portfolio/cynapse-rs/`
+(the Go repo at `/home/xander/Documents/portfolio/cynapse/` is legacy). Goal:
+Leafcutter is the inference backend, Cynapse supplies tools/agents.
+
+- `crates/cynapse-core/src/llm/leafcutter.rs` already spawns `leafcutter server`
+  and speaks OpenAI-compatible HTTP, but sends **plain role/content, no tools**
+  ("leafcutter is a raw inference server").
+- Next: tool pass-through — Cynapse `tools.rs`/`agent.rs` sends tool schemas via
+  the chat API; Leafcutter returns `[TOOL_CALLS]…[ARGS]…` (per the embedded
+  Mistral3 template) or OpenAI-style `tool_calls`.
+- **Unlimited OCR** (`/home/xander/Downloads/models/unlimited ocr/`,
+  `Unlimited-OCR-Q4_K_M.gguf`) as a document-RAG recall tool — Cynapse `ocr.rs`
+  currently shells out to Ollama `frob/unlimited-ocr`; native path is to load the
+  GGUF in Leafcutter.
 
 ---
 
