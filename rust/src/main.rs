@@ -982,19 +982,15 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
         conversation.push(("user".into(), input.clone()));
 
         let prompt_text = if let Some(ref file) = gguf {
-            // Prefer the GGUF's embedded Jinja chat_template when present —
-            // models like Ministral-2512 use a [SYSTEM_PROMPT]...[/SYSTEM_PROMPT]
-            // format that the hardcoded profile templates get wrong. When no
-            // template is embedded we fall back to the profile templates.
-            if file.metadata.contains_key("tokenizer.chat_template") {
-                // For multi-turn, render the full conversation via the profile
-                // template, but if this is the first turn or the profile's
-                // template is known-broken for this arch, use the GGUF renderer.
-                apply_chat_template_from_gguf(&file.metadata, &system_prompt, &input)
-            } else {
-                let prof = resolve_profile(&file.metadata, None);
-                render_chat_prompt(&prof, &system_prompt, &conversation)
-            }
+            // Always use the profile-based renderer (render_chat_prompt) for
+            // multi-turn REPL. The GGUF's embedded Jinja chat_template was
+            // designed for single-turn Ollama-style API calls and primes
+            // reasoning models (e.g. Ornith) to think verbosely with
+            // markdown bullets before answering, which floods stderr in the
+            // REPL. The profile renderer emits an open ChatML/Llama3/
+            // Ministral turn that matches Ollama's `run` behavior.
+            let prof = resolve_profile(&file.metadata, None);
+            render_chat_prompt(&prof, &system_prompt, &conversation)
         } else {
             input.clone()
         };
@@ -1058,7 +1054,11 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
                     } else {
                         // Emit all but the last 7 chars (they can't be part
                         // of a partial `</think>`), keeping the boundary.
-                        let keep = thinking_tail.len().saturating_sub(7);
+                        // SAFETY: the 7-byte window can straddle a multi-byte
+                        // UTF-8 character (e.g. emoji), so we floor to the
+                        // nearest char boundary to avoid a panic on `split_at`.
+                        let raw_keep = thinking_tail.len().saturating_sub(7);
+                        let keep = floor_char_boundary(&thinking_tail, raw_keep);
                         if keep > 0 {
                             let (emit, rest) = thinking_tail.split_at(keep);
                             if !thinking_prefix_shown {
@@ -1139,6 +1139,23 @@ fn truncate_str(s: &str, max: usize) -> String {
     } else {
         format!("{}...", &s[..max - 3])
     }
+}
+
+/// Return the largest `i <= at_or_before` that lands on a UTF-8 char boundary
+/// in `s`.  Avoids panics from `split_at` / `&s[..i]` when `i` falls inside a
+/// multi-byte character (e.g. emoji, accented Latin, CJK).
+fn floor_char_boundary(s: &str, at_or_before: usize) -> usize {
+    if at_or_before >= s.len() {
+        return s.len();
+    }
+    let mut i = at_or_before;
+    // Walk back until we find a non-continuation byte (UTF-8 continuation
+    // bytes are 0b10xxxxxx = 0x80..0xC0).  We never need more than 3 steps
+    // since the longest UTF-8 sequence is 4 bytes.
+    while i > 0 && (s.as_bytes()[i] & 0xC0) == 0x80 {
+        i -= 1;
+    }
+    i
 }
 
 /// Streaming chat via Ollama's HTTP API (`ollama serve`).

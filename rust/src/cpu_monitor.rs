@@ -18,6 +18,10 @@
 //!   * RSS_WARN=100GB  — heavy but OK for 70B class
 //!
 //! Opt out entirely: `LEAFCUTTER_CPU_MONITOR=0`
+//! Opt in (was the default in earlier versions; disabled to keep the REPL
+//! output stream clean — safety warnings used to interleave with streamed
+//! model text).  The monitor is still wired in for ops use; set the env var
+//! to `1` to see the temperature/RSS warnings on stderr.
 
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,14 +30,15 @@ use std::time::{Duration, Instant};
 
 static MONITORING: AtomicBool = AtomicBool::new(false);
 
-/// Start the background monitor.  Idempotent.  No-op if `LEAFCUTTER_CPU_MONITOR=0`.
+/// Start the background monitor.  Idempotent.  No-op unless
+/// `LEAFCUTTER_CPU_MONITOR=1` (default OFF so REPL output stays clean).
 pub fn start() {
     if MONITORING.swap(true, Ordering::SeqCst) {
         return; // already running
     }
     if std::env::var("LEAFCUTTER_CPU_MONITOR")
-        .map(|v| v == "0" || v == "false")
-        .unwrap_or(false)
+        .map(|v| v != "1" && v != "true")
+        .unwrap_or(true)
     {
         return;
     }
