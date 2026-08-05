@@ -92,16 +92,32 @@ pub const MINISTRAL_PROFILE: ModelProfile = ModelProfile {
     description: "Ministral / Mistral 3B instruction model",
     architectures: &["mistral", "mistral3"],
     default_system:
-        "You are a helpful assistant. Think step by step and explain your reasoning.",
+        "You are Ministral-3-3B-Instruct-2512, a Large Language Model (LLM) created \
+         by Mistral AI, a French startup headquartered in Paris.\n\
+         You power an AI assistant called Le Chat.\n\
+         Your knowledge base was last updated on 2023-10-01.\n\
+         The current date is {today}.\n\n\
+         When you're not sure about some information or when the user's request \
+         requires up-to-date or specific data, you must use the available tools \
+         to fetch the information. Do not hesitate to use tools whenever they can \
+         provide a more accurate or complete response. If no relevant tools are \
+         available, then clearly state that you don't have the information and \
+         avoid making up anything.\n\
+         If the user's question is not clear, ambiguous, or does not provide \
+         enough context for you to accurately answer the question, you do not \
+         try to answer it right away and you rather ask the user to clarify \
+         their request.\n\
+         You follow these instructions in all languages, and always respond to \
+         the user in the language they use or request.",
     sampling: SamplingDefaults {
-        temperature: 0.7,
+        temperature: 0.15,    // Ollama default for Ministral-3:3b
         top_k: 40,
         top_p: 0.9,
         repeat_penalty: 1.05,
     },
     stop_tokens: &[
         StopToken(2, "</s>"),                   // Mistral generic
-        StopToken(5, "[/INST]"),                // Mistral end
+        StopToken(4, "[/INST]"),                // Mistral-3 turn end (vocab id 4)
     ],
     opens_with_thinking: false,
     raw_continuation: false,
@@ -360,29 +376,26 @@ pub fn render_chat_prompt(
         _ => ("", "\n", "user", "assistant", "system", "tool"),
     };
 
-    // Special-case Ministral which uses [INST] / [/INST] tags.
+    // Special-case Ministral which uses [SYSTEM_PROMPT]/[INST]/[/INST] tags
+    // (Mistral-3 instruction format — different from Mistral v1's INST-wrapped
+    // system).  System is in its own [SYSTEM_PROMPT]…[/SYSTEM_PROMPT] block;
+    // each user turn is a [INST]…[/INST] pair.
     if profile.name == "ministral" {
         let mut out = String::new();
         if !sys.is_empty() {
-            out.push_str(&format!("[INST] {}\n{} [/INST]", sys, history.iter().filter(|(r,_)|r=="user").map(|(_,c)|c.as_str()).collect::<Vec<_>>().join(" ")));
-        } else {
-            // Build a turn-by-turn Ministral prompt: each user turn is
-            // an [INST] block, each assistant turn is plain text after
-            // the previous [/INST] until the next [INST].
-            let mut in_inst = false;
-            for (role, content) in history {
-                match role.as_str() {
-                    "user" => {
-                        out.push_str(&format!("[INST] {} [/INST]", content));
-                        in_inst = true;
-                    }
-                    "assistant" => {
-                        out.push_str(&format!(" {}", content));
-                        in_inst = false;
-                    }
-                    "system" if !sys.is_empty() => {} // already injected via sys path above (or prepended)
-                    _ => {}
+            out.push_str(&format!("[SYSTEM_PROMPT]{}[/SYSTEM_PROMPT]", sys));
+        }
+        for (role, content) in history {
+            match role.as_str() {
+                "user" => {
+                    out.push_str(&format!("[INST]{} [/INST]", content));
                 }
+                "assistant" => {
+                    // Assistant turn follows the previous [/INST] until next [INST].
+                    out.push_str(&format!(" {}", content));
+                }
+                "system" => {} // already in [SYSTEM_PROMPT]
+                _ => {}
             }
         }
         return out;

@@ -207,6 +207,7 @@ impl Engine {
             deltanet_cache: DeltaNetStateCache::new(),
             gguf_path: path.to_string(),
             cached_tokenizer: std::sync::Mutex::new(None),
+            cached_lm_head: None,
             cached_lm_head_size: std::sync::atomic::AtomicUsize::new(0),
             pages_dropped: true,
             seq_offset: 0,
