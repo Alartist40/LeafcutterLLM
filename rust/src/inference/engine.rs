@@ -928,7 +928,21 @@ impl Engine {
             let mut layer_weights: std::sync::Arc<HashMap<String, Tensor>> = model_ref
                 .get_layer(0)
                 .map_err(|e| format!("layer 0 load: {}", e))?;
-            let use_prefetch = std::env::var("LEAFCUTTER_PREFETCH").map(|v| v != "0" && v != "false").unwrap_or(true);
+            // Prefetch loads the next layer's weights into RAM while computing
+            // the current one — faster decode, but doubles peak RSS (current
+            // layer + next layer resident at the same time).  Only enable by
+            // default when we have generous RAM headroom (≥ 2× model size
+            // available); otherwise stay at the Ollama-like 1× footprint.
+            // Override: LEAFCUTTER_PREFETCH=1 to force on, =0 to force off.
+            let use_prefetch = match std::env::var("LEAFCUTTER_PREFETCH").ok().as_deref() {
+                Some("0") | Some("false") => false,
+                Some("1") | Some("true") => true,
+                _ => {
+                    let avail = crate::detect::probe_hardware().ram_available_mb;
+                    let model_mb = (self.model.file.file_size_bytes() / (1024 * 1024)) as u64;
+                    avail >= model_mb.saturating_mul(2)
+                }
+            };
             let mut prefetch: Option<std::thread::ScopedJoinHandle<'_, Result<std::sync::Arc<HashMap<String, Tensor>>, String>>> =
                 if use_prefetch && num_layers > 1 {
                     Some(scope.spawn(move || {

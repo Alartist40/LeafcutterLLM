@@ -79,6 +79,11 @@ pub enum GGUFValue {
 }
 
 impl GGUFile {
+    /// Total size of the GGUF file in bytes (= length of the mmap region).
+    pub fn file_size_bytes(&self) -> u64 {
+        self.mmap.len() as u64
+    }
+
     pub fn open<P: AsRef<Path>>(path: P) -> Result<Self, GGUError> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
