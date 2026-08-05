@@ -562,14 +562,23 @@ impl GGUFModel {
             .unwrap_or("");
         let yarn_active = scaling_type == "yarn";
         if yarn_active {
-            // Resolve yarn_ext_factor. Prefer llama.cpp's `yarn_ext_factor`
-            // key; fall back to HuggingFace's `factor`.
+            // Resolve the interpolation factor (`scaling.factor`, e.g. 16 for
+            // Ministral-3-2512) and the extrapolation factor (`yarn_ext_factor`).
+            // These are distinct: freq_scale = 1/factor, while ext_factor is 1.0
+            // for YARN type (llama.cpp llama-context.cpp:189-190 hardcodes it).
+            let scaling_factor = Self::get_meta_f32(file, &[
+                &format!("{}.rope.scaling.factor", prefix),
+                "llama.rope.scaling.factor",
+                "mistral3.rope.scaling.factor",
+                "qwen2.rope.scaling.factor",
+            ])
+            .unwrap_or(1.0);
+            // Explicit yarn_ext_factor key (DeepSeek-V2 style). Absent for
+            // Ministral-3; default 1.0 for YARN, 0.0 otherwise.
             let yarn_ext_factor = Self::get_meta_f32(file, &[
                 &format!("{}.rope.scaling.yarn_ext_factor", prefix),
                 "llama.rope.scaling.yarn_ext_factor",
-                &format!("{}.rope.scaling.factor", prefix),
-                "mistral3.rope.scaling.factor",
-                "qwen2.rope.scaling.factor",
+                "qwen2.rope.scaling.yarn_ext_factor",
             ])
             .unwrap_or(1.0);
             let orig_ctx = Self::get_meta_int(file, &[
@@ -607,7 +616,7 @@ impl GGUFModel {
             ])
             .unwrap_or(1.0);
             cfg.rope_yarn = Some(YarnParams {
-                freq_scale: 1.0 / yarn_ext_factor,
+                freq_scale: 1.0 / scaling_factor,
                 orig_ctx,
                 beta_fast,
                 beta_slow,
@@ -615,8 +624,8 @@ impl GGUFModel {
                 ext_factor: yarn_ext_factor,
             });
             eprintln!(
-                "[loader] RoPE-YaRN active: factor={}, orig_ctx={}, beta_fast={}, beta_slow={}, attn_factor={}",
-                yarn_ext_factor, orig_ctx, beta_fast, beta_slow, attn_factor
+                "[loader] RoPE-YaRN active: factor={}, freq_scale={}, orig_ctx={}, ext_factor={}, beta_fast={}, beta_slow={}, attn_factor={}",
+                scaling_factor, 1.0 / scaling_factor, orig_ctx, yarn_ext_factor, beta_fast, beta_slow, attn_factor
             );
         }
 

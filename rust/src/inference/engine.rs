@@ -548,6 +548,7 @@ impl Engine {
                 use_fused_qkv: false,
                 use_gate: false,
                 window_size,
+                yarn: config.rope_yarn.clone(),
             };
         }
 
@@ -582,6 +583,7 @@ impl Engine {
             use_fused_qkv: false,
             use_gate: false,
             window_size,
+            yarn: config.rope_yarn.clone(),
         }
     }
 

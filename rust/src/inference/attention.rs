@@ -9,27 +9,10 @@
 //!   - Rotary Position Embeddings (RoPE)
 //!   - Causal masking
 
+use crate::model::loader::YarnParams;
 use crate::model::tensor::Tensor;
 use crate::cache::KVCache;
 use rayon::prelude::*;
-
-#[derive(Debug, Clone, Default)]
-pub struct YarnParams {
-    /// 1.0 / yarn_ext_factor (e.g. 1/16 for Ministral-3).
-    pub freq_scale: f32,
-    /// Original training context length (e.g. 16384 for Ministral-3).
-    pub orig_ctx: usize,
-    /// YaRN beta_fast (default 32).
-    pub beta_fast: f32,
-    /// YaRN beta_slow (default 1).
-    pub beta_slow: f32,
-    /// mscale-equivalent (HuggingFace's `yarn_log_multiplier`).
-    /// llama.cpp pre-divides this by `(1 + 0.1*log(factor))` and the kernel
-    /// multiplies back, so the effective value baked into cos/sin equals this.
-    pub attn_factor: f32,
-    /// yarn_ext_factor (e.g. 16.0). Stored for debugging/logging.
-    pub ext_factor: f32,
-}
 
 pub struct AttentionParams {
     pub num_heads: usize,
@@ -63,28 +46,91 @@ impl Default for AttentionParams {
     }
 }
 
-pub fn apply_rotary_emb(x: &mut Tensor, seq_len: usize, num_heads: usize, head_dim: usize, rope_dim: usize, theta: f32, position_offset: usize) {
-    // Defensive: rope_dim must not exceed head_dim. Some model configs
-    // (e.g., partial RoPE variants, duplicated rope_dim metadata) advertise
-    // a rope_dim > head_dim; we silently clamp rather than OOB-panic on Q/K.
+/// YaRN ramp function: how much to mix interpolated vs extrapolated theta
+/// as a function of the dimension index.
+fn rope_yarn_ramp(low: f32, high: f32, i0: i64) -> f32 {
+    let y = (i0 / 2) as f32 - low;
+    let y = y / (high - low).max(0.001);
+    1.0 - y.clamp(0.0, 1.0)
+}
+
+/// YaRN correction dimension — the dimension index beyond which
+/// wavelengths are either interpolated or extrapolated.
+fn rope_yarn_corr_dim(n_dims: i32, n_ctx_orig: i32, n_rot: f32, base: f32) -> f32 {
+    (n_dims as f32) * (n_ctx_orig as f32 / (n_rot * 2.0 * std::f32::consts::PI)).ln()
+        / (2.0 * base.ln())
+}
+
+/// Compute the two correction-dimension boundaries for YaRN.
+fn rope_yarn_corr_dims(n_dims: i32, n_ctx_orig: i32, freq_base: f32, beta_fast: f32, beta_slow: f32) -> [f32; 2] {
+    let start = rope_yarn_corr_dim(n_dims, n_ctx_orig, beta_fast, freq_base).floor();
+    let end = rope_yarn_corr_dim(n_dims, n_ctx_orig, beta_slow, freq_base).ceil();
+    [start.max(0.0), (end.min((n_dims - 1) as f32))]
+}
+
+/// Apply standard or YaRN-scaled RoPE to a flat Q or K tensor.
+///
+/// `yarn` — when `Some`, activates YaRN scaling (correction dims, freq_scale,
+/// ext_factor ramp, mscale multiplication).  Models like Ministral-3-3B-2512
+/// require this; models like Llama-3 / Qwen2 pass `None`.
+pub fn apply_rotary_emb(
+    x: &mut Tensor,
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    rope_dim: usize,
+    theta: f32,
+    position_offset: usize,
+    yarn: Option<&YarnParams>,
+) {
     let rope_dim = if rope_dim > 0 && rope_dim <= head_dim { rope_dim } else { head_dim };
     let n = x.data.len();
     let stride = num_heads * head_dim;
+
+    // Precompute YaRN correction dims and the attn_factor (mscale) once.
+    let corr_dims;
+    let attn_factor;
+    if let Some(yp) = yarn {
+        corr_dims = rope_yarn_corr_dims(
+            rope_dim as i32, yp.orig_ctx as i32, theta,
+            yp.beta_fast, yp.beta_slow,
+        );
+        // Matches llama.cpp's llama-context.cpp setup: it pre-divides
+        // attn_factor by (1 + 0.1*log(factor)) so that when the kernel
+        // multiplies it back, the effective mscale equals the GGUF value.
+        // For Ministral-3 (factor=16, attn_factor=1.0) this is identity.
+        attn_factor = yp.attn_factor;
+    } else {
+        corr_dims = [0.0; 2];
+        attn_factor = 1.0;
+    }
+
     for i in 0..seq_len {
         for h in 0..num_heads {
             for d in 0..rope_dim / 2 {
+                let dim_idx = d as i64;
                 let freq = 1.0 / theta.powf(2.0 * d as f32 / rope_dim as f32);
-                let angle = (position_offset + i) as f32 * freq;
-                let cos_a = angle.cos();
-                let sin_a = angle.sin();
+                let raw_angle = (position_offset + i) as f32 * freq;
+
+                let (cos_a, sin_a) = if let Some(yp) = yarn {
+                    // YaRN: interpolate between freq_scale * angle and raw angle,
+                    // then multiply cos/sin by attn_factor.
+                    let theta_interp = yp.freq_scale * raw_angle;
+                    let mut theta = theta_interp;
+                    if yp.ext_factor != 0.0 {
+                        let ramp_mix = rope_yarn_ramp(corr_dims[0], corr_dims[1], dim_idx * 2) * yp.ext_factor;
+                        theta = theta_interp * (1.0 - ramp_mix) + raw_angle * ramp_mix;
+                    }
+                    (theta.cos() * attn_factor, theta.sin() * attn_factor)
+                } else {
+                    (raw_angle.cos(), raw_angle.sin())
+                };
 
                 let base = i * stride + h * head_dim;
                 let x1_idx = base + d;
                 let x2_idx = base + d + rope_dim / 2;
 
                 if x1_idx >= n || x2_idx >= n {
-                    // Defensive: should be unreachable once rope_dim <= head_dim.
-                    // Skip this pair rather than crash; preserves Llama/Qwen behavior.
                     continue;
                 }
 
@@ -274,8 +320,9 @@ pub fn attention_forward(
     // -------------------------------------------------------------------------
     // RoPE
     // -------------------------------------------------------------------------
-    apply_rotary_emb(&mut q, seq_len, params.num_heads, content_head_dim, params.rope_dim, params.rope_theta, position_offset);
-    apply_rotary_emb(&mut k, seq_len, params.num_kv_heads, params.kv_head_dim, params.rope_dim, params.rope_theta, position_offset);
+    let yarn_ref = params.yarn.as_ref();
+    apply_rotary_emb(&mut q, seq_len, params.num_heads, content_head_dim, params.rope_dim, params.rope_theta, position_offset, yarn_ref);
+    apply_rotary_emb(&mut k, seq_len, params.num_kv_heads, params.kv_head_dim, params.rope_dim, params.rope_theta, position_offset, yarn_ref);
 
     // -------------------------------------------------------------------------
     // KV Cache (M5: compressed dimensions)
