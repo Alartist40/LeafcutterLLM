@@ -8,6 +8,27 @@
 use crate::model::gguf::{GGUFile, GGUFValue};
 use std::collections::HashMap;
 
+/// Split a pre-token into (non-punct prefix, trailing punctuation run).
+/// In the GPT-2 byte-mapped space, punctuation is anything that is not an
+/// ASCII letter/digit and not a whitespace-mapped char (Ġ space, Ċ newline,
+/// ċ tab).  E.g. `"assistant."` → `("assistant", ".")`, `"logue)."` →
+/// `("logue", ").")`.
+fn split_trailing_punct(s: &str) -> (String, String) {
+    // Find the start of the trailing run of punctuation chars.
+    let mut punct_start = s.len();
+    for (i, c) in s.char_indices().rev() {
+        if c.is_ascii_alphanumeric() || c == '\u{0120}' || c == '\u{010A}' || c == '\u{0109}' {
+            break;
+        }
+        punct_start = i;
+    }
+    if punct_start == s.len() {
+        (s.to_string(), String::new())
+    } else {
+        (s[..punct_start].to_string(), s[punct_start..].to_string())
+    }
+}
+
 pub struct GgufTokenizer {
     /// token_id -> token_string
     vocab: Vec<String>,
@@ -220,8 +241,28 @@ impl GgufTokenizer {
         let mut i = 0;
         while i < n {
             let c = chars[i];
-            // Whitespace boundary
+            // Whitespace boundary.  The GPT-2/Mistral pretokenizer regex
+            // splits trailing punctuation off a word and keeps a punctuation
+            // run + trailing newlines together (e.g. `assistant.\n` →
+            // `assistant` + `.\n`, so BPE emits `.\n` as the single token
+            // `.\n`).  So when a newline (Ċ, U+010A) follows a word that ends
+            // in punctuation, the punct run is detached and merged with the
+            // newline.
             if c == '\u{0120}' || c == '\u{010A}' || c == '\u{0109}' {
+                if c == '\u{010A}' && !current.is_empty() {
+                    let (prefix, punct) = split_trailing_punct(&current);
+                    if !punct.is_empty() {
+                        // `word` + `.\n` → push `word`, keep `.\n` as current
+                        // so subsequent chars append to the newline group.
+                        if !prefix.is_empty() {
+                            result.push(prefix);
+                        }
+                        current = punct;
+                        current.push(c);
+                        i += 1;
+                        continue;
+                    }
+                }
                 if !current.is_empty() {
                     result.push(std::mem::take(&mut current));
                 }
@@ -229,28 +270,51 @@ impl GgufTokenizer {
                 i += 1;
                 continue;
             }
-            // Special-token boundary: <|...|> where ... is non-empty and
-            // contains no `<` or `|`.  The whole token (including the
-            // wrapping `<|...|>`) must be one pre-token so it ends up in
-            // the vocab as a single ID.
-            if c == '<' && i + 2 < n && chars[i + 1] == '|' {
-                // Flush any accumulated word first.
-                if !current.is_empty() {
-                    result.push(std::mem::take(&mut current));
+            // Special-token boundary: `<|...|>` (Qwen/Llama ChatML) or
+            // `[...]` (Ministral) markers.  The whole marker must be one
+            // pre-token so it ends up in the vocab as a single ID.  We only
+            // emit a special pre-token when the exact bracketed string exists
+            // in the vocab — e.g. `[INST]`/`[SYSTEM_PROMPT]` are single
+            // tokens, but `[THINK]` is NOT (HF splits it into `[`, `TH`,
+            // `INK`, `]`), so it must stay in the word stream for BPE to
+            // shatter it identically.
+            let (is_marker, close_len) = if c == '[' {
+                (true, 1usize)
+            } else if c == '<' && i + 2 < n && chars[i + 1] == '|' {
+                (true, 2usize)
+            } else {
+                (false, 0)
+            };
+            if is_marker {
+                let mut j = i + 1;
+                if c == '[' {
+                    while j < n && chars[j] != ']' {
+                        j += 1;
+                    }
+                } else {
+                    while j < n - 1 && !(chars[j] == '|' && chars[j + 1] == '>') {
+                        j += 1;
+                    }
                 }
-                // Scan forward to find the closing `|>`.
-                let mut j = i + 2;
-                while j < n - 1 && !(chars[j] == '|' && chars[j + 1] == '>') {
-                    j += 1;
+                let token_len = if c == '[' {
+                    if j < n { j + 1 - i } else { 0 }
+                } else {
+                    if j < n - 1 { j + 2 - i } else { 0 }
+                };
+                if token_len > 0 {
+                    let token: String = chars[i..i + token_len].iter().collect();
+                    if self.token_to_id.contains_key(&token) {
+                        // Flush any accumulated word first.
+                        if !current.is_empty() {
+                            result.push(std::mem::take(&mut current));
+                        }
+                        result.push(token);
+                        i += token_len;
+                        continue;
+                    }
                 }
-                if j < n - 1 {
-                    // Found `|>`.  The whole marker is chars[i..=j+1].
-                    let token: String = chars[i..=j + 1].iter().collect();
-                    result.push(token);
-                    i = j + 2;
-                    continue;
-                }
-                // No closing `|>` found — treat `<` as a normal character.
+                // Not a vocab special token — fall through to treat the
+                // opening bracket as a normal character.
             }
             current.push(c);
             i += 1;
@@ -610,7 +674,54 @@ impl GgufBpeTokenizer {
             }
         }
 
-        self.greedy_encode(&converted, &mut tokens);
+        // Split out special-token markers (`[...]` for Ministral, `<|...|>`
+        // for Qwen/Llama) that are exact vocab entries so greedy matching
+        // emits them as single IDs.  Without this, `[/SYSTEM_PROMPT]` and
+        // `[/INST]` get shattered (e.g. `.`+`[` merges into `.[`=8925 first)
+        // and the model sees garbage in place of its control tokens.
+        let chars: Vec<char> = converted.chars().collect();
+        let n = chars.len();
+        let mut i = 0;
+        let mut plain_start = 0;
+        while i < n {
+            let c = chars[i];
+            let is_marker = c == '[' || (c == '<' && i + 2 < n && chars[i + 1] == '|');
+            if !is_marker {
+                i += 1;
+                continue;
+            }
+            let mut j = i + 1;
+            if c == '[' {
+                while j < n && chars[j] != ']' {
+                    j += 1;
+                }
+                if j >= n {
+                    i += 1;
+                    continue;
+                }
+            } else {
+                while j < n - 1 && !(chars[j] == '|' && chars[j + 1] == '>') {
+                    j += 1;
+                }
+                if j >= n - 1 {
+                    i += 1;
+                    continue;
+                }
+                j += 1;
+            }
+            let token: String = chars[i..=j].iter().collect();
+            if let Some(&id) = self.vocab_map.get(&token) {
+                let seg: String = chars[plain_start..i].iter().collect();
+                self.greedy_encode(&seg, &mut tokens);
+                tokens.push(id);
+                i = j + 1;
+                plain_start = i;
+            } else {
+                i += 1;
+            }
+        }
+        let tail: String = chars[plain_start..].iter().collect();
+        self.greedy_encode(&tail, &mut tokens);
         tokens
     }
 
