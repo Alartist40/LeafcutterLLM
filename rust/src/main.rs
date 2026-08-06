@@ -1095,12 +1095,14 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
         turn_count += 1;
 
         let peak_rss = get_peak_rss_mb();
+        let cur_rss = get_current_rss_mb();
         eprintln!("─────────────────────────────────────────────────");
-        eprintln!("{} | out={} | {:.2}s | {:.2} tok/s | RAM {}",
+        eprintln!("{} | out={} | {:.2}s | {:.2} tok/s | RAM {} (peak {})",
             truncate_str(&model_name, 28),
             gen_tokens,
             gen_elapsed.as_secs_f64(),
             tok_per_sec,
+            format_rss(cur_rss),
             format_rss(peak_rss),
         );
         eprintln!();
@@ -1767,9 +1769,33 @@ fn get_peak_rss_bytes() -> u64 {
     0
 }
 
+/// Get current RSS in bytes from /proc/self/status (Linux only).
+/// VmRSS is the resident set size right now — the honest "how much RAM
+/// am I using this moment" number, comparable to Ollama/llama.cpp output.
+fn get_current_rss_bytes() -> u64 {
+    if let Ok(contents) = std::fs::read_to_string("/proc/self/status") {
+        for line in contents.lines() {
+            if line.starts_with("VmRSS:") {
+                let parts: Vec<&str> = line.split_whitespace().collect();
+                if parts.len() >= 2 {
+                    if let Ok(kb) = parts[1].parse::<u64>() {
+                        return kb * 1024;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
 /// Get peak RSS, return as MB for display
 fn get_peak_rss_mb() -> u64 {
     get_peak_rss_bytes() / (1024 * 1024)
+}
+
+/// Get current RSS, return as MB for display
+fn get_current_rss_mb() -> u64 {
+    get_current_rss_bytes() / (1024 * 1024)
 }
 
 /// Format RSS for the stats line — shows "123 MB" or "1.2 GB"

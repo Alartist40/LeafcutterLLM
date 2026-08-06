@@ -853,6 +853,14 @@ impl GGUFModel {
                 }
             }
             weights.insert(engine_name.to_string(), tensor);
+
+            // The tensor's bytes have been parsed into owned quantized
+            // blocks (or f32 data) above — the mmap pages that backed them
+            // are now a redundant second copy.  Release them so the model is
+            // never double-resident while the layer cache fills, keeping peak
+            // RSS ≈ model size (like Ollama) instead of 2× the model.
+            let start_abs = self.file.data_offset + info.offset;
+            self.file.drop_pages_in_range(start_abs, raw.len());
         }
 
         Ok(weights)

@@ -301,6 +301,47 @@ impl GGUFile {
         }
     }
 
+    /// Drop a sub-range of mmap pages from the OS page cache.
+    /// `start_abs` is the absolute byte offset into the mmap (data_offset +
+    /// tensor offset).  Used to release each tensor's file pages as soon as it
+    /// has been parsed into an owned quantized block cache, so the model is
+    /// never double-resident (raw mmap pages + cache copies) at once.
+    #[cfg(target_os = "linux")]
+    pub fn drop_pages_in_range(&self, start_abs: u64, len: usize) {
+        let ptr = self.mmap.as_ptr() as *mut libc::c_void;
+        // madvise requires a page-aligned address; round start down and
+        // length up to cover the same pages.
+        let page = 4096u64;
+        let start_aligned = (start_abs / page) * page;
+        let end = start_abs + len as u64;
+        let end_aligned = ((end + page - 1) / page) * page;
+        let len_aligned = (end_aligned - start_aligned) as usize;
+        unsafe {
+            libc::madvise(
+                ptr.add(start_aligned as usize) as *mut libc::c_void,
+                len_aligned,
+                libc::MADV_DONTNEED,
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn drop_pages_in_range(&self, start_abs: u64, len: usize) {
+        let ptr = self.mmap.as_ptr() as *mut libc::c_void;
+        unsafe {
+            libc::madvise(
+                ptr.add(start_abs as usize) as *mut libc::c_void,
+                len,
+                libc::MADV_FREE,
+            );
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub fn drop_pages_in_range(&self, _start_abs: u64, _len: usize) {
+        // No-op on unsupported platforms
+    }
+
     #[cfg(target_os = "macos")]
     pub fn drop_pages_from_cache(&self) {
         let ptr = self.mmap.as_ptr();
