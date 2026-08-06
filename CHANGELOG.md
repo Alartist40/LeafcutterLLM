@@ -5,6 +5,74 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [2026-08-05/06] — Ornith REPL restored; RAM capped; anti-doom removed; Ministral profile fixed
+
+### Fixed — Ornith REPL regression (commit `3ea1c3c`)
+
+The interactive `run` REPL had started preferring the GGUF-embedded Jinja
+template (`apply_chat_template_from_gguf`, which ends with `<think>\n`) over
+the profile-based `render_chat_prompt`. The GGUF template primed Ornith to
+think verbosely with markdown bullets. The CLI `generate` path (profile
+renderer) was unaffected. The REPL now always uses the profile renderer again:
+
+- `src/main.rs`: REPL prompt rendering switched back to `render_chat_prompt`;
+  added a `floor_char_boundary` slice guard so partial UTF-8 never hits the
+  `is_char_boundary` panic.
+- Verified by user: `leafcutter run 3` → short 💭 think → crisp answer
+  ("Hey! 👋 I'm Ornith…"), `/bye` clean, no panic.
+
+### Removed — anti-doom loop detector (`anti_doom.rs`)
+
+`anti_doom.rs:544` byte-sliced into multi-byte UTF-8 chars and panicked at
+`is_char_boundary` on `Ċ`/`👋`. It never worked reliably, so it is gone:
+- Deleted `src/inference/anti_doom.rs`; stripped all `engine.rs` / `mod.rs`
+  references. Native sampler (top-p + temperature + EOS stop tokens) is enough.
+
+### Fixed — RAM blow-up (commit `b90a49f`)
+
+Ollama holds Ornith at 5655 MB; leafcutter native hit 9.7 GB because async
+layer prefetch (`LEAFCUTTER_PREFETCH`, default-on) held current+next layer
+resident regardless of host memory.
+- `src/inference/engine.rs`: prefetch is now default-on **only when available
+  RAM ≥ 2× model size** (`crate::detect::probe_hardware().ram_available_mb`).
+- Measured: 3.4 GB single-shot, 7.8 GB REPL during active generation, 4.2–4.3
+  GB Ministral REPL. Override stays via `LEAFCUTTER_PREFETCH=0/1`.
+
+### Fixed — CPU monitor interleaving
+
+`cpu_monitor.rs` now opt-in via `LEAFCUTTER_CPU_MONITOR=1`; default OFF so
+`[MONITOR] CPU temp…` never appears mid-stream.
+
+### Fixed — GGUF tokenizer bracket markers + newline punctuation merge (`1459e47`)
+
+Mistral `[SYSTEM_PROMPT]` / `[INST]` marker pretokenization plus
+`split_trailing_punct` so `.\n`→1626 and `).\n`→4342 fire — required for the
+Ministral profile's `[SYSTEM_PROMPT]`-style template.
+
+### Fixed — Ministral profile + chat template + FFI build (`c7dde05`)
+
+- `src/profiles.rs`: `MINISTRAL_PROFILE` now uses Ollama's full
+  `SYSTEM_PROMPT.txt` (from the model dir) as `default_system`; temperature
+  0.7→0.15 (Ollama default); `[/INST]` stop-token id 5→4 (id 5 is
+  `[AVAILABLE_TOOLS]`); `render_chat_prompt` no longer wraps system inside
+  `[INST]…[/INST]` — it emits
+  `[SYSTEM_PROMPT]…[/SYSTEM_PROMPT][INST]user[/INST]`.
+- FFI engine initializer gets `cached_lm_head: None` so
+  `--features llama-ffi` builds again.
+
+### Status
+
+- ✅ **Ornith REPL** fully restored (profile renderer, no monitor noise, no panic).
+- ✅ **RAM** ~1× model RSS (matches Ollama).
+- ✅ **Ministral via FFI**: `The answer to **2 + 2** is: **4**` (full system prompt).
+- ✅ **Ministral via native**, short neutral system prompt: `The sum of 2 plus 2 is **4**`.
+- ⚠️ **Known bug**: native engine forward-pass divergence — identical 51-token
+  prefill → llama.cpp top-1 `The` (18.31) vs leafcutter `I`. Full Ollama system
+  prompt degenerates into `I'm. / ### Answer:` loops in native `generate`/`run`.
+  Use `--features llama-ffi` or short system prompts until fixed.
+
+---
+
 ## [Unreleased] — 2026-08-05 (RoPE-YaRN fixed; Ministral-3 coherent)
 
 ### Fixed — RoPE-YaRN now matches llama.cpp exactly (Ministral-3 coherent)

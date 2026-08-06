@@ -25,8 +25,8 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 | **HTTP API** | ✅ Built-in (Axum) | ❌ Library only | ❌ CLI only | ✅ Separate binary |
 | **OpenAI API** | ✅ `/v1/chat/completions` | ❌ Not supported | ❌ Not supported | ❌ Not supported |
 | **70B on 4GB** | ✅ **Validated: 1,145 MB peak** with layer streaming + `madvise` | ✅ Yes (PyTorch quantized ops) | ❌ BitNet only | ⚠️ With `--mmap` + aggressive quantization |
-| **Async layer prefetch** | ✅ Default ON (1.68× warm-cache speedup on 3B via `std::thread::scope`); opt-out via `LEAFCUTTER_PREFETCH=0` |
-| **Anti-doom loop guard** | ✅ Default ON — byte-level + token n-gram loops suppressed at sampler; opt-out via `LEAFCUTTER_ANTIDOOM=0` |
+| **Async layer prefetch** | ✅ Default ON when RAM headroom ≥ 2× model size; opt-in/out via `LEAFCUTTER_PREFETCH=1`/`=0`. Off on tight hosts (matches Ollama's file-size footprint). |
+| **Auto-regressive loop guard** | ❌ Removed 2026-08-05 — caused char-boundary panics on multi-byte UTF-8 (e.g. emoji). The native sampler (top-p + temperature + EOS stop tokens) is sufficient when tokenization is correct. |
 | **Auto-Fallback** | ✅ Unsupported quants → llama.cpp FFI | ❌ No | ❌ No | N/A |
 
 **Key advantage:** Leafcutter is the only open-source engine combining Rust memory safety, **automatic backend routing** (native → FFI fallback), native quantized weight loading with transposed-B GEMM, BitNet quantization, and a built-in OpenAI-compatible HTTP API in a single binary.
@@ -37,8 +37,8 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 |-------|------|---------|--------|----------|---------|
 | Llama-3.2-3B-Instruct | 1.9 GB | **Native** | ✅ Forward + generation | **534 MB** | ~0.12 |
 | Meta-Llama-3.1-70B-Instruct | 40.3 GB | **Native** | ✅ Load + forward | **1,145 MB** | ~0.007 |
-| Ministral-3-8B Q4_K_M | 4.9 GB | **Native** | ✅ Coherent generation (RoPE-YaRN, 2026-08-05) | 739 MB | — |
-| Ministral-3-3B Q4_K_M | 2.0 GB | **Native** | ✅ Coherent generation (RoPE-YaRN, 2026-08-05) | 504 MB | — |
+| Ministral-3-3B Q4_K_M | 2.0 GB | **Native** | ✅ Coherent on short prompts; ⚠️ degenerates with full Ollama system prompt (forward-pass divergence, see note below) | 504 MB | — |
+| Ministral-3-3B Q4_K_M | 2.0 GB | **FFI** (llama.cpp) | ✅ Coherent + Ollama-faithful ("The answer to **2 + 2** is: **4**") | ~4.2 GB | — |
 | Qwen3.5-0.8B | 0.5 GB | **FFI** | ✅ Coherent generation | ~3 GB | 14.68 |
 | Qwen3.5-9B | 5.0 GB | **FFI** | ✅ Coherent + reasoning | ~6 GB | 2.38 |
 | **Ornith 1.0 9B Q4_K_M** (Qwen 3.5 hybrid) | 5.3 GB | **Native** | ✅ Coherent reasoning chat (max_diff=0.000015 vs reference) | **~8.1 GB** | 1.2–1.65 |
@@ -56,6 +56,7 @@ LeafcutterLLM is a **Rust-based** inference engine for running large language mo
 
 ### Known Limitations (as of 2026-08-05)
 
+- **Ministral native-engine forward-pass divergence (known bug)** — same 51-token prefill produces llama.cpp top-1 `The` (logit 18.31) vs leafcutter `I`. Short/neutral system prompts answer correctly ("The sum of 2 plus 2 is **4**"), but the full Ollama system prompt degenerates into `I'm. / ### Answer:` loops. Workaround: `--features llama-ffi` (correct), or use short system prompts in native `run`/`generate`.
 - **RoPE-YaRN supported for Ministral-3 family** — implemented `freq_scale = 1/factor`, `ext_factor = 1.0`, beta_fast/slow, and mscale (effective attn_factor) exactly per llama.cpp. Llama-3.x-1M (factor=8) still unvalidated; Qwen2/Ornith/llama pass (no-op branch). See `NEXT_STEPS.md` for the full implementation note.
 - **No GPU offload** — Tier 1 (full GPU) and Tier 2 partial offload (`--gpu-layers N`) not implemented. CPU only. Probe and dispatch exist (`detect::GpuKind`, `LEAFCUTTER_PREFER_GPU`).
 - **Prompt prefill gap** — `chat`/`run` may discard all but the last prompt token in the streaming path; correctness gap on long prompts (not perf).
@@ -187,7 +188,7 @@ In the chat REPL:
 
 Models auto-detect from `./models`, `~/Downloads/models`, any `/source` dirs you add, or `LEAF_MODELS_DIR=/path/to/models`.
 
-All engine optimizations carry through: async layer prefetch (default ON), anti-doom loop detection (default ON), zero-copy mmap, SIMD matmul.
+All engine optimizations carry through: async layer prefetch (RAM-gated), native top-p + temperature sampling with EOS-aware stop tokens, zero-copy mmap, SIMD matmul. The previous anti-doom loop suppressor was removed 2026-08-05 because it was unstable on multi-byte UTF-8.
 
 ### Building from source
 
@@ -410,7 +411,7 @@ Response (token or text)
 | `src/inference/deltanet.rs` | Gated Delta Net forward pass (linear attention) |
 | `src/inference/mla.rs` | Multi-Latent Attention (DeepSeek/GLM) forward |
 | `src/inference/moe.rs` | MoE routed + shared expert forward |
-| `src/inference/anti_doom.rs` | Doom-loop detector + sampler suppression |
+| `src/inference/anti_doom.rs` | *(removed 2026-08-05 — unstable on multi-byte UTF-8)* |
 | `src/inference/ffn.rs` | SiLU-gated feedforward network |
 | `src/inference/sampler.rs` | top-p / temperature sampling |
 | `src/llama_ffi/mod.rs` | Safe Rust wrappers around llama.cpp C API |

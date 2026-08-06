@@ -1,9 +1,9 @@
 # LeafcutterLLM Handoff Document
 
-**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward), 2026-07-09 (pre-release audit hardening — 20 findings routed), 2026-07-24 (Phase 2 async layer prefetch + anti-doom loop detector), 2026-07-29 (native engine F32 loader fix — coherent English across Q4_K_M / Q6_K / Q8_0), 2026-07-29 (safetensor backend working + Colibri Rust port begun), 2026-07-30 (streaming native Rust forward pass — 6 correctness bugs fixed, " Paris" logit +0.150 vs reference 16.25, layer 0 token 0 hidden state matches Python), **2026-08-01 (GGUF engine breakthrough — Q4_K/Q6_K verified, coherent output; project wrap-up — correct UTF-8 streaming + Q6_K lm_head cache + green test suite)**.
-**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward; pre-release audit + 16 fix areas; Phase 2 + anti-doom runtime guard; native engine forward-pass fix; safetensor Python-subprocess backend (working end-to-end) + Rust safetensors loader (Colibri st.h port); streaming native Rust safetensors forward pass (validated end-to-end, debugging correctness against Python reference); **GGUF engine end-to-end — Q4_K/Q6_K token-identical output verified, Ornith 9B coherent chat in `leafcutter run`, GPT-2 byte-level decode fixed (emoji/Latin-1), lm_head cache swapped to native Q6_K blocks (~8 GB peak), test suite fully green (161 pass / 0 fail)**.
-**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3; audit-era: 1ed554a, 5d735a9, e95c624, 115fbdb; modern-era: 991e481, 528f620, 16bcef8, a1c2f67, 5aa6154 Phase 2 prefetch, aaec49d anti-doom, c4944e0 native engine fix; streaming-era: 4d196cd plan doc, 989132a naive impl, dff4dee build guide; **GGUF-era: 646b16b strategy reassessment, 824d36c lm_head caching + GGUF docs — plus uncommitted wrap-up work: GPT-2 byte decode fix, Q6_K lm_head block cache, streaming UTF-8 buffer, 3 stale tests fixed**).
-**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / Qwen 3.5 / Ornith / pre-release audit hardening work by m3 (Nvidia); Phase 2 + anti-doom work by m3 (Nvidia); streaming native Rust forward pass by m3 (Nvidia) + Hermes GLM-5.2 pair-programming; **GGUF engine breakthrough + project wrap-up by m3 (Nvidia) / xander with OpenCode**.
+**Date:** 2026-05-28 (initial), updated 2026-06-16 (audit + stability fixes), 2026-06-19 (Frontier Models scaffold), 2026-06-30 (Qwen 3.5 / Ornith native coarse forward), 2026-07-09 (pre-release audit hardening — 20 findings routed), 2026-07-24 (Phase 2 async layer prefetch + anti-doom loop detector), 2026-07-29 (native engine F32 loader fix — coherent English across Q4_K_M / Q6_K / Q8_0), 2026-07-29 (safetensor backend working + Colibri Rust port begun), 2026-07-30 (streaming native Rust forward pass — 6 correctness bugs fixed, " Paris" logit +0.150 vs reference 16.25, layer 0 token 0 hidden state matches Python), **2026-08-01 (GGUF engine breakthrough — Q4_K/Q6_K verified, coherent output; project wrap-up — correct UTF-8 streaming + Q6_K lm_head cache + green test suite)**, **2026-08-05/06 (Ornith REPL restored, RAM capped, anti-doom removed, Ministral profile fixed — docs updated)**.
+**Session:** Go Removal + llama.cpp Minimization + Repo Cleanup; follow-up audit pass; Kimi K2.6 + GLM-5.2 intake and MoE scaffold; Qwen 3.5 / Ornith 1.0 9B native DeltaNet forward; pre-release audit + 16 fix areas; Phase 2 + anti-doom runtime guard; native engine forward-pass fix; safetensor Python-subprocess backend (working end-to-end) + Rust safetensors loader (Colibri st.h port); streaming native Rust safetensors forward pass (validated end-to-end, debugging correctness against Python reference); **GGUF engine end-to-end — Q4_K/Q6_K token-identical output verified, Ornith 9B coherent chat in `leafcutter run`, GPT-2 byte-level decode fixed (emoji/Latin-1), lm_head cache swapped to native Q6_K blocks (~8 GB peak), test suite fully green (161 pass / 0 fail)**; **Ornith REPL restoration + RAM cap + anti-doom removal + Ministral profile fix (2026-08-05/06)**.
+**Git commits:** Pushed to origin/main (audit pass; Ornith-era: f234fe1, 8bf5a88, a1ca9c0, 7ea8d40, 1dd11d3; audit-era: 1ed554a, 5d735a9, e95c624, 115fbdb; modern-era: 991e481, 528f620, 16bcef8, a1c2f67, 5aa6154 Phase 2 prefetch, aaec49d anti-doom, c4944e0 native engine fix; streaming-era: 4d196cd plan doc, 989132a naive impl, dff4dee build guide; **GGUF-era: 646b16b strategy reassessment, 824d36c lm_head caching + GGUF docs — plus uncommitted wrap-up work: GPT-2 byte decode fix, Q6_K lm_head block cache, streaming UTF-8 buffer, 3 stale tests fixed**; **2026-08-05/06-era: 3ea1c3c Ornith REPL restore + anti-doom removal, b90a49f RAM cap, 1459e47 tokenizer bracket/punct fix, c7dde05 Ministral profile + FFI build fix**).
+**Author:** Kimi Code CLI; stability fixes by m3 (Nvidia); Kimi K2.6 / GLM-5.2 / Qwen 3.5 / Ornith / pre-release audit hardening work by m3 (Nvidia); Phase 2 + anti-doom work by m3 (Nvidia); streaming native Rust forward pass by m3 (Nvidia) + Hermes GLM-5.2 pair-programming; **GGUF engine breakthrough + project wrap-up by m3 (Nvidia) / xander with OpenCode**; **Ornith REPL restoration + RAM cap + Ministral profile fix by xander with OpenCode (2026-08-05/06)**.
 
 ---
 
@@ -14,12 +14,12 @@ Transform LeafcutterLLM from a failing prototype into a production-ready LLM inf
 **Tripolar mission (re-aligned 2026-07-24):**
 1. **Lighter than airllm**: 1,145 MB peak RSS on 70B via layer streaming + `madvise`. AirLLM needs 16+ GB for the same model. Reference: `/home/xander/Documents/reference/airllm/`.
 2. **Faster than colibri**: layer-streaming + async layer prefetch (commit 5aa6154, 1.68× warm-cache on 3B) + per-architecture SIMD paths. Reference: `/home/xander/Documents/reference/colibri/`.
-3. **Smarter than colibri**: inference-time anti-doom loop detector (commit aaec49d), per-architecture fast paths for Gemma 3/4 / Qwen 3.5 / BitNet / MoE, "every token counts" runtime guards. Colibri is pure dumb-pipe inference; Leafcutter's defensible differential is the Smart primitive. Reference: `/home/xander/Documents/reference/antidoom/`.
+3. **Smarter than colibri**: correct tokenization (marker-aware pretokenize + UTF-8 streaming), profile-faithful chat templates, RAM-gated prefetch, per-architecture fast paths for Gemma 3/4 / Qwen 3.5 / BitNet / MoE. (The inference-time anti-doom loop detector, commit aaec49d, was **removed 2026-08-05** — it panicked on multi-byte UTF-8; the native sampler with correct stop tokens is sufficient.) Colibri is pure dumb-pipe inference; Leafcutter's defensible differential is the Smart primitive.
 
 Stack policy:
-- Rust for the inference engine and any inference-time runtime logic (anti-doom, sampler hooks, K/V cache strategies).
+- Rust for the inference engine and any inference-time runtime logic (sampler hooks, K/V cache strategies).
 - Go ONLY when we need to orchestrate many concurrent multi-model-serving tasks (`/home/xander/Documents/portfolio/cynapse` is the example).
-- Avoid Python — antidoom itself is Python+PyTorch, but we ported the IDEA to Rust as a sampler hook; the Python training pipeline is NOT a target.
+- Avoid Python in the inference engine — antidoom's idea was ported to Rust as a sampler hook, but the Python training pipeline is NOT a target. (Separate OCR work is a Python build, outside the engine.)
 
 ---
 
@@ -50,6 +50,7 @@ Stack policy:
   - **Correct UTF-8 streaming** — GPT-2 byte-level decode fixed (`gguf.rs`); multi-byte chars (emoji, Latin-1) split across byte-tokens are reassembled by a streaming UTF-8 buffer instead of printing `�`.
   - **Q6_K lm_head block cache** — lm_head stays quantized in RAM (~0.8 GB vs the old 3.79 GiB f32 array); saves ~3 GB and ~2× per-token lm_head time. Peak chat RAM **~8.1 GB**, 1.2–1.65 tok/s on a Ryzen 5800HS.
   - **Test suite fully green** — 161 passed / 0 failed / 3 ignored (the 3 stale tests were fixed).
+- **Ornith REPL restored + RAM capped + Ministral fixed (2026-08-05/06)** — see the new "Session 2026-08-05/06" entry in Recent Changes below. Highlights: REPL regression (GGUF Jinja template primed verbose thinking) fixed back to the profile renderer; anti-doom loop detector removed after UTF-8 char-boundary panics; RAM now matches Ollama (~1× model size); Ministral profile matches Ollama's full system prompt + temperature + stop tokens.
 - **Pre-release audit hardening (Jul 2026)** — 20 audit findings routed. Closed all 3 CRITICAL (byte-fallback tokenizer, mmap OOB, hardcoded API key) and 7 of 7 HIGH (hardcoded path, `Engine::forward` Result propagation, `gemma.rs` TODO, FFI Send/Sync documentation, exhaustive dequant dispatch via `UnsupportedQuantType`, atomic `KVCache` KVEntry). 5/5 MEDIUM closed (saturating_sub, TcpListener error, host flag, AVX2 scalar fallback, stdin/stdout). 5 of 5 LOW closed. Two follow-up findings landed in `35001a3`: FINDING K (`lm_head_projection` no longer panics on row-read failure — returns `0.0` logit instead) and FINDING M (hardcoded `"v0.9.5-production"` in `/health` replaced with `env!("CARGO_PKG_VERSION")`). **Ornith E2E still 5/5**; 137 unit tests pass (1 unchanged pre-existing failure). Both feature configs build release-clean. See `AUDIT_REPORT.md` for full findings.
 - **Coherent generation verified** — "The capital of France is" → coherent multi-sentence output
 - **Quantized weight loading** — 4× memory reduction. One layer resident at a time as native quantized blocks.
@@ -81,9 +82,12 @@ Stack policy:
 
 ### What's Blocked
 
+- **Ministral native forward-pass divergence (KNOWN BUG, 2026-08-05)** — Identical 51-token prefill → llama.cpp top-1 `The` (logit 18.31) vs leafcutter `I`. Short/neutral system prompts answer correctly ("The sum of 2 plus 2 is **4**"), but the full Ollama system prompt degenerates into `I'm. / ### Answer:` loops in native `generate`/`run`. Workaround: `--features llama-ffi` (correct, "The answer to **2 + 2** is: **4**"), or short system prompts in native mode. Suspect: RoPE/temperature_scale or a residual numerical difference in the prefill path. Not yet routed through the FFI path (no REPL-FFI routing exists).
+- **`run --engine ollama`** — Returns HTTP 400 from `http://127.0.0.1:11434/api/chat` on this system (model name accepted, request rejected). Not a usable fallback yet.
 - **Qwen3.5/3.6 native DeltaNet coherence** — DeltaNet kernels implemented but `qkv_proj` output does not yet match HF reference. Pre-norm input is correct (decay/beta match). Suspected cause: Q4_0 quantized matmul kernel orientation or weight loading layout.
 - **Qwen3.6-27B attention layers** — compressed KV (`key_length=256`) and partial RoPE (`rope_dim=64`) are implemented, but the model has not been validated end-to-end due to the DeltaNet alignment blocker above.
-- **Workaround:** Use llama.cpp bridge for Qwen3.5/3.6 models.
+- **Bonsai-27B-dspark-Q4_1.gguf** — Unsupported in native engine (Q4_1/BF16/attn_q_norm kinds → "Can run: NO ❌" unless `--features llama-ffi`). **Intentionally ignored**; now occupies `leafcutter list` index 0 (Ministral=1, Ornith=3).
+- **Workaround:** Use llama.cpp bridge for Qwen3.5/3.6 and Bonsai models.
 
 ### Real Model Validation Results
 
@@ -168,6 +172,34 @@ small refactor and is deferred.
 - CRASH-2 — `ffn_forward` shape panic on Ministral-3B (hidden=3072 vs FFN=4096). Needs either a hidden_size override flag or a runtime projecting layer.
 - CRASH-3 — Qwen3.6 MoE: `ffn_forward` uses `mlp.gate_proj/up_proj/down_proj`; MoE arch has different weight names (`mlp.expert_*` + router). Adding full MoE dispatch is a future milestone.
 - CORRECT-4 — causal mask for `seq_offset > 0` + multi-token prefill. The single-token decode path is correct.
+
+### Session 2026-08-05/06 — Ornith REPL restored; RAM capped; anti-doom removed; Ministral profile fixed (xander + OpenCode)
+
+Commits: `3ea1c3c` (REPL restore + anti-doom removal + monitor opt-in), `b90a49f` (RAM cap), `1459e47` (tokenizer bracket/punct merge), `c7dde05` (Ministral profile + chat template + FFI build fix).
+
+**Ornith REPL regression — root cause & fix (`3ea1c3c`):**
+- The `run` REPL started preferring the GGUF-embedded Jinja template (`apply_chat_template_from_gguf`, ends with `<think>\n`) over the profile-based `render_chat_prompt`. The GGUF template primed Ornith to think verbosely with markdown bullets. The CLI `generate` path (profile renderer) was unaffected.
+- Fix: REPL always uses the profile renderer again; added a `floor_char_boundary` slice guard so partial UTF-8 never hits the `is_char_boundary` panic.
+- Verified by user: `leafcutter run 3` → short 💭 think → crisp "Hey! 👋 I'm Ornith…", `/bye` clean, no panic. This exact interaction quality must not regress.
+
+**anti-doom removed (`3ea1c3c`):**
+- `anti_doom.rs:544` byte-sliced into multi-byte UTF-8 chars → `is_char_boundary` panic on `Ċ`/`👋`. Never worked reliably. Deleted `src/inference/anti_doom.rs`; stripped all `engine.rs`/`mod.rs` references.
+
+**RAM cap (`b90a49f`):**
+- Ollama holds Ornith at 5,655 MB; leafcutter native hit 9.7 GB because async layer prefetch (default-on) held current+next layer resident. Now default-on only when available RAM ≥ 2× model size (`probe_hardware().ram_available_mb`). Measured: 3.4 GB single-shot, 7.8 GB REPL, 4.2–4.3 GB Ministral REPL. Override: `LEAFCUTTER_PREFETCH=0/1`.
+
+**CPU monitor opt-in:** `cpu_monitor.rs` now off by default; `LEAFCUTTER_CPU_MONITOR=1` enables. No `[MONITOR]` noise mid-stream.
+
+**Tokenizer (`1459e47`):** Mistral `[SYSTEM_PROMPT]`/`[INST]` marker pretokenization + `split_trailing_punct` (`.\n`→1626, `).\n`→4342).
+
+**Ministral profile (`c7dde05`):** `default_system` = Ollama's full `SYSTEM_PROMPT.txt` from the model dir; temperature 0.7→0.15; `[/INST]` stop id 5→4 (id 5 = `[AVAILABLE_TOOLS]`); `render_chat_prompt` emits `[SYSTEM_PROMPT]…[/SYSTEM_PROMPT][INST]user[/INST]` (no system inside `[INST]`). FFI engine gets `cached_lm_head: None` so `--features llama-ffi` builds.
+
+**Status:**
+- ✅ Ornith REPL fully restored (profile renderer, no monitor noise, no panic).
+- ✅ RAM ~1× model RSS (matches Ollama).
+- ✅ Ministral via FFI: "The answer to **2 + 2** is: **4**" (full system prompt).
+- ✅ Ministral via native, short neutral system prompt: "The sum of 2 plus 2 is **4**".
+- ⚠️ Known bug: native forward-pass divergence (see "What's Blocked").
 
 ### Session 2026-05-28 — Go Removal + llama.cpp Minimization
 
@@ -255,11 +287,13 @@ small refactor and is deferred.
 
 ## Next Steps
 
-1. **[IN PROGRESS] Qwen3.5 native DeltaNet** — Kernels implemented; debugging `qkv_proj` alignment vs HF. Use bridge for production.
-2. **[HIGH] Speed optimization** — Quantized GEMM kernels are naive scalar loops. Need SIMD matmul or `gemm` crate.
-3. **[MEDIUM] More quant formats** — Q2_K, IQ2_XXS, Q4_1, BF16 have no native dequant kernels.
-4. **[MEDIUM] KV cache quantization** — Store KV cache as f16 or Q8_0 to reduce memory by 2-4×.
-5. **[LOW] Chat template robustness** — Qwen3.6 uses `<|im_start|>` format; already auto-detected from vocab tokens.
+1. **[HIGH] Fix Ministral native forward-pass divergence** — same 51-token prefill → llama.cpp `The` (18.31) vs leafcutter `I`. Debug RoPE/temperature_scale/prefill numerics, or route the REPL through the FFI path so Ministral works natively with the full system prompt.
+2. **[IN PROGRESS] Qwen3.5 native DeltaNet** — Kernels implemented; debugging `qkv_proj` alignment vs HF. Use bridge for production.
+3. **[HIGH] Speed optimization** — Quantized GEMM kernels are naive scalar loops. Need SIMD matmul or `gemm` crate.
+4. **[MEDIUM] More quant formats** — Q2_K, IQ2_XXS, Q4_1, BF16 have no native dequant kernels.
+5. **[MEDIUM] KV cache quantization** — Store KV cache as f16 or Q8_0 to reduce memory by 2-4×.
+6. **[LOW] Chat template robustness** — Qwen3.6 uses `<|im_start|>` format; already auto-detected from vocab tokens.
+7. **[NEXT SESSION] Unlimited-OCR Python build** — after docs, build the OCR pipeline in Python (project focus has shifted to OCR; LeafcutterLLM is in a clean, documented state).
 
 ---
 
