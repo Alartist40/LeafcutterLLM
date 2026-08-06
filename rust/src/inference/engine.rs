@@ -354,7 +354,11 @@ impl Engine {
         // `LEAFCUTTER_CACHE_HEAD=0`.
         let lm_head_tied = !model.file.get_tensor_info("output.weight").is_some();
         let lm_head_tensor_name = if lm_head_tied { "token_embd.weight" } else { "output.weight" };
-        let cache_head = std::env::var("LEAFCUTTER_CACHE_HEAD").map(|v| v != "0").unwrap_or(true);
+        // Default OFF: Leafcutter is a stateless inference tool — like Ollama it
+        // reads output.weight from mmap on demand per token instead of holding a
+        // resident Q6_K cache (~0.8 GB for Ornith).  Opt in with
+        // `LEAFCUTTER_CACHE_HEAD=1` for a ~2× lm_head speedup at +0.8 GB RSS.
+        let cache_head = std::env::var("LEAFCUTTER_CACHE_HEAD").map(|v| v == "1" || v == "true").unwrap_or(false);
         let cached_lm_head = if cache_head && model.model_fits_available_ram() {
             load_lm_head_cache(&model, lm_head_tensor_name)
         } else {
@@ -930,19 +934,19 @@ impl Engine {
                 .get_layer(0)
                 .map_err(|e| format!("layer 0 load: {}", e))?;
             // Prefetch loads the next layer's weights into RAM while computing
-            // the current one — faster decode, but doubles peak RSS (current
-            // layer + next layer resident at the same time).  Only enable by
-            // default when we have generous RAM headroom (≥ 2× model size
-            // available); otherwise stay at the Ollama-like 1× footprint.
+            // the current one — faster decode, but holds 2 layers resident.
+            // Default OFF for an Ollama-like 1× footprint (Leafcutter is a
+            // stateless tool).  Opt in with `LEAFCUTTER_PREFETCH=1`; the
+            // available-RAM guard still protects tight hosts from `=1`.
             // Override: LEAFCUTTER_PREFETCH=1 to force on, =0 to force off.
             let use_prefetch = match std::env::var("LEAFCUTTER_PREFETCH").ok().as_deref() {
                 Some("0") | Some("false") => false,
-                Some("1") | Some("true") => true,
-                _ => {
+                Some("1") | Some("true") => {
                     let avail = crate::detect::probe_hardware().ram_available_mb;
                     let model_mb = (self.model.file.file_size_bytes() / (1024 * 1024)) as u64;
                     avail >= model_mb.saturating_mul(2)
                 }
+                _ => false,
             };
             let mut prefetch: Option<std::thread::ScopedJoinHandle<'_, Result<std::sync::Arc<HashMap<String, Tensor>>, String>>> =
                 if use_prefetch && num_layers > 1 {
