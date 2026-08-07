@@ -41,7 +41,11 @@ curl -fsSL https://raw.githubusercontent.com/Alartist40/LeafcutterLLM/main/insta
 curl -fsSL https://raw.githubusercontent.com/Alartist40/LeafcutterLLM/main/install.sh | bash
 ```
 
-The installer clones the repo, compiles the `leafcutter` binary, and puts it on your PATH. That's it — one static binary, zero runtime dependencies.
+The installer downloads the prebuilt `leafcutter` binary for your OS and CPU
+and puts it on your PATH — no compiler, no Rust toolchain, nothing to wait on
+(the same instant-start experience as installing Ollama). If no prebuilt
+binary exists yet for your platform it falls back to compiling from source
+and even installs Rust for you. One binary, zero runtime dependencies.
 
 ```bash
 # Find your models (auto-detects ./models and ~/Downloads/models)

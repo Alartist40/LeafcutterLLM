@@ -1,0 +1,117 @@
+# Build native LeafcutterLLM binaries for every major platform and attach
+# them to a GitHub Release.  This is what powers the one-line install:
+#
+#   curl -fsSL https://raw.githubusercontent.com/Alartist40/LeafcutterLLM/main/install.sh | sh
+#
+# install.sh downloads the matching prebuilt binary from the latest release
+# instead of requiring a local Rust toolchain.  Cut a release by pushing a
+# tag:   git tag v0.9.0 && git push origin v0.9.0
+#
+# Asset names follow: leafcutter-<os>-<arch>[.exe]
+#   e.g. leafcutter-linux-x86_64, leafcutter-macos-aarch64,
+#        leafcutter-windows-x86_64.exe
+
+name: Release Binaries
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to build (default: latest pushed tag)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: leafcutter-linux-x86_64
+            ext: ''
+          - name: linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: leafcutter-linux-aarch64
+            ext: ''
+          - name: macos-x86_64
+            os: macos-13
+            target: x86_64-apple-darwin
+            artifact: leafcutter-macos-x86_64
+            ext: ''
+          - name: macos-aarch64
+            os: macos-14
+            target: aarch64-apple-darwin
+            artifact: leafcutter-macos-aarch64
+            ext: ''
+          - name: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: leafcutter-windows-x86_64
+            ext: .exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ matrix.target }}-${{ hashFiles('rust/Cargo.lock') }}
+
+      - name: Build release binary
+        working-directory: rust
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin leafcutter
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "rust/target/${{ matrix.target }}/release/leafcutter${{ matrix.ext }}" \
+             "dist/${{ matrix.artifact }}${{ matrix.ext }}"
+          chmod +x "dist/${{ matrix.artifact }}${{ matrix.ext }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}${{ matrix.ext }}
+          if-no-files-found: error
+
+  release:
+    name: Attach to GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
