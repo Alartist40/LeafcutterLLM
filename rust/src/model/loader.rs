@@ -56,6 +56,12 @@ pub struct ModelConfig {
     /// (i.e. `rope_scaling.type == "yarn"` is absent). Models like
     /// Ministral-3-3B-Instruct-2512 require this for coherent generation.
     pub rope_yarn: Option<YarnParams>,
+    /// Attention temperature scaling scale factor (`*.attention.temperature_scale`).
+    /// 0.0 = disabled.  Used by Mistral-3 / Llama-4 models.
+    pub attention_temp_scale: f32,
+    /// Position floor for attention temperature scaling.  When 0, derived from
+    /// the YaRN original context length at load time.
+    pub attention_temp_floor_scale: usize,
 }
 
 impl Default for ModelConfig {
@@ -77,6 +83,8 @@ impl Default for ModelConfig {
             norm_eps: 1e-5,
             eos_token: 2,
             rope_yarn: None,
+            attention_temp_scale: 0.0,
+            attention_temp_floor_scale: 0,
         }
     }
 }
@@ -627,6 +635,32 @@ impl GGUFModel {
                 "[loader] RoPE-YaRN active: factor={}, freq_scale={}, orig_ctx={}, ext_factor={}, beta_fast={}, beta_slow={}, attn_factor={}",
                 scaling_factor, 1.0 / scaling_factor, orig_ctx, yarn_ext_factor, beta_fast, beta_slow, attn_factor
             );
+        }
+
+        // Attention temperature scaling (Mistral-3 / Llama-4): `temperature_scale`
+        // KV under `<prefix>.attention.*`.  llama.cpp (llama-graph.cpp) computes
+        // `log(floor((pos + offset)/floor_scale) + 1) * scale + 1` per position and
+        // multiplies Q by it after RoPE.  floor_scale is n_ctx_orig_yarn when the
+        // KV is absent (llama.cpp mistral3.cpp:14-15).
+        cfg.attention_temp_scale = Self::get_meta_f32(file, &[
+            &format!("{}.attention.temperature_scale", prefix),
+            "mistral3.attention.temperature_scale",
+            "llama4.attention.temperature_scale",
+            "llama.attention.temperature_scale",
+        ])
+        .unwrap_or(0.0);
+        if cfg.attention_temp_scale != 0.0 {
+            let floor = cfg.rope_yarn.as_ref().map(|y| y.orig_ctx).unwrap_or(0);
+            cfg.attention_temp_floor_scale = floor;
+            if floor == 0 {
+                eprintln!("[loader] WARNING: attention.temperature_scale set but no YaRN orig_ctx; temp scaling disabled");
+                cfg.attention_temp_scale = 0.0;
+            } else {
+                eprintln!(
+                    "[loader] attention temp scaling active: scale={}, floor_scale={}",
+                    cfg.attention_temp_scale, floor
+                );
+            }
         }
 
         cfg

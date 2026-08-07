@@ -124,7 +124,7 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         raw: bool,
         /// Max tokens to generate
-        #[arg(short, long, default_value = "128")]
+        #[arg(short = 'n', long, default_value = "128")]
         max_tokens: usize,
         /// Sampling temperature (0.0 = greedy)
         #[arg(short, long, default_value = "0.8")]
@@ -189,6 +189,10 @@ enum SourceOp {
 
 #[tokio::main]
 async fn main() {
+    // Cap rayon's global pool BEFORE any par_iter() runs (defaults to ALL
+    // logical CPUs → pegs every core and spins up laptop fans during a
+    // single inference workload). Default = physical cores − 1.
+    leafcutter::init::configure_thread_pool(None);
     let cli = Cli::parse();
 
     // Cynapse synapse metadata query — must work without loading a model

@@ -518,6 +518,12 @@ impl Engine {
     // Attention parameter inference from actual weight shapes
     // -------------------------------------------------------------------------
     fn infer_attention_params(model: &GGUFModel, config: &ModelConfig) -> AttentionParams {
+        // mistral3 (and similar NORM-rope arches) rotate consecutive pairs (2d, 2d+1);
+        // classic arches use NEOX-style half-dim pairs (d, d+rope_dim/2).
+        let rope_pair_norm = match model.file.metadata.get("general.architecture") {
+            Some(crate::model::gguf::GGUFValue::String(s)) => s == "mistral3",
+            _ => false,
+        };
         let num_layers = config.num_hidden_layers;
         let mut q_out_dim = 0usize;
         let mut kv_out_dim = 0usize;
@@ -554,6 +560,9 @@ impl Engine {
                 use_gate: false,
                 window_size,
                 yarn: config.rope_yarn.clone(),
+                temp_scale: config.attention_temp_scale,
+                temp_floor_scale: config.attention_temp_floor_scale,
+                rope_pair_norm,
             };
         }
 
@@ -589,6 +598,9 @@ impl Engine {
             use_gate: false,
             window_size,
             yarn: config.rope_yarn.clone(),
+            temp_scale: config.attention_temp_scale,
+            temp_floor_scale: config.attention_temp_floor_scale,
+            rope_pair_norm,
         }
     }
 

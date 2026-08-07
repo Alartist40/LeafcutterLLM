@@ -27,6 +27,16 @@ pub struct AttentionParams {
     /// Optional YaRN parameters. When `Some`, `apply_rotary_emb` uses
     /// YaRN-scaled inv_freq instead of vanilla RoPE.
     pub yarn: Option<YarnParams>,
+    /// Attention temperature scaling (Mistral-3 / Llama-4): Q is multiplied
+    /// per-position by `log(floor((pos + offset)/floor_scale) + 1) * scale + 1`
+    /// after RoPE.  `scale == 0.0` disables.  For Ministral-3 this is
+    /// scale=0.1 with floor_scale = original_context_length (16384).
+    pub temp_scale: f32,
+    /// Position floor for temperature scaling (n_attn_temp_floor_scale).
+    pub temp_floor_scale: usize,
+    /// RoPE pairing mode. `false` = NEOX (pairs `(d, d + head_dim/2)`, default),
+    /// `true` = NORM (consecutive pairs `(2d, 2d+1)`, used by e.g. mistral3).
+    pub rope_pair_norm: bool,
 }
 
 impl Default for AttentionParams {
@@ -42,6 +52,9 @@ impl Default for AttentionParams {
             use_gate: false,
             window_size: 0,
             yarn: None,
+            temp_scale: 0.0,
+            temp_floor_scale: 0,
+            rope_pair_norm: false,
         }
     }
 }
@@ -82,6 +95,7 @@ pub fn apply_rotary_emb(
     theta: f32,
     position_offset: usize,
     yarn: Option<&YarnParams>,
+    pair_norm: bool,
 ) {
     let rope_dim = if rope_dim > 0 && rope_dim <= head_dim { rope_dim } else { head_dim };
     let n = x.data.len();
@@ -127,8 +141,11 @@ pub fn apply_rotary_emb(
                 };
 
                 let base = i * stride + h * head_dim;
-                let x1_idx = base + d;
-                let x2_idx = base + d + rope_dim / 2;
+                let (x1_idx, x2_idx) = if pair_norm {
+                    (base + 2 * d, base + 2 * d + 1)
+                } else {
+                    (base + d, base + d + rope_dim / 2)
+                };
 
                 if x1_idx >= n || x2_idx >= n {
                     continue;
@@ -321,8 +338,31 @@ pub fn attention_forward(
     // RoPE
     // -------------------------------------------------------------------------
     let yarn_ref = params.yarn.as_ref();
-    apply_rotary_emb(&mut q, seq_len, params.num_heads, content_head_dim, params.rope_dim, params.rope_theta, position_offset, yarn_ref);
-    apply_rotary_emb(&mut k, seq_len, params.num_kv_heads, params.kv_head_dim, params.rope_dim, params.rope_theta, position_offset, yarn_ref);
+    apply_rotary_emb(&mut q, seq_len, params.num_heads, content_head_dim, params.rope_dim, params.rope_theta, position_offset, yarn_ref, params.rope_pair_norm);
+    apply_rotary_emb(&mut k, seq_len, params.num_kv_heads, params.kv_head_dim, params.rope_dim, params.rope_theta, position_offset, yarn_ref, params.rope_pair_norm);
+
+    // -------------------------------------------------------------------------
+    // Attention temperature scaling (Mistral-3 / Llama-4)
+    // -------------------------------------------------------------------------
+    // Matches llama.cpp llama-graph.cpp set_input: per-position scale applied
+    // to Q after RoPE.  `scale = log(floor((pos+offset)/floor_scale)+1)*k + 1`.
+    // For positions below floor_scale this is exactly 1.0 (identity), so only
+    // long-context sequences are affected.
+    if params.temp_scale != 0.0 && params.temp_floor_scale > 0 {
+        let q_dim = params.num_heads * content_head_dim;
+        let scale = params.temp_scale;
+        let floor_scale = params.temp_floor_scale;
+        for s in 0..seq_len {
+            let pos = (position_offset + s) as f32;
+            let sc = ((pos / floor_scale as f32).floor() + 1.0).ln() * scale + 1.0;
+            if sc != 1.0 {
+                let base = s * q_dim;
+                for d in 0..q_dim {
+                    q.data[base + d] *= sc;
+                }
+            }
+        }
+    }
 
     // -------------------------------------------------------------------------
     // KV Cache (M5: compressed dimensions)

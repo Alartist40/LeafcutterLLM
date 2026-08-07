@@ -336,6 +336,9 @@ pub fn gemma_layer_forward(
         // sliding layers use window_size=1024; global layers use 0 (no mask)
         window_size: if layer_cfg.is_global { 0 } else { 1024 },
         yarn: None,
+        temp_scale: 0.0,
+        temp_floor_scale: 0,
+        rope_pair_norm: false,
     };
     let attn_out = attention_forward(
         &pre_attn,

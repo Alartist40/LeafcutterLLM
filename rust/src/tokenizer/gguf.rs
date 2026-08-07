@@ -249,6 +249,14 @@ impl GgufTokenizer {
             // in punctuation, the punct run is detached and merged with the
             // newline.
             if c == '\u{0120}' || c == '\u{010A}' || c == '\u{0109}' {
+                // Multiple newlines group into one pre-token (tekken/GPT-2
+                // regex: `\s+` / `[\s\p{Z}]+[\r\n]`), so a `.\n\n` stays
+                // together as `.\n\n` and can BPE into the single vocab token.
+                if c == '\u{010A}' && !current.is_empty() && current.ends_with('\u{010A}') {
+                    current.push(c);
+                    i += 1;
+                    continue;
+                }
                 if c == '\u{010A}' && !current.is_empty() {
                     let (prefix, punct) = split_trailing_punct(&current);
                     if !punct.is_empty() {
@@ -315,6 +323,12 @@ impl GgufTokenizer {
                 }
                 // Not a vocab special token — fall through to treat the
                 // opening bracket as a normal character.
+            }
+            // A newline group is standalone (regex `\s+`); don't let the next
+            // word absorb the leading newline(s).  Spaces (Ġ) still attach to
+            // the following word per GPT-2 convention.
+            if current.contains('\u{010A}') {
+                result.push(std::mem::take(&mut current));
             }
             current.push(c);
             i += 1;
