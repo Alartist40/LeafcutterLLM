@@ -20,6 +20,25 @@ pub fn enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the current CPU supports AVX2 + FMA.
+///
+/// Safe to call on ANY architecture (x86, aarch64, riscv, …). On non-x86
+/// targets this always returns `false`, so kernels can gate their SIMD fast
+/// paths with a single portable check instead of sprinkling
+/// `std::arch::is_x86_feature_detected!` behind `cfg!()` guards (the macro
+/// itself cannot even be *parsed* on non-x86 targets).
+#[inline]
+pub fn cpu_has_avx2_fma() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    {
+        std::arch::is_x86_feature_detected!("avx2") && std::arch::is_x86_feature_detected!("fma")
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        false
+    }
+}
+
 /// Reference dot product: serial, f64-accumulated, no FMA contraction.
 /// Bit-identical for a given input on every machine/thread count.
 #[inline]

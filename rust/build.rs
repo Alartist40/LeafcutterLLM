@@ -1,7 +1,18 @@
 use std::path::Path;
 
 fn main() {
-    // Allow overriding the llama.cpp build path via env var.
+    // Only link llama.cpp when the FFI feature is actually enabled. Without
+    // this guard a vendored `llama.cpp/build` directory (or an x86_64 build
+    // on this machine) would inject host-architecture .so link directives
+    // into a cross-compiled or aarch64 build.
+    #[cfg(feature = "llama-ffi")]
+    {
+        link_llama_cpp();
+    }
+}
+
+#[cfg(feature = "llama-ffi")]
+fn link_llama_cpp() {
     let llama_build = std::env::var("LLAMA_CPP_BUILD")
         .unwrap_or_else(|_| {
             // Check vendored path first

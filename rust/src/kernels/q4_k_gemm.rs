@@ -361,27 +361,34 @@ fn q4_k_gemv_col_scalar(a: &[f32], b: &Q4KMatrix, col: usize) -> f32 {
 pub fn q4_k_gemv_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], k: usize, n: usize) {
     assert_eq!(b.cols, k, "B cols ({}) must match k ({}) in transposed mode", b.cols, k);
     assert_eq!(b.rows, n, "B rows ({}) must match n ({}) in transposed mode", b.rows, n);
+
+    #[cfg(target_arch = "x86_64")]
     let use_avx2 = !crate::deterministic::enabled()
-        && cfg!(target_arch = "x86_64")
         && std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("fma");
+    #[cfg(not(target_arch = "x86_64"))]
+    let use_avx2 = false;
 
     if n >= 4096 {
         use rayon::prelude::*;
+        #[cfg(target_arch = "x86_64")]
         if use_avx2 {
             c.par_iter_mut().enumerate().for_each(|(j, out)| {
                 *out = unsafe { q4_k_gemv_col_avx2(a, b, j) };
             });
-        } else {
-            c.par_iter_mut().enumerate().for_each(|(j, out)| {
-                *out = q4_k_gemv_col_scalar(a, b, j);
-            });
+            return;
         }
-    } else if use_avx2 {
-        for (j, out) in c.iter_mut().enumerate() {
-            *out = unsafe { q4_k_gemv_col_avx2(a, b, j) };
-        }
+        c.par_iter_mut().enumerate().for_each(|(j, out)| {
+            *out = q4_k_gemv_col_scalar(a, b, j);
+        });
     } else {
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 {
+            for (j, out) in c.iter_mut().enumerate() {
+                *out = unsafe { q4_k_gemv_col_avx2(a, b, j) };
+            }
+            return;
+        }
         for (j, out) in c.iter_mut().enumerate() {
             *out = q4_k_gemv_col_scalar(a, b, j);
         }
