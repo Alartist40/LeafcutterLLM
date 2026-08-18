@@ -1703,7 +1703,7 @@ fn run_tf_check_ffi(model: &LlamaModel, _model_path: &PathBuf, prompt: &str, sys
         all.extend_from_slice(&reference[..i]);
         match ctx.forward(&all) {
             Ok(logits) => {
-                if let Some(pred) = argmax_top(&logits, model.n_vocab()) {
+                if let Some(pred) = argmax_top(&logits, model.n_vocab() as usize) {
                     total += 1;
                     if pred == reference[i] as usize {
                         matched += 1;
