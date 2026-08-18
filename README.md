@@ -43,9 +43,15 @@ curl -fsSL https://raw.githubusercontent.com/Alartist40/LeafcutterLLM/main/insta
 
 The installer downloads the prebuilt `leafcutter` binary for your OS and CPU
 and puts it on your PATH — no compiler, no Rust toolchain, nothing to wait on
-(the same instant-start experience as installing Ollama). If no prebuilt
-binary exists yet for your platform it falls back to compiling from source
-and even installs Rust for you. One binary, zero runtime dependencies.
+(the same instant-start experience as installing Ollama). Prebuilt binaries
+are published for `linux-x86_64` and `linux-aarch64` (Raspberry Pi, Orange Pi
+and other SBCs). If no prebuilt binary exists yet for your platform it falls
+back to compiling from source and even installs Rust for you. One binary, zero
+runtime dependencies.
+
+Update to the latest version any time with `leafcutter update` — it downloads
+the newest prebuilt binary (or rebuilds from source on platforms without one),
+just like `opencode upgrade`.
 
 ```bash
 # Find your models (auto-detects ./models and ~/Downloads/models)
@@ -62,6 +68,9 @@ leafcutter generate --model ~/models/model.gguf --prompt "Hello world"
 
 # Serve an OpenAI-compatible API
 leafcutter serve --model ~/models/model.gguf --port 8081
+
+# Update to the latest version (like `opencode upgrade`)
+leafcutter update
 ```
 
 Inside the chat REPL:
