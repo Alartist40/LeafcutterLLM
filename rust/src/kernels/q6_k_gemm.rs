@@ -313,15 +313,16 @@ pub fn q6_k_matmul_transposed_b(a: &[f32], b: &Q6KMatrix, c: &mut [f32], m: usiz
     if m == 1 {
         // Q8_K-activation integer-dot path is the default (faster); the f32
         // fused GEMV below remains as the opt-out (`LEAFCUTTER_Q8_GEMV=0`).
+        // Deterministic mode also disables it so results are reproducible.
         let disabled = std::env::var("LEAFCUTTER_Q8_GEMV").map(|v| v == "0").unwrap_or(false);
-        if !disabled {
+        if !disabled && !crate::deterministic::enabled() {
             crate::kernels::q8_k_gemm::q6_k_matmul_transposed_b_q8(a, b, c, m, k, n);
             return;
         }
         let a_row = &a[..k];
         #[cfg(target_arch = "x86_64")]
         {
-            if std::is_x86_feature_detected!("avx2") {
+            if !crate::deterministic::enabled() && std::is_x86_feature_detected!("avx2") {
                 use rayon::prelude::*;
                 // Parallel over columns. Each column accumulates into one
                 // output slot, so parallel writes never conflict.

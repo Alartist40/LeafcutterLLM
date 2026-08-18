@@ -401,15 +401,25 @@ pub fn attention_forward(
                     } else if params.window_size > 0 && t + params.window_size <= cache_len + s {
                         scores[t] = f32::NEG_INFINITY; // SWA: block tokens beyond window
                     } else {
-                        let mut dot = 0.0f32;
-                        for d in 0..params.kv_head_dim {
-                            // Q uses first kv_head_dim of its head_dim for scoring
-                            let q_val = q.data[s * params.num_heads * content_head_dim + h * content_head_dim + d];
-                            let k_val = k_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d];
-                            dot += q_val * k_val;
+                        if crate::deterministic::enabled() {
+                            let q_base = s * params.num_heads * content_head_dim + h * content_head_dim;
+                            let k_base = t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim;
+                            let mut dot = 0.0f64;
+                            for d in 0..params.kv_head_dim {
+                                dot += q.data[q_base + d] as f64 * k_cached.data[k_base + d] as f64;
+                            }
+                            scores[t] = dot as f32 / (params.kv_head_dim as f32).sqrt();
+                        } else {
+                            let mut dot = 0.0f32;
+                            for d in 0..params.kv_head_dim {
+                                // Q uses first kv_head_dim of its head_dim for scoring
+                                let q_val = q.data[s * params.num_heads * content_head_dim + h * content_head_dim + d];
+                                let k_val = k_cached.data[t * params.num_kv_heads * params.kv_head_dim + kv_h * params.kv_head_dim + d];
+                                dot += q_val * k_val;
+                            }
+                            // Scale by sqrt(kv_head_dim) — the dimension of the dot product
+                            scores[t] = dot / (params.kv_head_dim as f32).sqrt();
                         }
-                        // Scale by sqrt(kv_head_dim) — the dimension of the dot product
-                        scores[t] = dot / (params.kv_head_dim as f32).sqrt();
                     }
                 }
 

@@ -183,8 +183,9 @@ pub fn q4_k_matmul_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usiz
     if m == 1 {
         // Q8_K-activation integer-dot path is the default (faster); the f32
         // fused GEMV below remains as the opt-out (`LEAFCUTTER_Q8_GEMV=0`).
+        // Deterministic mode also disables it so results are reproducible.
         let disabled = std::env::var("LEAFCUTTER_Q8_GEMV").map(|v| v == "0").unwrap_or(false);
-        if !disabled {
+        if !disabled && !crate::deterministic::enabled() {
             crate::kernels::q8_k_gemm::q4_k_matmul_transposed_b_q8(a, b, c, m, k, n);
             return;
         }
@@ -360,7 +361,8 @@ fn q4_k_gemv_col_scalar(a: &[f32], b: &Q4KMatrix, col: usize) -> f32 {
 pub fn q4_k_gemv_transposed_b(a: &[f32], b: &Q4KMatrix, c: &mut [f32], k: usize, n: usize) {
     assert_eq!(b.cols, k, "B cols ({}) must match k ({}) in transposed mode", b.cols, k);
     assert_eq!(b.rows, n, "B rows ({}) must match n ({}) in transposed mode", b.rows, n);
-    let use_avx2 = cfg!(target_arch = "x86_64")
+    let use_avx2 = !crate::deterministic::enabled()
+        && cfg!(target_arch = "x86_64")
         && std::arch::is_x86_feature_detected!("avx2")
         && std::arch::is_x86_feature_detected!("fma");
 

@@ -391,10 +391,8 @@ After each milestone, all four of these must be updated:
 - `CHANGELOG.md` (release notes): new version section with the
   Added / Fixed / Deferred sub-lists, list of every test added,
   every file created.
-- `handoff-leafcutterllm.md` (architecture + prior session log): a
-  new section at the end describing what landed and what didn't.
-- The series-specific plan doc (`FRONTIER_MODELS_PLAN.md` here).
-  Status, dim tables, milestone roadmap, open questions table.
+- This doc (`MODEL_INTAKE_METHOD.md`): a new section at the end
+  describing what landed and what didn't.
 
 The user told us upfront *"do not break the program that we have
 built"* — which means documented behavior must match actual behavior.
@@ -493,6 +491,6 @@ Personal note for the future agent:
 
 ---
 
-*End of methodology. See also `FRONTIER_MODELS_PLAN.md` for the
-Kimi/GLM-specific plan, `handoff-leafcutterllm.md` for an evolving
-project log, and `CHANGELOG.md` for an actual release history.*
+*End of methodology. See also `CHANGELOG.md` for the release history
+and `ARCHITECTURE.md` for the colony design. The Kimi K2.6 / GLM-5.2
+intake scaffold is recorded in the CHANGELOG 2026-06-19 sections.*

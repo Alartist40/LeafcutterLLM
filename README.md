@@ -82,6 +82,36 @@ Leafcutter **adapts to whatever model you throw at it** — it reads the GGUF me
 
 ---
 
+## 📥 Model Downloads & Recommended Models
+
+**Place your GGUF models in `./models` (or any folder added via `leafcutter source add`) and Leafcutter auto-detects them.** No config files — drop the file, run `leafcutter list`, then `leafcutter run <name>`.
+
+**Tip (2026-08-01):** Ornith 1.0 9B (Qwen3.5 hybrid) is the fully verified flagship — run `leafcutter run ornith` with the Q4_K_M GGUF for coherent native chat at ~8.1 GB peak RAM. GGUF files are the recommended format.
+
+### Recommended models by hardware
+
+| Hardware | Model | Size |
+|----------|-------|------|
+| Pi Zero 2W (512MB) | TinyLlama-1.1B-Q4 | ~600MB |
+| Pi 5 (4GB) | Qwen2-1.5B-Q4 | ~1GB |
+| Pi 5 (8GB) | LLaMA-7B-Q4 | ~4GB |
+| Laptop (16GB) | Ornith-9B-Q4_K_M (native, ~8 GB peak) | 5.3GB |
+
+### Ornith 1.0 9B (Qwen3.5 hybrid) — flagship, native
+*Qwen 3.5 hybrid (DeltaNet linear attention + full attention interleaved)*
+- Ornith-1.0-9b Q4_K_M (5.3 GB) — verified: `leafcutter run ornith`
+- Ornith-1.0-9b Q6_K (7.4 GB) — verified forward + coherent generation
+
+### Small / low-RAM models
+- **TinyLlama-1.1B-Chat-v1.0 (GGUF Q4_K_M)** — great for Raspberry Pi Zero 2W or Pi 3 — [TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF](https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF)
+- **Qwen2-1.5B-Instruct (GGUF Q4_K_M)** — high performance for low RAM — [Qwen/Qwen2-1.5B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen2-1.5B-Instruct-GGUF)
+- **Meta-Llama-3-8B-Instruct (GGUF Q4_K_M)** — standard for Pi 5 (8GB) or laptops — [MaziyarPanahi/Meta-Llama-3-8B-Instruct-GGUF](https://huggingface.co/MaziyarPanahi/Meta-Llama-3-8B-Instruct-GGUF)
+- **Phi-3-mini-4k-instruct (GGUF Q4_K_M)** — Microsoft's capable small model — [microsoft/Phi-3-mini-4k-instruct-gguf](https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf)
+
+LeafcutterLLM will automatically check if your system can run a model: ✅ green fits comfortably, ⚠️ yellow fits but tight, ❌ red too large (reduce quantization or use a smaller model).
+
+---
+
 ## 🌱 Why Leafcutter?
 
 Most local inference engines have one job and do it narrowly: load a model, generate tokens. They either assume you have a GPU, assume you have 32 GB of RAM, or assume you're willing to babysit Python dependencies.
@@ -189,6 +219,7 @@ Every row below is measured on real hardware, not estimated.
 | Llama-3.2-3B-Instruct Q4_K_XL | 1.9 GB | **Native** | ✅ Generation | 534 MB |
 | Ministral-3-3B Q4_K_M | 2.0 GB | **Native** | ✅ Generation (short prompts) | 504 MB |
 | Ministral-3-3B Q4_K_M | 2.0 GB | **FFI** | ✅ Generation, Ollama-faithful | ~4.2 GB |
+| Qwen2.5-1.5B-Instruct Q4_K_M | 1.04 GB | **Native** | ✅ Coherent generation, 4.07 tok/s | ~2 GB peak |
 | Ornith 1.0 9B Q4_K_M (Qwen3.5 hybrid) | 5.3 GB | **Native** | ✅ Coherent reasoning chat + UTF-8 streaming | ~7–8 GB |
 | Ornith 1.0 9B Q6_K | 7.4 GB | **Native** | ✅ Forward + generation | TBD |
 | Qwen3.5-0.8B | 0.5 GB | **FFI** | ✅ Generation | ~3 GB |
@@ -259,6 +290,18 @@ Llama-3.2-3B-Instruct (Q4_K_XL):
 | Llama-2-13B (est.) | ~8 GB | ~1.1 GB | Scaled estimate |
 
 **Why the numbers are real:** `peak = base + layer_size + overhead` — the formula is anchored to two measured data points, and both are reproduced in the test suite (`scripts/benchmark_all_models.sh`, `scripts/bench_one.sh`).
+
+### Qwen2.5 vs AirLLM — head-to-head (2026-08-02, same machine & prompt)
+
+| Metric | Leafcutter (native GGUF Q4_K_M) | AirLLM (safetensors BF16) | Leafcutter wins |
+|---|---|---|---|
+| **Throughput** | **4.07 tok/s** | 0.188 tok/s | **21.6×** |
+| ms per token | 246 ms | 5,317 ms | 21.6× |
+| Time for 8 tokens | 2.0 s | 42.5 s | 21× |
+| Load time (cold) | 0.2 s | 0.8 s | 4× |
+| Model file on disk | 1.04 GB (Q4_K_M) | 2.9 GB (BF16) | 2.8× smaller |
+
+Both produced the correct continuation ("The capital of France is Paris."). AirLLM's one edge — lower peak RSS via layer sharding (1,085 vs 1,967 MB) — is exactly what Leafcutter's Tier-3 adaptive loader already replicates for models that *don't* fit in RAM (proven on 70B at 11.5 GB peak). So Leafcutter has both ends: fast resident (Tier 2) and bounded-RAM streaming (Tier 3). Full methodology in the original benchmark.
 
 **Ornith 1.0 9B decode profile** (2026-08-01, Ryzen 5800HS):
 - `lm_head`: ~10% of wall time (Q6_K block GEMM — was ~20% with the old f32 cache)

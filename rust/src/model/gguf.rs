@@ -36,7 +36,7 @@ pub enum GGUError {
     UnsupportedQuantType(String, u32),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct GGUFHeader {
     pub magic: u32,
     pub version: u32,
@@ -44,7 +44,7 @@ pub struct GGUFHeader {
     pub metadata_count: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 pub struct GGUFTensor {
     pub name: String,
     pub dimensions: Vec<u64>,
@@ -76,6 +76,29 @@ pub enum GGUFValue {
     Bool(bool),
     String(String),
     Array(Vec<GGUFValue>),
+}
+
+impl std::hash::Hash for GGUFValue {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            GGUFValue::U8(v) => v.hash(state),
+            GGUFValue::I8(v) => v.hash(state),
+            GGUFValue::U16(v) => v.hash(state),
+            GGUFValue::I16(v) => v.hash(state),
+            GGUFValue::U32(v) => v.hash(state),
+            GGUFValue::I32(v) => v.hash(state),
+            // Hash the raw bits so f32/f64 have a stable hash regardless of
+            // NaN payload handling.
+            GGUFValue::F32(v) => v.to_bits().hash(state),
+            GGUFValue::U64(v) => v.hash(state),
+            GGUFValue::I64(v) => v.hash(state),
+            GGUFValue::F64(v) => v.to_bits().hash(state),
+            GGUFValue::Bool(v) => v.hash(state),
+            GGUFValue::String(v) => v.hash(state),
+            GGUFValue::Array(v) => v.hash(state),
+        }
+    }
 }
 
 impl GGUFile {
@@ -144,6 +167,37 @@ impl GGUFile {
             return None;
         }
         Some(&self.mmap[start as usize..end as usize])
+    }
+
+    /// Stable config fingerprint of this model file: hashes the GGUF metadata
+    /// key/value pairs (sorted) plus every tensor's name/type/dims.
+    ///
+    /// This is the "config fingerprint" idea from the kimi-k3-in-c analysis:
+    /// any change to the model file that affects how it should be loaded
+    /// (architecture, quant type, tensor layout, even the tokenizer template)
+    /// changes the fingerprint, so cached/saved state keyed on it can be
+    /// detected as stale.
+    pub fn fingerprint(&self) -> String {
+        use std::hash::{Hash, Hasher};
+        use std::collections::hash_map::DefaultHasher;
+        let mut hasher = DefaultHasher::new();
+        self.header.version.hash(&mut hasher);
+        self.header.metadata_count.hash(&mut hasher);
+        self.header.tensor_count.hash(&mut hasher);
+        let mut keys: Vec<&String> = self.metadata.keys().collect();
+        keys.sort();
+        for k in keys {
+            k.hash(&mut hasher);
+            self.metadata[k].hash(&mut hasher);
+        }
+        let mut tensors: Vec<&GGUFTensor> = self.tensors.iter().collect();
+        tensors.sort_by_key(|t| t.name.as_str());
+        for t in tensors {
+            t.name.hash(&mut hasher);
+            t.typ.hash(&mut hasher);
+            t.dimensions.hash(&mut hasher);
+        }
+        format!("{:016x}", hasher.finish())
     }
 
     pub fn get_tensor_info(&self, name: &str) -> Option<&GGUFTensor> {
@@ -878,5 +932,71 @@ mod header_counts {
         println!("metadata_count = {}", file.header.metadata_count);
         println!("actual tensors parsed = {}", file.tensors.len());
         println!("actual metadata keys = {}", file.metadata.len());
+    }
+}
+
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::*;
+
+    fn sample_file() -> GGUFile {
+        let tmp = std::env::temp_dir().join("leafcutter_fp_test.bin");
+        std::fs::write(&tmp, vec![0u8; 4096]).unwrap();
+        GGUFile {
+            header: GGUFHeader {
+                magic: GGUF_MAGIC,
+                version: 3,
+                tensor_count: 2,
+                metadata_count: 1,
+            },
+            metadata: std::collections::HashMap::from([
+                ("general.architecture".to_string(), GGUFValue::String("qwen2".to_string())),
+                ("tokenizer.ggml.model".to_string(), GGUFValue::String("gpt2".to_string())),
+            ]),
+            tensors: vec![
+                GGUFTensor { name: "token_embd.weight".into(), dimensions: vec![4096, 2048], typ: 3, offset: 0 },
+                GGUFTensor { name: "blk.0.attn_q.weight".into(), dimensions: vec![4096, 4096], typ: 3, offset: 100 },
+            ],
+            data_offset: 0,
+            mmap: unsafe { memmap2::Mmap::map(&std::fs::File::open(&tmp).unwrap()).unwrap() },
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_stable() {
+        let a = sample_file();
+        let b = sample_file();
+        assert_eq!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_changes_with_metadata() {
+        let mut a = sample_file();
+        a.metadata.insert("general.name".into(), GGUFValue::String("v2".into()));
+        let b = sample_file();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_changes_with_tensor_layout() {
+        let mut a = sample_file();
+        a.tensors[1].dimensions = vec![8192, 8192];
+        let b = sample_file();
+        assert_ne!(a.fingerprint(), b.fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_ignores_metadata_order() {
+        let mut a = sample_file();
+        let mut b = sample_file();
+        std::mem::swap(
+            a.metadata.get_mut("general.architecture").unwrap(),
+            b.metadata.get_mut("tokenizer.ggml.model").unwrap(),
+        );
+        std::mem::swap(
+            a.metadata.get_mut("tokenizer.ggml.model").unwrap(),
+            b.metadata.get_mut("general.architecture").unwrap(),
+        );
+        assert_eq!(a.fingerprint(), b.fingerprint());
     }
 }

@@ -36,6 +36,7 @@ use leafcutter::tokenizer::chat_template::apply_chat_template_from_gguf;
 #[command(name = "leafcutter")]
 #[command(about = "LeafcutterLLM — Run LLMs locally, fast and light")]
 #[command(version = "0.9.0")]
+#[command(disable_help_subcommand = true)]
 struct Cli {
     /// Print Cynapse synapse metadata JSON and exit
     #[arg(long, global = true)]
@@ -71,7 +72,7 @@ enum Commands {
         #[arg(long, default_value = "http://127.0.0.1:11434")]
         ollama_host: String,
     },
-    /// Start the HTTP API server (OpenAI-compatible, for Cynapse/Hermes/OpenCode integration)
+    /// Start the HTTP API server (OpenAI-compatible, for Cynapse integration)
     Serve {
         /// Path to GGUF model file
         #[arg(short, long, default_value = "")]
@@ -123,6 +124,13 @@ enum Commands {
         /// Skip chat-template formatting and use raw prompt
         #[arg(long, default_value_t = false)]
         raw: bool,
+        /// Teacher-forcing oracle gate (kimi-k3-in-c idea): prefill the
+        /// prompt, then feed a known reference continuation token-by-token
+        /// and report how often the model's top-1 prediction matches the
+        /// reference. A cheap sanity check that the engine + quant are
+        /// producing sane logits (useful as a gate before big runs).
+        #[arg(long, default_value_t = false)]
+        tf_check: bool,
         /// Max tokens to generate
         #[arg(short = 'n', long, default_value = "128")]
         max_tokens: usize,
@@ -175,6 +183,54 @@ enum Commands {
         #[command(subcommand)]
         op: SourceOp,
     },
+    /// Launch the launcher menu or a specific app (Ollama-style)
+    Launch {
+        /// App to launch: cynapse or a registered app.
+        /// Omit to show the launcher menu.
+        app: Option<String>,
+        /// Model to use (defaults to the app's last used model)
+        #[arg(long)]
+        model: Option<String>,
+        /// Configure the app without launching it
+        #[arg(long)]
+        config: bool,
+        /// Restore an app config to its pre-launch state
+        #[arg(long)]
+        restore: bool,
+        /// Automatically answer yes to prompts
+        #[arg(short, long)]
+        yes: bool,
+        /// Extra arguments passed to the app after `--`
+        #[arg(last = true)]
+        passthrough: Vec<String>,
+    },
+    /// Manage the app registry used by `leafcutter launch`
+    App {
+        /// Operation: add <name>, remove <name>, or list
+        #[command(subcommand)]
+        op: AppOp,
+    },
+    /// Show the command list (alias: 'leaf help')
+    Help,
+}
+
+#[derive(clap::Subcommand)]
+enum AppOp {
+    /// Register an app for `leafcutter launch`
+    Add {
+        /// App name (e.g. cynapse)
+        name: String,
+        /// Command / executable to run
+        #[arg(long)]
+        command: String,
+        /// Start a leafcutter server first
+        #[arg(long)]
+        needs_server: bool,
+    },
+    /// Remove a previously registered app
+    Remove { name: String },
+    /// List registered apps (built-in + config)
+    List,
 }
 
 #[derive(clap::Subcommand)]
@@ -242,11 +298,11 @@ async fn main() {
         Some(Commands::Server { model, port, host, engine, benchmark }) => {
             cmd_serve(&model, port, &host, &engine, benchmark).await;
         }
-        Some(Commands::Generate { model, prompt, system, raw, max_tokens, temperature, threads, ctx_size, gpu_layers }) => {
+        Some(Commands::Generate { model, prompt, system, raw, tf_check, max_tokens, temperature, threads, ctx_size, gpu_layers }) => {
             #[cfg(feature = "llama-ffi")]
-            cmd_generate(&model, &prompt, &system, raw, max_tokens, temperature, threads, ctx_size, gpu_layers);
+            cmd_generate(&model, &prompt, &system, raw, max_tokens, temperature, threads, ctx_size, gpu_layers, tf_check);
             #[cfg(not(feature = "llama-ffi"))]
-            cmd_generate_native(&model, &prompt, &system, raw, max_tokens, temperature);
+            cmd_generate_native(&model, &prompt, &system, raw, max_tokens, temperature, tf_check);
         }
         Some(Commands::Chat { model, system, max_tokens, temperature, threads, ctx_size, gpu_layers }) => {
             #[cfg(feature = "llama-ffi")]
@@ -263,6 +319,22 @@ async fn main() {
         }
         Some(Commands::Source { op }) => {
             cmd_source(op);
+        }
+        Some(Commands::Launch {
+            app,
+            model,
+            config,
+            restore,
+            yes,
+            passthrough,
+        }) => {
+            cmd_launch(app.as_deref(), model.as_deref(), config, restore, yes, &passthrough);
+        }
+        Some(Commands::App { op }) => {
+            cmd_app(op);
+        }
+        Some(Commands::Help) => {
+            cmd_help();
         }
         None => {
             // No subcommand: print help and exit. Never bake a hardcoded
@@ -621,6 +693,149 @@ fn cmd_source(op: SourceOp) {
             }
             for (i, d) in dirs.iter().enumerate() {
                 println!("  [{}] {}", i, d.display());
+            }
+        }
+    }
+}
+
+fn cmd_launch(app: Option<&str>, model: Option<&str>, config_only: bool, restore: bool, yes: bool, passthrough: &[String]) {
+    use leafcutter::launch::{self, LaunchRequest};
+
+    // `leafcutter launch` with no app → launcher menu.
+    let app = match app {
+        Some(a) => a.to_string(),
+        None => {
+            cmd_launch_menu();
+            return;
+        }
+    };
+
+    let req = LaunchRequest {
+        app: app.clone(),
+        model_override: model.map(|s| s.to_string()),
+        force_configure: false,
+        configure_only: config_only,
+        restore,
+        yes,
+        extra_args: pasthru(passthrough),
+    };
+
+    let models = scan_models(&resolve_models_dirs())
+        .into_iter()
+        .map(|(p, _)| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+
+    if let Err(e) = launch::launch(&req, &models) {
+        eprintln!("{}", e);
+        std::process::exit(1);
+    }
+}
+
+/// Convert `-- args...` (post-`--`) into the passthrough list.
+fn pasthru(args: &[String]) -> Vec<String> {
+    args.to_vec()
+}
+
+/// The no-arg launcher menu: list apps + the current model.
+fn cmd_launch_menu() {
+    use leafcutter::config;
+    eprintln!("🌿 leafcutter launcher");
+    eprintln!();
+    eprintln!("Apps:");
+    let mut names: Vec<String> = config::load()
+        .apps
+        .keys()
+        .cloned()
+        .chain(config::builtin_apps().into_iter().map(|(n, _)| n))
+        .collect();
+    names.sort();
+    names.dedup();
+    for n in names {
+        let entry = config::resolve_app(&n).unwrap();
+        let server = if entry.needs_server { " (server)" } else { "" };
+        let model = config::app_model(&n).unwrap_or_else(|| "-".into());
+        eprintln!("  - {:<12} model: {}{}", n, model, server);
+    }
+    eprintln!();
+    eprintln!("Run: leafcutter launch <app> [--model <model>]");
+    eprintln!("     leafcutter launch <app> --config   (configure only)");
+    eprintln!("     leafcutter launch <app> --restore  (undo launch config)");
+}
+
+fn cmd_help() {
+    println!("🌿 LeafcutterLLM — Run LLMs locally, fast and light");
+    println!();
+    println!("Usage: leafcutter <command> [options]     (alias: leaf)");
+    println!();
+    println!("Commands:");
+    println!("  list                 List available models (auto-detects model dirs)");
+    println!("  run <model>          Start a streaming chat session (Ollama-style)");
+    println!("  generate --model     One-shot text generation from a prompt");
+    println!("  chat --model         Interactive chat session (requires llama-ffi build)");
+    println!("  serve --model        Start the HTTP API server (OpenAI-compatible)");
+    println!("  server               Alias for 'serve'");
+    println!("  list-models          List models (legacy flag form, --dir)");
+    println!("  source <op>          Manage model source directories (add/remove/list)");
+    println!("  launch [app]         Launcher menu or start an app (e.g. cynapse)");
+    println!("  app <op>             Manage the app registry used by 'launch'");
+    println!("  help                 Show this command list");
+    println!();
+    println!("Options:");
+    println!("  -h, --help           Print help");
+    println!("  -V, --version        Print version");
+    println!();
+    println!("Examples:");
+    println!("  leafcutter list");
+    println!("  leafcutter run ornith");
+    println!("  leafcutter launch cynapse --model ornith");
+    println!("  leafcutter serve --model /path/to/model.gguf --port 8081");
+    println!();
+    println!("For Cynapse integration:  leafcutter --meta   (synapse metadata JSON)");
+}
+
+fn cmd_app(op: AppOp) {
+    use leafcutter::config;
+    match op {
+        AppOp::Add {
+            name,
+            command,
+            needs_server,
+        } => {
+            let entry = config::AppEntry {
+                command: command.clone(),
+                args: Vec::new(),
+                needs_server,
+                env: std::collections::HashMap::new(),
+                model: None,
+                model_fp: None,
+            };
+            if config::add_app(&name, entry) {
+                eprintln!("Registered app '{}' (command: {})", name, command);
+            } else {
+                eprintln!("App '{}' already registered.", name);
+            }
+        }
+        AppOp::Remove { name } => {
+            if config::remove_app(&name) {
+                eprintln!("Removed app '{}'.", name);
+            } else {
+                eprintln!("App '{}' not found.", name);
+            }
+        }
+        AppOp::List => {
+            eprintln!("Registered apps:");
+            let mut names: Vec<String> = config::load()
+                .apps
+                .keys()
+                .cloned()
+                .chain(config::builtin_apps().into_iter().map(|(n, _)| n))
+                .collect();
+            names.sort();
+            names.dedup();
+            for n in names {
+                let entry = config::resolve_app(&n).unwrap();
+                let server = if entry.needs_server { " (server)" } else { "" };
+                eprintln!("  - {}{}", n, server);
             }
         }
     }
@@ -1399,6 +1614,7 @@ fn cmd_generate(
     threads: i32,
     ctx_size: u32,
     gpu_layers: i32,
+    tf_check: bool,
 ) {
     backend_init();
 
@@ -1412,6 +1628,11 @@ fn cmd_generate(
     };
     eprintln!("✅ Model loaded. n_vocab={}, n_embd={}, n_layer={}",
              model.n_vocab(), model.n_embd(), model.n_layer());
+
+    if tf_check {
+        run_tf_check_ffi(&model, model_path, prompt, system, raw);
+        return;
+    }
 
     let mut ctx = match LlamaContext::new(&model, ctx_size, threads) {
         Ok(c) => c,
@@ -1452,6 +1673,117 @@ fn cmd_generate(
     io::stdout().flush().unwrap();
 
     backend_free();
+}
+
+#[cfg(feature = "llama-ffi")]
+fn run_tf_check_ffi(model: &LlamaModel, _model_path: &PathBuf, prompt: &str, system: &str, raw: bool) {
+    // Teacher-forcing oracle via the llama.cpp FFI backend. Prefill the
+    // prompt, then feed a known reference continuation token-by-token and
+    // report the fraction where the model's top-1 prediction matched the
+    // reference. A low match rate flags a broken engine/quant, not a bad
+    // answer — this is a sanity gate, kimi's "tiny-model oracle" idea.
+    let mut ctx = match LlamaContext::new(model, 4096, 4) {
+        Ok(c) => c,
+        Err(e) => { eprintln!("❌ Failed to create context: {}", e); std::process::exit(1); }
+    };
+    let prompt_text = if raw {
+        prompt.to_string()
+    } else if system.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{system}\n\n{prompt}")
+    };
+    let tokens = ctx.tokenize(&prompt_text, true, true);
+    let reference = ctx.tokenize(" one two three four five six seven eight nine ten.", true, true);
+
+    let mut matched = 0usize;
+    let mut total = 0usize;
+    for i in 0..reference.len() {
+        let mut all = tokens.clone();
+        all.extend_from_slice(&reference[..i]);
+        match ctx.forward(&all) {
+            Ok(logits) => {
+                if let Some(pred) = argmax_top(&logits, model.n_vocab()) {
+                    total += 1;
+                    if pred == reference[i] as usize {
+                        matched += 1;
+                    }
+                }
+            }
+            Err(e) => { eprintln!("⚠️  forward failed at step {}: {}", i, e); break; }
+        }
+    }
+    report_tf_check("ffi", matched, total);
+    backend_free();
+    if total > 0 && (matched as f64 / total as f64) < 0.5 {
+        std::process::exit(1);
+    }
+}
+
+/// Teacher-forcing oracle for the native engine. Prefill the prompt, then
+/// force the reference continuation through and count top-1 matches.
+fn run_tf_check_native(
+    _engine: &mut leafcutter::inference::engine::Engine,
+    model_path: &PathBuf,
+    prompt: &str,
+    system: &str,
+    raw: bool,
+) {
+    use leafcutter::inference::engine::Engine;
+    let mut engine = Engine::load(model_path.to_str().unwrap()).expect("load failed");
+    let prompt_text = if raw {
+        prompt.to_string()
+    } else if system.is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{system}\n\n{prompt}")
+    };
+    let tokens = engine.tokenize(&prompt_text, true);
+    let reference = engine.tokenize(" one two three four five six seven eight nine ten.", true);
+
+    let mut matched = 0usize;
+    let mut total = 0usize;
+    for i in 0..reference.len() {
+        let mut all = tokens.clone();
+        all.extend_from_slice(&reference[..i]);
+        let logits = engine.forward(&all);
+        total += 1;
+        if argmax(&logits) == Some(reference[i]) {
+            matched += 1;
+        }
+    }
+    report_tf_check("native", matched, total);
+    if total > 0 && (matched as f64 / total as f64) < 0.5 {
+        std::process::exit(1);
+    }
+}
+
+fn argmax(logits: &[f32]) -> Option<usize> {
+    if logits.is_empty() { return None; }
+    let mut best = 0usize;
+    let mut best_val = f32::NEG_INFINITY;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
+            best = i;
+        }
+    }
+    Some(best)
+}
+
+#[cfg(feature = "llama-ffi")]
+fn argmax_top(logits: &[f32], vocab: usize) -> Option<usize> {
+    argmax(&logits[..logits.len().min(vocab)])
+}
+
+fn report_tf_check(engine_name: &str, matched: usize, total: usize) {
+    let pct = if total > 0 { 100.0 * matched as f64 / total as f64 } else { 0.0 };
+    eprintln!("🌿 Teacher-forcing oracle ({} engine):", engine_name);
+    eprintln!("   reference: ' one two three four five six seven eight nine ten.'");
+    eprintln!("   top-1 match: {}/{} ({:.1}%)", matched, total, pct);
+    if total > 0 && pct < 50.0 {
+        eprintln!("⚠️  Match rate below 50% — engine or quant may be broken.");
+    }
 }
 
 #[cfg(feature = "llama-ffi")]
@@ -1571,6 +1903,7 @@ fn cmd_generate_native(
     raw: bool,
     max_tokens: usize,
     temperature: f32,
+    tf_check: bool,
 ) {
     use leafcutter::inference::engine::Engine;
 
@@ -1588,6 +1921,11 @@ fn cmd_generate_native(
             std::process::exit(1);
         }
     };
+
+    if tf_check {
+        run_tf_check_native(&mut engine, model_path, prompt, system, raw);
+        return;
+    }
 
     // Resolve the per-architecture profile (Ollama Modelfile-style), which
     // supplies the chat template (with <think> for reasoning models), stop

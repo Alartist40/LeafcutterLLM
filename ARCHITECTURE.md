@@ -6,10 +6,11 @@
 > single binary and sharing one loader.
 
 This document records the current state (2026-08-02) and the design intent for
-the colony. It supersedes the tier-specific strategy docs in scope: `strategy.md`
-(safetensors streaming, historical), `LEAFCUTTER_STRATEGY.md` (GGUF integration,
-the fast-engine layers), and `COLIBRI_ANALYSIS.md` / `docs/research/airllm_vs_colibri.txt`
-(competitive research). This doc is the top-level view of how they fit together.
+the colony. It supersedes the tier-specific strategy docs (removed 2026-08-17):
+`strategy.md` (safetensors streaming, historical), `LEAFCUTTER_STRATEGY.md`
+(GGUF integration, the fast-engine layers), and `COLIBRI_ANALYSIS.md` /
+`docs/research/airllm_vs_colibri.txt` (competitive research). This doc is the
+top-level view of how they fit together.
 
 ---
 
@@ -259,9 +260,11 @@ Any engine change must keep them:
 ## 9. Reference Files
 
 - Colony doc: `ARCHITECTURE.md` (this file)
-- Fast-engine deep dive: `LEAFCUTTER_STRATEGY.md`
-- Competitive research: `docs/research/airllm_vs_colibri.txt`, `COLIBRI_ANALYSIS.md`
-- Historical: `strategy.md` (safetensors streaming), `docs/architecture/*`
+- Competitive research: `docs/research/airllm_vs_colibri.txt`
+- Historical (removed 2026-08-17): `strategy.md` (safetensors streaming),
+  `LEAFCUTTER_STRATEGY.md` (GGUF integration), `COLIBRI_ANALYSIS.md`,
+  `docs/architecture/*`, `docs/research/KIMI_K3_IN_C_ANALYSIS.md` (adopted
+  techniques are implemented in `rust/src/`; see CHANGELOG 2026-08-17)
 - External references (do not modify): `/home/xander/Documents/portfolio/leafcutter_max/airllm`,
   `/home/xander/Documents/portfolio/leafcutter_max/colibri`,
   `/home/xander/Documents/portfolio/leafcutter_max/llama.cpp`

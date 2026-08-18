@@ -71,7 +71,7 @@ impl Default for GemmaLayerParams {
 /// here therefore inflates every activation by a factor of up to ~2x per norm,
 /// which compounds across 48 layers × 4 norms = 192 applications and is the
 /// leading cause of the "logits 10–20× too large, degenerate generation"
-/// symptom documented in `GEMMA4_DEBUG_LOG.md` Finding 1.
+/// symptom (Gemma 4 investigation, Finding 1).
 ///
 /// `with_scale=False` norms (e.g. Gemma 4 `v_norm`) pass an all-ones weight
 /// and reduce to pure RMS — handled by the same code path.
@@ -232,8 +232,8 @@ pub fn gemma_fused_qkv(_hidden: &Tensor, layer_weights: &mut HashMap<String, Ten
 /// (`register_buffer("layer_scalar", torch.ones(1))`, init.ones_), i.e. **always
 /// 1.0** in real checkpoints. We deliberately IGNORE the `layer_output_scale.weight`
 /// tensor because the Q4_K_M GGUF we target contains garbage in those slots
-/// (`7e+32`, `nan`, …) — a known Gemma-4 conversion artifact (see
-/// GEMMA4_DEBUG_LOG.md Finding 4). Multiplying by it destroyed the residual
+/// (`7e+32`, `nan`, …) — a known Gemma-4 conversion artifact (Gemma 4
+/// investigation, Finding 4). Multiplying by it destroyed the residual
 /// stream from layer 0 onward.
 pub fn gemma_layer_forward(
     hidden: &Tensor,

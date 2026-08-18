@@ -270,7 +270,10 @@ pub fn simd_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: u
     unsafe {
         #[cfg(target_arch = "x86_64")]
         {
-            if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            if !crate::deterministic::enabled()
+                && is_x86_feature_detected!("avx2")
+                && is_x86_feature_detected!("fma")
+            {
                 avx2_matmul(a, b, c, m, k, n);
                 return;
             }
@@ -284,7 +287,10 @@ pub fn simd_matmul(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: u
 pub fn simd_matmul_parallel(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) {
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+        if !crate::deterministic::enabled()
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("fma")
+        {
             simd_matmul_par_avx2(a, b, c, m, k, n);
             return;
         }
@@ -408,10 +414,17 @@ pub fn simd_sum_sq(data: &[f32]) -> f32 {
 }
 
 /// SIMD-accelerated dot product (f32). Falls back to scalar on non-x86_64.
+/// In deterministic mode (`LEAFCUTTER_DETERMINISTIC=1`) uses a serial,
+/// f64-accumulated reference reduction so results are bit-identical
+/// across machines and thread counts.
 #[inline]
 pub fn simd_dot_product(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len());
     let len = a.len();
+
+    if crate::deterministic::enabled() {
+        return crate::deterministic::dot_product(a, b);
+    }
 
     #[cfg(target_arch = "x86_64")]
     unsafe {

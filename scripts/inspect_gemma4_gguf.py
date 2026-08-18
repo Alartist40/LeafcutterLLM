@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal GGUF v3 reader: dumps config KV + tensor inventory.
-Used to settle Gemma 4 questions in GEMMA4_DEBUG_LOG.md (Findings 4 & 5)."""
+Used to settle Gemma 4 questions (Findings 4 & 5)."""
 import struct, sys, collections
 
 path = sys.argv[1] if len(sys.argv) > 1 else '/home/xander/Downloads/models/gemma-4-12b-it-Q4_K_M.gguf'

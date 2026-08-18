@@ -13,7 +13,32 @@
 //!   - Windows:   `%APPDATA%\leafcutter\config.json`
 
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// How `leafcutter launch <app>` starts a program.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct AppEntry {
+    /// Executable to run (resolved against PATH, or a direct path).
+    pub command: String,
+    /// Fixed arguments passed to the executable.
+    #[serde(default)]
+    pub args: Vec<String>,
+    /// Ensure a leafcutter server is running while the app runs.
+    #[serde(default)]
+    pub needs_server: bool,
+    /// Extra environment variables injected into the app process.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Last model selected for this app (persisted by launch).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Config fingerprint of the model file `model` pointed at when it was
+    /// saved (kimi-k3-in-c "config fingerprint"): if the model file changed
+    /// (re-downloaded, re-quantized), launch can detect a stale saved model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_fp: Option<String>,
+}
 
 /// What we persist. JSON so users can hand-edit it like a `.ollama`/Modelfile.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -24,6 +49,9 @@ pub struct Config {
     /// Last model used (for a fast `leafcutter run` resume). Optional.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_model: Option<String>,
+    /// Apps known to `leafcutter launch <app>`, keyed by name.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub apps: HashMap<String, AppEntry>,
 }
 
 /// Path to the config file for the current OS. Does not create it.
@@ -143,6 +171,136 @@ pub fn remove_model_dir(dir: &str) -> bool {
     }
 }
 
+/// Register an app for `leafcutter launch`. Returns true if newly added.
+pub fn add_app(name: &str, entry: AppEntry) -> bool {
+    let mut cfg = load();
+    if cfg.apps.contains_key(name) {
+        false
+    } else {
+        cfg.apps.insert(name.to_string(), entry);
+        save(&cfg);
+        true
+    }
+}
+
+/// Remove a registered app. Returns true if it existed.
+pub fn remove_app(name: &str) -> bool {
+    let mut cfg = load();
+    if cfg.apps.remove(name).is_some() {
+        save(&cfg);
+        true
+    } else {
+        false
+    }
+}
+
+/// Look up a registered app, falling back to a built-in default.
+pub fn resolve_app(name: &str) -> Option<AppEntry> {
+    let cfg = load();
+    if let Some(entry) = cfg.apps.get(name) {
+        return Some(entry.clone());
+    }
+    builtin_app(name)
+}
+
+/// Built-in app registry: programs that commonly talk to a local leafcutter
+/// server. Users can override or extend these via `leafcutter app add`.
+pub fn builtin_apps() -> Vec<(String, AppEntry)> {
+    let mut out = Vec::new();
+    for (name, entry) in [
+        (
+            "cynapse",
+            AppEntry {
+                command: "cynapse".into(),
+                args: Vec::new(),
+                needs_server: false,
+                env: HashMap::new(),
+                model: None,
+                model_fp: None,
+            },
+        ),
+    ] {
+        out.push((name.to_string(), entry));
+    }
+    out
+}
+
+fn builtin_app(name: &str) -> Option<AppEntry> {
+    builtin_apps()
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, e)| e)
+}
+
+/// Remember the model launch last used for an app, so `leafcutter launch <app>`
+/// can resume with the same model without typing it again. Also records the
+/// model's config fingerprint so a stale (changed) model file can be detected.
+pub fn set_app_model(name: &str, model: &str, fingerprint: Option<&str>) {
+    let mut cfg = load();
+    // Builtin apps (e.g. cynapse) live in builtin_apps(), not cfg.apps, so we
+    // upsert a copy into cfg.apps to persist the per-app model choice.
+    let entry = match cfg.apps.get_mut(name) {
+        Some(e) => e,
+        None => {
+            cfg.apps.insert(name.to_string(), builtin_app(name).unwrap_or_default());
+            cfg.apps.get_mut(name).unwrap()
+        }
+    };
+    entry.model = Some(model.to_string());
+    entry.model_fp = fingerprint.map(|f| f.to_string());
+    save(&cfg);
+}
+
+/// The last model launch selected for an app, if any.
+pub fn app_model(name: &str) -> Option<String> {
+    let cfg = load();
+    if let Some(entry) = cfg.apps.get(name) {
+        return entry.model.clone();
+    }
+    builtin_app(name).and_then(|e| e.model)
+}
+
+/// The stored config fingerprint for an app's saved model, if any.
+pub fn app_model_fp(name: &str) -> Option<String> {
+    let cfg = load();
+    cfg.apps.get(name).and_then(|e| e.model_fp.clone())
+}
+
+/// Path where `launch` stores a pre-launch backup of an app's config file,
+/// used by `--restore` to undo a launch-managed rewrite.
+pub fn launch_backup_path(app: &str) -> PathBuf {
+    config_dir().join(format!("launch-{}.bak", app))
+}
+
+/// Write a backup of the given file (if it exists) for `--restore`.
+pub fn save_launch_backup(app: &str, path: &std::path::Path) {
+    if let Ok(data) = std::fs::read(path) {
+        let _ = std::fs::create_dir_all(&config_dir());
+        let _ = std::fs::write(launch_backup_path(app), data);
+    }
+}
+
+/// Restore an app's config file from the launch backup (if present).
+/// Returns true if a backup was restored.
+pub fn restore_launch_backup(app: &str, path: &std::path::Path) -> bool {
+    let backup = launch_backup_path(app);
+    if !backup.exists() {
+        return false;
+    }
+    let data = match std::fs::read(&backup) {
+        Ok(d) => d,
+        Err(_) => return false,
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if std::fs::write(path, data).is_ok() {
+        let _ = std::fs::remove_file(&backup);
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,18 +310,34 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.model_dirs.is_empty());
         assert!(cfg.last_model.is_none());
+        assert!(cfg.apps.is_empty());
     }
 
     #[test]
     fn roundtrip_serialization() {
-        let cfg = Config {
+        let mut cfg = Config {
             model_dirs: vec!["/mnt/models".into(), "~/models".into()],
             last_model: Some("ornith".into()),
+            apps: std::collections::HashMap::new(),
         };
+        cfg.apps.insert(
+            "cynapse".into(),
+            AppEntry {
+                command: "cynapse".into(),
+                args: vec!["--gui".into()],
+                needs_server: false,
+                env: std::collections::HashMap::new(),
+                model: None,
+                model_fp: None,
+            },
+        );
         let text = serde_json::to_string(&cfg).unwrap();
         let back: Config = serde_json::from_str(&text).unwrap();
         assert_eq!(back.model_dirs, cfg.model_dirs);
         assert_eq!(back.last_model, cfg.last_model);
+        assert_eq!(back.apps.len(), 1);
+        assert_eq!(back.apps["cynapse"].command, "cynapse");
+        assert_eq!(back.apps["cynapse"].needs_server, false);
     }
 
     #[test]

@@ -5,6 +5,47 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ---
 
+## [2026-08-17] — Doc consolidation; kimi-k3-in-C techniques landed
+
+### Documentation — repo cleaned from 28 → 9 `.md` files
+
+- **README.md** — absorbed `models/README.md` (model dir usage), 
+  `models/examples/download_models.md` (recommended models + hardware table +
+  HuggingFace links), and `BENCHMARK_QWEN25_AIRLLM.md` (Leafcutter 21.6× vs
+  AirLLM table). Added Qwen2.5-1.5B row to Validated Model Support.
+- **CHANGELOG.md** — absorbed `AUDIT_REPORT.md` (full 20-finding table with
+  severity / file:line / resolution status), the 2026-05-19 NaN/corruption
+  investigation (`sanitize_weights` + `scan_for_corruption`), and the
+  per-date test-suite snapshots from `rust/TEST_REPORT.md`,
+  `rust/TEST_RESULTS.md`, `rust/MILESTONES_AND_TESTING.md`.
+- **Deleted (superseded / historical):** `strategy.md`, `LEAFCUTTER_STRATEGY.md`,
+  `COLIBRI_ANALYSIS.md`, `COLIBRI_DEEP_DIVE.md`, `FRONTIER_MODELS_PLAN.md`,
+  `GEMMA4_DEBUG_LOG.md`, `handoff-leafcutterllm.md`, `rust/PHASE2_70B_MEASUREMENT.md`,
+  `docs/architecture/colibri-port-notes.md`, `docs/architecture/path-b-native-rust-forward.md`,
+  `docs/architecture/streaming-native-plan.md`, `docs/research/KIMI_K3_IN_C_ANALYSIS.md`
+  (techniques now implemented — see below). Current docs: `README.md`,
+  `ARCHITECTURE.md`, `CHANGELOG.md`, `NEXT_STEPS.md`, `MODEL_INTAKE_METHOD.md`,
+  `ai_model_reference_guide.md`, `docs/MINISTRAL_3_NATIVE_SUPPORT.md`,
+  `docs/CPU_THROTTLING_STRATEGY.md`.
+- Updated references in `ARCHITECTURE.md`, `MODEL_INTAKE_METHOD.md`,
+  `ai_model_reference_guide.md`, `rust/src/inference/gemma.rs`,
+  `scripts/inspect_gemma4_gguf.py` to remove dangling links.
+
+### Adopted from kimi-k3-in-C analysis (2026-08-17)
+
+- **Determinism contract** — `LEAFCUTTER_DETERMINISTIC=1` + `src/deterministic.rs`:
+  f64 serial reductions force scalar/f64 paths; Q8_K integer-dot and AVX2/FMA
+  kernels gated. Verified bit-identical logits across regimes (max diff 0).
+- **Config fingerprint** — `GGUFile::fingerprint()` (header + sorted metadata +
+  sorted tensors); `AppEntry.model_fp` persisted; stale-model warning on launch.
+- **Trunk-first memory budgeting** — `compute_cache_budget_bytes` reserves KV
+  cache + activations + LM head before layer cache (margin 512 MB, floor 256 MB).
+- **`--tf-check` oracle gate** — teacher-forced top-1 agreement check
+  (reference: " one two three four five six seven eight nine ten."); verified
+  58.3% on Ministral-3-3B.
+
+---
+
 ## [2026-08-05/06] — Ornith REPL restored; RAM capped; anti-doom removed; Ministral profile fixed
 
 ### Fixed — Ornith REPL regression (commit `3ea1c3c`)
@@ -1115,9 +1156,41 @@ Routed the 20 audit findings (3 critical, 7 high, 5 medium, 5 low/info) from
   no longer kills the entire generation.
 
 ### Documentation
-- `AUDIT_REPORT.md` — 20 ranks, file:line ref, plan-of-action.
+- `AUDIT_REPORT.md` — 20 ranks, file:line ref, plan-of-action. (Merged into this entry; file removed 2026-08-17.)
 - `strategy.md` (July 2026) — CPU thermal mgmt + GPU image expansion roadmap.
 - `verify_ornith_qwen35.sh` — 5-check end-to-end verification script.
+
+### Audit findings summary (from AUDIT_REPORT.md, removed 2026-08-17)
+
+Full 20-finding audit, 2026-07-09, by Kimi K2.6 (security-audit skill), read-only, over
+`rust/src/`. Findings (severity / file / one-liner):
+
+| # | Sev | File | Finding |
+|---|-----|------|---------|
+| 1 | CRITICAL | `bridge/mod.rs:246` | Byte-level fallback tokenizer silently corrupts non-ASCII input |
+| 2 | CRITICAL | `model/gguf.rs:127,157` | `as usize` cast on mmap offsets — no bounds check vs `mmap.len()` |
+| 3 | CRITICAL | `api/mod.rs:196,202` | Hardcoded default API key `"leaf-dev"` ships in production binary |
+| 4 | HIGH | `main.rs:178` | Hardcoded user-specific model path baked into binary fallback |
+| 5 | HIGH | `inference/engine.rs` | 14 `.expect()` calls on tensor lookups → panic on missing/renamed tensor |
+| 6 | HIGH | `inference/gemma.rs` | 9 `.expect()` calls → panic on incomplete GGUF |
+| 7 | HIGH | `llama_ffi/mod.rs:39-42` | `unsafe impl Send/Sync` for FFI types without proven thread safety |
+| 8 | HIGH | `model/quant.rs` vs `model/gguf.rs` | Capability drift: Q2_K/IQ2_XXS/IQ3_XXS/IQ1_M fall to silent `_ => None` in dequant |
+| 9 | HIGH | `cache/mod.rs:44,46` | Chained `.unwrap()` on HashMap lookups — panics if K exists but V doesn't |
+| 10 | MEDIUM | `api/mod.rs:142-143` | `top_p` from HTTP body silently discarded for FFI engine |
+| 11 | MEDIUM | `api/mod.rs:315-316` | `unwrap()` on `TcpListener::bind` / `axum::serve` → panic if port in use |
+| 12 | MEDIUM | `install.sh:58` | Piping curl to shell for rustup install (supply-chain risk, standard practice) |
+| 13 | MEDIUM | `api/mod.rs:312` | Server binds `0.0.0.0` by default — no loopback-only option |
+| 14 | MEDIUM | `main.rs:384-390` | `ctx_size - max_tokens` can underflow if `max_tokens > ctx_size` |
+| 15 | MEDIUM | `kernels/q4_k_gemm.rs:53` | AVX2 path asserts `n % 256 == 0` — panics on non-256-aligned dims |
+| 16 | LOW | `main.rs:313,362,365,399` | `stdout().flush().unwrap()` / `stdin().read_line().unwrap()` panic on broken pipe |
+| 17 | LOW | `api/mod.rs` | No rate limiting on HTTP endpoints — DoS via rapid requests |
+| 18 | LOW | `main.rs:509-523` | `as_ref().unwrap()` on tokenizer — panics on corrupt GGUF tokenizer metadata |
+| 19 | LOW | `model/loader.rs:567` | `product::<u64>() as usize` — theoretical overflow on >2^64-element tensors |
+| 20 | INFO | `install.sh:178` | Hardcoded version `0.9.0` vs Cargo.toml — must be kept in sync |
+
+Resolution status: all 3 CRITICAL, all 7 HIGH, 5/5 MEDIUM, 5/5 LOW closed (see
+fix list above); finding 20 resolved via `grep` from `Cargo.toml`. #12, #17 remain
+accepted-risk documentation items.
 
 ### Verified
 - `cargo build --release --no-default-features --bin test_generation` clean.
@@ -1887,6 +1960,23 @@ Each fix is tagged with its ID (FIX-001, COMPILE-FIX-0, etc.) to match the audit
 |-------|---------|----------|---------|--------|
 | Ministral-3B Q4_K_M | Native | **504 MB** | 1.09 | ✅ Verified |
 | Ministral-8B Q4_K_M | Native | **739 MB** | 0.62 | ✅ Verified |
+
+### NaN investigation (merged from TEST_REPORT.md, removed 2026-08-17)
+
+2026-05-19 investigation into all-NaN logits (sampler fell back to token 151935).
+Traced via NaN-propagation chain: layer 1 `gate_proj` had `nan=25` → silu → ffn_out
+`nan=2048` → all subsequent layers NaN. Root cause was **corrupted Q4_K quantization
+blocks in the upstream HuggingFace GGUF file** (confirmed by Python `gguf`: same NaN
+values; ~1.22% bad blocks in `blk.1.ffn_gate`, plus `token_embd`/`output`). Not a
+parser bug and not local disk corruption. Defenses added:
+
+- `src/model/loader.rs` — `sanitize_weights()` zeroes NaN/Inf/outliers (>100) in
+  dequantized weights; `CorruptionReport` + `scan_for_corruption()` scans raw tensor
+  blocks for NaN/Inf/huge scales (`|d| > 10,000`) without dequantizing.
+- `src/inference/engine.rs` — corruption scan runs on every `Engine::load()`, prints a
+  clear warning when found.
+- Outcome: NaN/Inf eliminated from forward pass; fresh re-download of the file verified
+  clean.
 
 ---
 

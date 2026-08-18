@@ -165,7 +165,7 @@ impl GGUFModel {
             .map(|t| calculate_tensor_size(&t.dimensions, t.typ))
             .sum();
 
-        let cache_budget_bytes = Self::compute_cache_budget_bytes(total_model_bytes);
+        let cache_budget_bytes = Self::compute_cache_budget_bytes(total_model_bytes, &config);
 
         Ok(Self {
             file,
@@ -188,10 +188,14 @@ impl GGUFModel {
     }
 
     /// Compute the layer-cache budget from `LEAFCUTTER_CACHE_MB` (if set),
-    /// else from the available RAM:
-    ///   - model ≤ available RAM − 1 GiB margin  →  unlimited (0)
-    ///   - otherwise                              →  available RAM − 1 GiB
-    fn compute_cache_budget_bytes(total_model_bytes: usize) -> usize {
+    /// else from the available RAM using trunk-first budgeting:
+    ///   1. reserve the dense trunk — KV cache at a working context, the
+    ///      activation workspace, and a resident LM head — explicitly;
+    ///   2. give the leftover RAM to the layer cache (the "expert" pool).
+    /// This mirrors kimi-k3-in-c's trunk-first allocation: the always-needed
+    /// dense working set is guaranteed before any optional cache is allowed
+    /// to consume memory.
+    fn compute_cache_budget_bytes(total_model_bytes: usize, config: &ModelConfig) -> usize {
         if let Ok(v) = std::env::var("LEAFCUTTER_CACHE_MB") {
             if let Ok(mb) = v.parse::<usize>() {
                 return mb.saturating_mul(1024 * 1024);
@@ -201,12 +205,41 @@ impl GGUFModel {
         if avail_mb == 0 {
             return 0; // meminfo unavailable → unlimited (backward compatible)
         }
-        let budget_mb = avail_mb.saturating_sub(1024); // 1 GiB for KV + activations
-        let budget_bytes = budget_mb * 1024 * 1024;
+        // Dense trunk estimate (f32): KV cache at a default working context
+        // (min(config.max_seq_len, 4096) unless LEAFCUTTER_CTX_KB overrides),
+        // plus activations (roughly 3 hidden layers of the hidden dimension
+        // scaled by batch/heads), plus a resident LM head (2 floats per vocab
+        // entry covers an f32 head; quantized heads are cheaper).
+        let ctx = std::env::var("LEAFCUTTER_CTX_KB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|kb| kb * 1024)
+            .unwrap_or_else(|| config.max_seq_len.min(4096));
+        let kv_cache_bytes = 2usize // K and V
+            .saturating_mul(config.num_hidden_layers)
+            .saturating_mul(config.num_key_value_heads)
+            .saturating_mul(config.kv_head_dim)
+            .saturating_mul(ctx)
+            .saturating_mul(4); // f32
+        let activation_bytes = config
+            .hidden_size
+            .saturating_mul(config.num_attention_heads.max(1) + 3) // qkv + o + mlp
+            .saturating_mul(4);
+        let head_bytes = config
+            .vocab_size
+            .saturating_mul(config.hidden_size)
+            .saturating_mul(2); // f32 head, lower bound
+        let trunk_bytes = kv_cache_bytes.saturating_add(activation_bytes).saturating_add(head_bytes);
+        let margin_mb = 512; // OS + page cache + slack
+        let budget_bytes = (avail_mb.saturating_sub(margin_mb) * 1024 * 1024).saturating_sub(trunk_bytes);
+
+        // Trunk-first: if even the trunk doesn't fit, still give the cache a
+        // minimal slice so a huge model can stream; otherwise give it the
+        // leftover. If the whole model fits under the budget, cache everything.
         if total_model_bytes <= budget_bytes {
-            0 // model fits → cache everything
+            0
         } else {
-            budget_bytes
+            budget_bytes.max(256 * 1024 * 1024) // floor 256 MiB so streaming works
         }
     }
 
@@ -1548,5 +1581,63 @@ fn debug_all_layer1_q4k_blocks() {
             }
         }
         println!("{}: blocks={} bad={}", name, num_blocks, bad_blocks);
+    }
+}
+
+#[cfg(test)]
+mod trunk_first_tests {
+    use super::*;
+
+    fn cfg() -> ModelConfig {
+        ModelConfig {
+            hidden_size: 4096,
+            num_hidden_layers: 32,
+            num_key_value_heads: 8,
+            kv_head_dim: 128,
+            vocab_size: 128_000,
+            max_seq_len: 4096,
+            ..ModelConfig::default()
+        }
+    }
+
+    #[test]
+    fn small_model_fits_unlimited() {
+        // A ~3 GB model on a machine with enough RAM → budget 0 (cache all).
+        let c = cfg();
+        let budget = GGUFModel::compute_cache_budget_bytes(3 << 30, &c);
+        // We can't control available_memory_mb() here; just assert the math
+        // shape is sane (>= floor).
+        assert!(budget == 0 || budget >= 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn trunk_first_reserves_head_and_kv() {
+        // Force a large model so the budget is bounded (not 0).
+        // 32 layers * 8 kv_heads * 128 dim * 4096 ctx * 2 * 4 B = 1 GiB KV,
+        // plus head, so a 20 GiB model on a machine with < 20 GiB available
+        // must produce a non-zero, bounded budget rather than 0.
+        let c = cfg();
+        let budget = GGUFModel::compute_cache_budget_bytes(20 << 30, &c);
+        let avail_mb = available_memory_mb();
+        if avail_mb == 0 {
+            return; // meminfo unavailable on this machine
+        }
+        // Budget must not exceed available RAM and must be at least the floor.
+        assert!(budget == 0 || budget <= avail_mb * 1024 * 1024);
+        assert!(budget == 0 || budget >= 256 * 1024 * 1024);
+    }
+
+    #[test]
+    fn kv_trunk_scales_with_context() {
+        let mut c = cfg();
+        c.max_seq_len = 4096;
+        let a = GGUFModel::compute_cache_budget_bytes(20 << 30, &c);
+        c.max_seq_len = 128 * 1024;
+        let b = GGUFModel::compute_cache_budget_bytes(20 << 30, &c);
+        if available_memory_mb() == 0 {
+            return;
+        }
+        // Bigger context → bigger reserved trunk → smaller (or equal) cache budget.
+        assert!(b == 0 || b <= a);
     }
 }

@@ -7,6 +7,13 @@ pub mod cache;
 pub mod config;
 pub mod detect;
 
+/// Deterministic-mode controls (kimi-k3-in-c "determinism contract"):
+/// `LEAFCUTTER_DETERMINISTIC=1` forces serial, f64-accumulated dot products
+/// and disables the numeric-regime switches (Q8_K integer dot, AVX2 dual-
+/// accumulator FMA splits) so two runs on the same model produce
+/// bit-identical logits regardless of machine or thread count.
+pub mod deterministic;
+
 /// Background safety monitor — observes CPU temp/RSS and prints warnings
 /// to stderr.  Never throttles execution; pure advisory.
 pub mod cpu_monitor;
@@ -76,3 +83,4 @@ pub mod safetensor_backend;
 pub mod safetensors_loader;
 pub mod shard;
 pub mod tokenizer;
+pub mod launch;
