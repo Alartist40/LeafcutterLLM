@@ -212,6 +212,14 @@ enum Commands {
     },
     /// Show the command list (alias: 'leaf help')
     Help,
+    /// Update leafcutter to the latest release from GitHub
+    /// (downloads the prebuilt binary; falls back to a source rebuild if no
+    /// prebuilt exists yet for your OS/CPU)
+    Update {
+        /// Rebuild from source even when a prebuilt binary is available
+        #[arg(long)]
+        from_source: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -335,6 +343,9 @@ async fn main() {
         }
         Some(Commands::Help) => {
             cmd_help();
+        }
+        Some(Commands::Update { from_source }) => {
+            cmd_update(from_source);
         }
         None => {
             // No subcommand: print help and exit. Never bake a hardcoded
@@ -778,6 +789,7 @@ fn cmd_help() {
     println!("  source <op>          Manage model source directories (add/remove/list)");
     println!("  launch [app]         Launcher menu or start an app (e.g. cynapse)");
     println!("  app <op>             Manage the app registry used by 'launch'");
+    println!("  update               Update leafcutter to the latest GitHub release");
     println!("  help                 Show this command list");
     println!();
     println!("Options:");
@@ -791,6 +803,213 @@ fn cmd_help() {
     println!("  leafcutter serve --model /path/to/model.gguf --port 8081");
     println!();
     println!("For Cynapse integration:  leafcutter --meta   (synapse metadata JSON)");
+}
+
+/// Detect the GitHub release asset name for the current OS/CPU, e.g.
+/// `leafcutter-linux-x86_64`. Returns None for platforms we don't publish
+/// prebuilt binaries for (e.g. some BSDs) so the caller can fall back to a
+/// source rebuild.
+fn release_asset_name() -> Option<String> {
+    let os = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "x86_64" => "x86_64",
+        "aarch64" => "aarch64",
+        _ => return None,
+    };
+    Some(format!("leafcutter-{}-{}{}", os, arch, if os == "windows" { ".exe" } else { "" }))
+}
+
+/// `leafcutter update` — self-update from the GitHub release feed.
+///
+/// Tries to download the prebuilt binary for the current OS/CPU first. If no
+/// prebuilt exists (new/unknown platform) or `--from-source` is passed, it
+/// falls back to a source rebuild: clone/pull LeafcutterLLM into
+/// `~/.leafcutter` (the same location `install.sh` uses) and rebuild with
+/// cargo. The current executable is then replaced in place.
+fn cmd_update(from_source: bool) {
+    let repo = "Alartist40/LeafcutterLLM";
+    let cur_exe = std::env::current_exe().unwrap_or_else(|_| {
+        eprintln!("❌ Could not determine the current executable path.");
+        std::process::exit(1);
+    });
+
+    if from_source {
+        update_from_source(repo, &cur_exe);
+        return;
+    }
+
+    let Some(asset) = release_asset_name() else {
+        eprintln!(
+            "ℹ️  No prebuilt binary for {}/{} — falling back to a source rebuild.",
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        );
+        update_from_source(repo, &cur_exe);
+        return;
+    };
+
+    let latest_url = format!(
+        "https://api.github.com/repos/{}/releases/latest",
+        repo
+    );
+    let dl_url = format!(
+        "https://github.com/{}/releases/latest/download/{}",
+        repo, asset
+    );
+
+    // Probe for a prebuilt binary (release asset). A redirect/200 means the
+    // asset exists for this platform; 404 means it doesn't yet.
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout_read(std::time::Duration::from_secs(15))
+        .user_agent("leafcutter-update/0.9.0")
+        .build();
+
+    println!("🌿 Checking for updates from {}", repo);
+    let latest_tag = agent
+        .get(&latest_url)
+        .call()
+        .ok()
+        .and_then(|r| {
+            let body = r.into_string().ok()?;
+            serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("tag_name").and_then(|t| t.as_str()).map(String::from))
+        });
+
+    match latest_tag {
+        Some(tag) => println!("   latest release: {}", tag),
+        None => println!("   (could not read latest release tag)"),
+    }
+
+    let probe = agent.head(&dl_url).call();
+    let asset_exists = matches!(probe, Ok(_) | Err(ureq::Error::Status(302, _)));
+
+    if !asset_exists {
+        eprintln!("ℹ️  No prebuilt binary ({}) — falling back to a source rebuild.", asset);
+        update_from_source(repo, &cur_exe);
+        return;
+    }
+    println!("⬇️  Downloading {} …", asset);
+    let resp = match agent.get(&dl_url).call() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("❌ Download failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    let mut bytes = Vec::new();
+    if let Err(e) = resp.into_reader().read_to_end(&mut bytes) {
+        eprintln!("❌ Download failed: {e}");
+        std::process::exit(1);
+    }
+    if bytes.is_empty() {
+        eprintln!("❌ Downloaded file is empty.");
+        std::process::exit(1);
+    }
+
+    // Best-effort sanity check that it's a real executable (ELF/Mach-O/PE).
+    let looks_like_binary = bytes.len() >= 4
+        && matches!(
+            (&bytes[0], &bytes[1], &bytes[2], &bytes[3]),
+            (0x7f, 0x45, 0x4c, 0x46)          // ELF
+                | (0x4d, 0x5a, _, _)          // PE
+                | (0xcf, 0xfa, 0xed, 0xfe)    // Mach-O (64-bit)
+        );
+    if !looks_like_binary {
+        eprintln!("❌ Downloaded file does not look like a binary — aborting.");
+        std::process::exit(1);
+    }
+
+    // Replace the running executable. Write to a temp file first, then rename
+    // over the target (atomic on POSIX; works on Windows for a stopped exe).
+    let exe_dir = cur_exe.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let tmp_path = exe_dir.join(format!(".leafcutter-update-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp_path, &bytes) {
+        eprintln!("❌ Could not write update to {}: {e}", tmp_path.display());
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755));
+    }
+    if let Err(e) = std::fs::rename(&tmp_path, &cur_exe) {
+        eprintln!("❌ Could not replace {}: {e}", cur_exe.display());
+        let _ = std::fs::remove_file(&tmp_path);
+        std::process::exit(1);
+    }
+
+    println!("✅ Updated to the latest release. Restart leafcutter to use it.");
+}
+
+/// Rebuild leafcutter from source into `~/.leafcutter` (same location
+/// `install.sh` uses), then copy the fresh binary over the current one.
+fn update_from_source(repo: &str, cur_exe: &std::path::Path) {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let install_dir = std::path::PathBuf::from(format!("{}/.leafcutter", home));
+    let base_url = format!("https://github.com/{}.git", repo);
+
+    println!("🛠  Rebuilding from source in {} …", install_dir.display());
+
+    if install_dir.join(".git").exists() {
+        println!("   pulling latest …");
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&install_dir)
+            .arg("pull")
+            .arg("--rebase")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("❌ `git pull` failed in {}", install_dir.display());
+            std::process::exit(1);
+        }
+    } else {
+        println!("   cloning …");
+        if !std::process::Command::new("git")
+            .arg("clone")
+            .arg("--depth")
+            .arg("1")
+            .arg(&base_url)
+            .arg(&install_dir)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+        {
+            eprintln!("❌ `git clone` failed. Is git installed and the network up?");
+            std::process::exit(1);
+        }
+    }
+
+    if !std::process::Command::new("cargo")
+        .current_dir(install_dir.join("rust"))
+        .args(["build", "--release", "--bin", "leafcutter"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+    {
+        eprintln!("❌ `cargo build --release` failed. Is cargo installed?");
+        std::process::exit(1);
+    }
+
+    let built = install_dir.join("rust/target/release/leafcutter");
+    if let Err(e) = std::fs::copy(&built, cur_exe) {
+        eprintln!("❌ Could not install built binary to {}: {e}", cur_exe.display());
+        std::process::exit(1);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(cur_exe, std::fs::Permissions::from_mode(0o755));
+    }
+    println!("✅ Updated from source. Restart leafcutter to use it.");
 }
 
 fn cmd_app(op: AppOp) {
