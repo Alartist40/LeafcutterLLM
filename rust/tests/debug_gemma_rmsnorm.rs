@@ -10,6 +10,7 @@ use leafcutter::inference::engine::Engine;
 use leafcutter::tokenizer::GgufTokenizer;
 
 #[test]
+#[ignore = "manual debug test against local GGUF file"]
 fn debug_rmsnorm_input() {
     let model_path = std::env::var("LEAFCUTTER_MODEL").unwrap_or_else(|_| {
         "/home/xander/Downloads/models/gemma-4-12b-it-Q4_K_M.gguf".to_string()

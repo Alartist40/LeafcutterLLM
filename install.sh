@@ -160,7 +160,9 @@ if [ "${INSTALLED:-}" != "prebuilt" ]; then
     # --- install ---
     cp "${INSTALL_DIR}/rust/target/release/leafcutter" "${BIN_PATH}"
     chmod +x "${BIN_PATH}"
-    echo "Installed to ${BIN_PATH}"
+    # Create symlink 'leaf' -> 'leafcutter' for convenience
+    ln -sf "${BIN_PATH}" "${BIN_DIR}/leaf"
+    echo "Installed to ${BIN_PATH} (and symlinked ${BIN_DIR}/leaf)"
 fi
 
 # ------------------------------------------------------------------ models ---
@@ -168,19 +170,69 @@ fi
 # PATH hasn't been refreshed yet in this shell).
 "$BIN_PATH" list >/dev/null 2>&1 || true
 
+# -------------------------------------------------------------- settings ---
+# Write a documented settings template so the shipped binary's env vars and
+# defaults are captured on every install (rebuild-from-scratch friendly).
+CFG_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/leafcutter"
+mkdir -p "${CFG_DIR}"
+SETTINGS_EXAMPLE="${CFG_DIR}/settings.env.example"
+cat > "${SETTINGS_EXAMPLE}" <<'SETTINGS'
+# LeafcutterLLM — settings template (copy to settings.env and export as needed)
+# Every variable below is OPTIONAL; the binary has sane built-in defaults.
+
+# --- model search ---
+# LEAF_MODELS_DIR=/models:/more/models        # colon-separated extra model dirs
+#                                              # (default: ./models, ~/Downloads/models)
+
+# --- performance ---
+# LEAFCUTTER_THREADS=12                        # Rayon worker threads
+#                                              # (default: physical cores on ARM, cores-1 on x86)
+# LEAFCUTTER_NO_CACHE=1                        # Tier 3 low-RAM mode: stream + evict layers
+# LEAFCUTTER_PREFETCH=1                        # prefetch layer l+1 during layer l (default on)
+# LEAFCUTTER_CACHE_MB=6000                     # resident layer cache ceiling
+# LEAFCUTTER_CTX_KB=4096                       # KV-cache context budget
+# LEAFCUTTER_Q8_GEMV=0                         # 0 disables ARM sdot Q8 GEMV (NEON fallback)
+# LEAFCUTTER_PREFER_GPU=1                      # prefer Vulkan/GPU path when available
+
+# --- determinism / debugging ---
+# LEAFCUTTER_DETERMINISTIC=1                   # bit-identical serial reductions
+# LEAFCUTTER_PROFILE=1                         # per-component layer timing to stderr
+# LEAFCUTTER_DEBUG=1                           # verbose debug output
+# LEAFCUTTER_DEBUG_LAYERS=0,5,10               # per-layer tensor debug
+# LEAFCUTTER_DEBUG_NORMS=1                     # rms-norm diagnostics
+# LEAFCUTTER_DEBUG_PROMPT=1                    # print the exact prompt sent to the model
+# LEAFCUTTER_ROPE_DEBUG=1                      # RoPE angle diagnostics
+# LEAFCUTTER_TOKENIZER_DEBUG=1                 # tokenizer decode diagnostics
+# LEAFCUTTER_DELTANET_DEBUG=1                  # DeltaNet layer diagnostics
+# LEAFCUTTER_CHUNK_DEBUG=1                     # GGUF chunk parser diagnostics
+# LEAFCUTTER_OLLAMA_DEBUG=1                    # Ollama API adapter diagnostics
+# LEAFCUTTER_CPU_MONITOR=1                     # log CPU temp / throttling warnings
+
+# --- sampling / API ---
+# LEAFCUTTER_TOP_K=2048                        # sampling top-k cap
+# LEAFCUTTER_API_KEY=sk-...                    # remote model API key (API-backed models)
+# LEAFCUTTER_BASE_URL=http://localhost:11434   # remote model API base URL
+# LEAFCUTTER_MODEL=/path/to/model.gguf         # model path override for scripts
+SETTINGS
+echo "Settings template:        ${SETTINGS_EXAMPLE}"
+
 echo ""
-echo "✅ LeafcutterLLM installed."
+echo "✅ LeafcutterLLM installed successfully."
 echo ""
-echo "Quick start:"
-echo "  leafcutter list              # list available models"
-echo "  leafcutter source add <dir>  # point at a folder of models (persisted)"
-echo "  leafcutter run <model>       # start chatting"
-echo "  leafcutter serve             # start HTTP API server"
+echo "Quick start (using 'leafcutter' or shortcut 'leaf'):"
+echo "  leafcutter list                # list available models"
+echo "  leafcutter source add <dir>    # point at a folder of models (persisted)"
+echo "  leafcutter run <model>         # start chatting (gold & purple REPL UI)"
+echo "  leafcutter generate --model .. # one-shot generation"
+echo "  leafcutter serve               # start OpenAI-compatible HTTP API server"
+echo "  leafcutter update              # update to the latest version"
 echo ""
 echo "Models auto-detect from ./models, ~/Downloads/models, and any /source dirs."
 echo "Or set LEAF_MODELS_DIR=/path/to/models"
+echo "Tune runtime behavior with env vars (see ${SETTINGS_EXAMPLE})."
 if [ "${BIN_DIR}" != "/usr/local/bin" ]; then
     echo ""
     echo "Add ${BIN_DIR} to your PATH if not already there:"
     echo "  export PATH=\"${BIN_DIR}:\$PATH\""
 fi
+

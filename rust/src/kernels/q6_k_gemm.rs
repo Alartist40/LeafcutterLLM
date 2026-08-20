@@ -361,6 +361,14 @@ pub fn q6_k_matmul_transposed_b(a: &[f32], b: &Q6KMatrix, c: &mut [f32], m: usiz
         return;
     }
 
+    // Prefill (m > 1): quantize each activation row to Q8_K and use the
+    // integer-dot path (sdot on aarch64), skipping the f32 dequant.
+    let q8_disabled = std::env::var("LEAFCUTTER_Q8_GEMV").map(|v| v == "0").unwrap_or(false);
+    if !q8_disabled && !crate::deterministic::enabled() {
+        crate::kernels::q8_k_gemm::q6_k_matmul_transposed_b_q8(a, b, c, m, k, n);
+        return;
+    }
+
     use std::cell::RefCell;
     thread_local! {
         static TEMP_BUF: RefCell<Vec<f32>> = RefCell::new(Vec::new());

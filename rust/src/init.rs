@@ -48,7 +48,17 @@ pub fn configure_thread_pool(threads: Option<usize>) -> Result<usize, String> {
 /// physical pairs. When that file isn't available (Windows/Mac), we
 /// fall back to `available_parallelism() / 2`.
 pub fn default_thread_count() -> usize {
-    // Try /proc/cpuinfo — most Linux boxes expose physical cores via "cpu cores".
+    let logical = std::thread::available_parallelism()
+        .map(|u| u.get())
+        .unwrap_or(4);
+
+    // On aarch64 / ARM (e.g. CIX Sky1 / RK3588), cores are physical (no SMT hyperthreading).
+    // Use logical - 1 (or all logical cores if <= 4) for maximum parallel GEMV performance.
+    if cfg!(target_arch = "aarch64") {
+        return (logical.saturating_sub(1)).max(2);
+    }
+
+    // Try /proc/cpuinfo for x86 physical core detection.
     if let Ok(s) = std::fs::read_to_string("/proc/cpuinfo") {
         let mut phys = 0usize;
         for line in s.lines() {
@@ -62,10 +72,7 @@ pub fn default_thread_count() -> usize {
             return (phys.saturating_sub(1)).max(2);
         }
     }
-    // Fallback: assume SMT (typical for x86, Apple M-series big.little)
-    let logical = std::thread::available_parallelism()
-        .map(|u| u.get())
-        .unwrap_or(4);
+    // Fallback for x86 SMT
     (logical / 2).max(2)
 }
 

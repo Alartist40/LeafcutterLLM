@@ -88,7 +88,9 @@ impl Backend for CpuBackend {
     }
 
     fn silu(&self, x: &[f32]) -> Vec<f32> {
-        x.iter().map(|&v| v * (1.0 / (1.0 + (-v).exp()))).collect()
+        let mut result = vec![0.0f32; x.len()];
+        crate::kernels::simd::simd_silu(x, &mut result);
+        result
     }
 
     fn softmax(&self, x: &[f32], hidden_size: usize) -> Vec<f32> {

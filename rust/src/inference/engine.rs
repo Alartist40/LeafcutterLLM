@@ -14,7 +14,7 @@ use crate::cache::{KVCache, ssm_state::SSMStateCache, deltanet_state::DeltaNetSt
 use crate::inference::attention::{attention_forward, AttentionParams};
 use crate::inference::deltanet::{deltanet_forward, DeltaNetParams};
 use crate::inference::mla::{mla_forward, MlaParams};
-use crate::inference::moe::{MoeConfig, moe_forward};
+use crate::inference::moe::MoeConfig;
 use crate::inference::sampler::sample_top_p;
 use crate::inference::ssm::{ssm_forward, SSMConfig};
 use crate::inference::speculative::SpeculativeHead;
@@ -354,11 +354,17 @@ impl Engine {
         // `LEAFCUTTER_CACHE_HEAD=0`.
         let lm_head_tied = !model.file.get_tensor_info("output.weight").is_some();
         let lm_head_tensor_name = if lm_head_tied { "token_embd.weight" } else { "output.weight" };
-        // Default OFF: Leafcutter is a stateless inference tool — like Ollama it
-        // reads output.weight from mmap on demand per token instead of holding a
-        // resident Q6_K cache (~0.8 GB for Ornith).  Opt in with
-        // `LEAFCUTTER_CACHE_HEAD=1` for a ~2× lm_head speedup at +0.8 GB RSS.
-        let cache_head = std::env::var("LEAFCUTTER_CACHE_HEAD").map(|v| v == "1" || v == "true").unwrap_or(false);
+        // Default ON for models that fully fit in RAM (cache budget == 0):
+        // holding output.weight as a resident Q6_K cache makes lm_head a fast
+        // quantized GEMV instead of per-row mmap re-dequantization (~310ms →
+        // ~44ms for Ornith's 248K vocab), and the model fits anyway so the
+        // extra ~0.8 GB RSS is within budget.  For "large model on small
+        // hardware" it falls back to the per-row mmap path instead.  Override
+        // with `LEAFCUTTER_CACHE_HEAD=0` (or `=1` to force on).
+        let cache_head = match std::env::var("LEAFCUTTER_CACHE_HEAD") {
+            Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+            Err(_) => model.layer_cache_budget_bytes() == 0,
+        };
         let cached_lm_head = if cache_head && model.model_fits_available_ram() {
             load_lm_head_cache(&model, lm_head_tensor_name)
         } else {
@@ -953,12 +959,12 @@ impl Engine {
             // Override: LEAFCUTTER_PREFETCH=1 to force on, =0 to force off.
             let use_prefetch = match std::env::var("LEAFCUTTER_PREFETCH").ok().as_deref() {
                 Some("0") | Some("false") => false,
-                Some("1") | Some("true") => {
-                    let avail = crate::detect::probe_hardware().ram_available_mb;
+                Some("1") | Some("true") => true,
+                _ => {
+                    let total_ram = crate::detect::probe_hardware().ram_total_mb;
                     let model_mb = (self.model.file.file_size_bytes() / (1024 * 1024)) as u64;
-                    avail >= model_mb.saturating_mul(2)
+                    total_ram >= model_mb
                 }
-                _ => false,
             };
             let mut prefetch: Option<std::thread::ScopedJoinHandle<'_, Result<std::sync::Arc<HashMap<String, Tensor>>, String>>> =
                 if use_prefetch && num_layers > 1 {
@@ -1019,19 +1025,39 @@ impl Engine {
                         .get("input_layernorm.weight")
                         .or_else(|| layer_weights.get("attn_norm.weight"))
                         .ok_or_else(|| format!("layer {}: missing pre-norm (input_layernorm/attn_norm)", layer_idx))?;
+                    let _t_pre = std::time::Instant::now();
                     let normed = hidden.rms_norm(pre_norm_weight, self.config.norm_eps);
+                    if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+                        eprintln!("[PROFILE] pre_norm               {:>8.2}ms", _t_pre.elapsed().as_secs_f32() * 1000.0);
+                    }
 
                     if has_standard_attn {
+                        let _t_attn = std::time::Instant::now();
                         let attn_out = attention_forward(&normed, &layer_weights, &self.attn_params, &mut self.kv_cache, layer_idx, self.seq_offset);
+                        if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+                            eprintln!("[PROFILE] attention_forward      {:>8.2}ms", _t_attn.elapsed().as_secs_f32() * 1000.0);
+                        }
                         hidden = hidden.add(&attn_out);
                     } else if has_deltanet {
+                        let _t_delta = std::time::Instant::now();
                         let deltanet_out = deltanet_forward(&normed, &layer_weights, &self.deltanet_params, &mut self.deltanet_cache, layer_idx);
+                        if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+                            eprintln!("[PROFILE] deltanet_forward      {:>8.2}ms", _t_delta.elapsed().as_secs_f32() * 1000.0);
+                        }
                         hidden = hidden.add(&deltanet_out);
                     } else if has_ssm {
+                        let _t_ssm = std::time::Instant::now();
                         let ssm_out = ssm_forward(&normed, &layer_weights, &self.ssm_config, &mut self.ssm_cache, layer_idx);
+                        if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+                            eprintln!("[PROFILE] ssm_forward            {:>8.2}ms", _t_ssm.elapsed().as_secs_f32() * 1000.0);
+                        }
                         hidden = hidden.add(&ssm_out);
                     } else if has_mla {
+                        let _t_mla = std::time::Instant::now();
                         let mla_out = mla_forward(&normed, &layer_weights, &self.mla_params, &mut self.kv_cache, layer_idx, self.seq_offset);
+                        if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+                            eprintln!("[PROFILE] mla_forward            {:>8.2}ms", _t_mla.elapsed().as_secs_f32() * 1000.0);
+                        }
                         hidden = hidden.add(&mla_out);
                     }
 
@@ -1040,12 +1066,20 @@ impl Engine {
                         .or_else(|| layer_weights.get("post_attention_norm.weight"))
                         .or_else(|| layer_weights.get("ffn_norm.weight"))
                         .ok_or_else(|| format!("layer {}: missing post-norm (post_attention_layernorm/_norm/ffn_norm)", layer_idx))?;
+                    let _t_post = std::time::Instant::now();
                     let normed = hidden.rms_norm(post_norm_weight, self.config.norm_eps);
+                    if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+                        eprintln!("[PROFILE] post_norm              {:>8.2}ms", _t_post.elapsed().as_secs_f32() * 1000.0);
+                    }
+                    let _t_ffn = std::time::Instant::now();
                     let ffn_out = if has_moe {
                         Self::ffn_moe_forward(&normed, &layer_weights, &self.moe_params, has_shared_expert)?
                     } else {
                         Self::ffn_forward(&normed, &layer_weights)?
                     };
+                    if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+                        eprintln!("[PROFILE] ffn_forward            {:>8.2}ms", _t_ffn.elapsed().as_secs_f32() * 1000.0);
+                    }
                     hidden = hidden.add(&ffn_out);
                 }
 
@@ -1493,94 +1527,47 @@ impl Engine {
             .get("mlp.down_proj.weight")
             .ok_or_else(|| "ffn_forward: missing mlp.down_proj.weight".to_string())?;
 
+        let _t_gate = std::time::Instant::now();
         let gate_proj = x.matmul(gate);
+        let t_gate = _t_gate.elapsed().as_secs_f32() * 1000.0;
+        let _t_up = std::time::Instant::now();
         let up_proj = x.matmul(up);
+        let t_up = _t_up.elapsed().as_secs_f32() * 1000.0;
+        let _t_silu = std::time::Instant::now();
         let activated = gate_proj.silu();
-
+        let t_silu = _t_silu.elapsed().as_secs_f32() * 1000.0;
+        let _t_fused = std::time::Instant::now();
         let mut fused = vec![0.0f32; activated.size()];
-        for i in 0..activated.size() {
-            fused[i] = activated.data[i] * up_proj.data[i];
-        }
+        crate::kernels::simd::simd_vec_mul(&activated.data, &up_proj.data, &mut fused);
         let fused_tensor = Tensor::from_vec(fused, activated.shape.clone());
-
-        Ok(fused_tensor.matmul(down))
+        let t_fused = _t_fused.elapsed().as_secs_f32() * 1000.0;
+        let _t_down = std::time::Instant::now();
+        let out = fused_tensor.matmul(down);
+        let t_down = _t_down.elapsed().as_secs_f32() * 1000.0;
+        if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+            eprintln!("[PROFILE]   ffn gate={:.3} up={:.3} silu={:.3} fusedmul={:.3} down={:.3}",
+                t_gate, t_up, t_silu, t_fused, t_down);
+        }
+        Ok(out)
     }
 
     /// MoE FFN forward (DeepSeek-2 / GLM-DSA).  Per-token, top-k routing
     /// over routed experts + shared expert branch.  Driven by
     /// `crate::inference::moe::moe_forward_one_token`.
     ///
-    /// The engine's `load_layer()` returns routed `*_exps.weight` tensors
-    /// in their full 3-D shape `[out, in, num_experts]`.  We slice them
-    /// into per-expert 2-D views here so that the MoE module's
-    /// `moe_forward_one_token` API (which expects 2-D per-expert weights)
-    /// works without further changes.  Shared expert weights are already 2-D
-    /// and pass through unchanged.
+    /// Routed `*_exps.weight` tensors stay resident as 3-D QUANTIZED
+    /// tensors (`[d0, d1, num_experts]`); each active expert is sliced out
+    /// on demand inside the MoE module via `Tensor::expert_slice` (no f32
+    /// materialization of the full 3-D tensor).  Shared expert weights are
+    /// 2-D and pass through unchanged.
     pub fn ffn_moe_forward(
         x: &Tensor,
         weights: &HashMap<String, Tensor>,
         cfg: &crate::inference::moe::MoeConfig,
         has_shared_expert: bool,
     ) -> Result<Tensor, String> {
-        let seq_len = x.shape[0];
-        let hidden_dim = x.shape[1];
-
-        // Slice routed experts into per-expert 2-D views.
-        let mut sliced: HashMap<String, Tensor> = HashMap::new();
-        // The two naming conventions seen in GGUF shards for Kimi / GLM-DSA:
-        //   * `ffn_gate_inp` / `ffn_*_exps`     (DeepSeek-2 convention)
-        //   * `mlp.expert_gate` / `mlp.expert_*` (Qwen-MoE convention)
-        // Support whichever appears.  Only one of the two pairs is loaded
-        // for a given model tensor naming, so this is safe.
-        crate::inference::moe::slice_experts(
-            weights,
-            &mut sliced,
-            "ffn_gate_exps",
-            "ffn_gate_exps",
-        );
-        crate::inference::moe::slice_experts(
-            weights,
-            &mut sliced,
-            "ffn_up_exps",
-            "ffn_up_exps",
-        );
-        crate::inference::moe::slice_experts(
-            weights,
-            &mut sliced,
-            "ffn_down_exps",
-            "ffn_down_exps",
-        );
-        crate::inference::moe::slice_experts(
-            weights,
-            &mut sliced,
-            "mlp.expert_gate.weight",
-            "ffn_gate_exps",
-        );
-        crate::inference::moe::slice_experts(
-            weights,
-            &mut sliced,
-            "mlp.expert_up.weight",
-            "ffn_up_exps",
-        );
-        crate::inference::moe::slice_experts(
-            weights,
-            &mut sliced,
-            "mlp.expert_down.weight",
-            "ffn_down_exps",
-        );
-
-        // Merge sliced + shared into the working weights map.
-        let mut working = sliced;
-        for (k, v) in weights {
-            // Pass through everything that is not a 3-D routed tensor we already sliced.
-            // (Slice-experts only inserts into `sliced` for ffn_*/mlp.expert_*, no conflicts.)
-            if !working.contains_key(k) {
-                working.insert(k.clone(), v.clone());
-            }
-        }
         let _ = has_shared_expert; // reserved for later exp_probs_b wiring
-
-        Ok(crate::inference::moe::moe_forward(x, &working, cfg))
+        Ok(crate::inference::moe::moe_forward(x, weights, cfg))
     }
 
     /// Get engine info for diagnostics

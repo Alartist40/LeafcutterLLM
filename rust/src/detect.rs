@@ -50,6 +50,47 @@ impl GpuKind {
     }
 }
 
+/// What kind of NPU the host exposes.  NPUs are fixed-function
+/// accelerators: they execute *precompiled* model binaries, not arbitrary
+/// GEMM/LLM ops, so they can't take llama.cpp-style compute offload the way
+/// a GPU can.  We detect them so the capability report is honest and future
+/// dispatch tiers can be wired in — but we never route tensor offload to one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NpuKind {
+    /// No NPU found.
+    None,
+    /// Arm China Zhouyi AIPU (`/dev/aipu`, kernel driver aliases
+    /// `armchina,zhouyi-*`; used by e.g. the CIX Sky1 SoC).
+    ZhouyiAipu,
+    /// Some other NPU recognised by its kernel driver node.
+    Other,
+}
+
+impl NpuKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            NpuKind::None => "none",
+            NpuKind::ZhouyiAipu => "zhouyi-aipu",
+            NpuKind::Other => "other",
+        }
+    }
+
+    pub fn is_present(self) -> bool {
+        self != NpuKind::None
+    }
+
+    /// True when the NPU accepts arbitrary LLM compute at runtime.  Zhouyi
+    /// AIPUs (like most embedded NPUs) only run precompiled `.aipu.bin`
+    /// graphs compiled by Arm China's offline compiler — there is no
+    /// userland runtime that can stream llama.cpp ops through them, so this
+    /// is always false today.  Kept as a method so a future dynamic-offload
+    /// NPU (e.g. a full Ethos-U with a live runtime) can opt in without
+    /// changing call sites.
+    pub fn supports_dynamic_offload(self) -> bool {
+        false
+    }
+}
+
 /// Snapshot of the host machine, gathered once at startup.
 #[derive(Debug, Clone)]
 pub struct HardwareInfo {
@@ -57,6 +98,8 @@ pub struct HardwareInfo {
     pub ram_total_mb: u64,
     pub ram_available_mb: u64,
     pub gpu: GpuKind,
+    /// Fixed-function NPU, if any (reported but never used for offload).
+    pub npu: NpuKind,
     /// Host OS (linux, macos, windows, ...).
     pub os: &'static str,
     /// CPU architecture (x86_64, aarch64, ...).
@@ -73,6 +116,7 @@ impl HardwareInfo {
             ram_total_mb: total,
             ram_available_mb: avail,
             gpu: probe_gpu(),
+            npu: probe_npu(),
             os: current_os(),
             arch: current_arch(),
         }
@@ -232,13 +276,16 @@ pub fn choose_tier(
     if prefer_gpu && gpu.is_present() {
         return Tier::Gpu;
     }
-    // Reserve ~1.5 GiB for OS + KV cache + activations + lm_head.
+    if ram_available_mb == 0 {
+        return Tier::StreamingCpu;
+    }
+    let (total_mb, avail_mb) = meminfo_mb();
+    let ram_mb = if total_mb > 0 { total_mb } else { ram_available_mb };
+    let total_ram_bytes = ram_mb.saturating_mul(1024 * 1024);
+    // Reserve 1.5 GiB headroom for OS + KV cache + activations
     const RESERVE_BYTES: u64 = 1536 * 1024 * 1024;
-    // Headroom factor over the raw model bytes for caches at decode time.
-    const EST_FACTOR: u64 = 125; // ×1.25
-    let available = ram_available_mb.saturating_mul(1024 * 1024);
-    let need = model_size_bytes.saturating_mul(EST_FACTOR) / 100 + RESERVE_BYTES;
-    if need <= available {
+    let need = model_size_bytes.saturating_add(RESERVE_BYTES);
+    if need <= total_ram_bytes {
         Tier::FastCpu
     } else {
         Tier::StreamingCpu
@@ -311,6 +358,24 @@ fn probe_gpu() -> GpuKind {
 
 fn path_exists(p: &str) -> bool {
     std::path::Path::new(p).exists()
+}
+
+/// Cheap, dependency-free NPU probe.
+///
+/// Recognises the Arm China Zhouyi AIPU (`/dev/aipu`, misc-class sysfs node
+/// `aipu`, driver aliases `armchina,zhouyi-*`) used by the CIX Sky1 and
+/// other Arm-NPU SoCs.  Other NPU driver nodes fall back to `NpuKind::Other`
+/// when present.  NPUs are never treated as GPUs for tier dispatch.
+fn probe_npu() -> NpuKind {
+    if path_exists("/dev/aipu") || sysfs_misc_exists("aipu") {
+        return NpuKind::ZhouyiAipu;
+    }
+    NpuKind::None
+}
+
+/// True if `/sys/class/misc/<name>` exists (a misc-class char device).
+fn sysfs_misc_exists(name: &str) -> bool {
+    Path::new("/sys/class/misc").join(name).exists()
 }
 
 /// True if any `/dev/dri/renderD*` node exists (a real GPU kernel driver).
@@ -420,6 +485,18 @@ mod tests {
     fn tier_uses_gpu_when_preferred() {
         assert_eq!(choose_tier(GpuKind::Vulkan, 8_000, 40_000_000_000, true), Tier::Gpu);
         assert_eq!(choose_tier(GpuKind::None, 8_000, 40_000_000_000, true), Tier::StreamingCpu);
+    }
+
+    #[test]
+    fn npu_kind_labels_and_never_offloads() {
+        assert_eq!(NpuKind::None.label(), "none");
+        assert_eq!(NpuKind::ZhouyiAipu.label(), "zhouyi-aipu");
+        assert!(!NpuKind::None.is_present());
+        assert!(NpuKind::ZhouyiAipu.is_present());
+        assert!(!NpuKind::ZhouyiAipu.supports_dynamic_offload());
+        // An NPU must never upgrade the tier to GPU even if present.
+        let hw = HardwareInfo { npu: NpuKind::ZhouyiAipu, gpu: GpuKind::None, ..probe_hardware() };
+        assert_eq!(choose_tier(hw.gpu, hw.ram_available_mb, 40_000_000_000, true), Tier::StreamingCpu);
     }
 
     #[test]

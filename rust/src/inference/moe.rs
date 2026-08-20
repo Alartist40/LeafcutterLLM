@@ -19,9 +19,11 @@
 //!   - `expert_gating_func = 1` (softmax)       — older Qwen-MoE
 //!
 //! This module is **layer-streaming**: the caller is expected to drop
-//! resident expert tensors between layer iterations.  For now we accept
-//! already-dequantized f32 tensor views; the engine handles layer
-//! dequantization on top of `moe_forward`.
+//! resident expert tensors between layer iterations.  Routed experts are
+//! stored as single 3-D quantized tensors (`[d0, d1, num_experts]`, GGUF
+//! row-major over `[expert, d1, d0]`); each active expert is sliced out
+//! on demand via `Tensor::expert_slice` — quantized, without ever
+//! materializing the full 3-D tensor to f32.
 //!
 //! Inside the layer, we compute routing weights once and use them for
 //! both shared-expert bias correction (DeepSeek-V3) and routed-sigmoid
@@ -67,32 +69,54 @@ impl Default for MoeConfig {
 
 /// Compute the MoE forward from a single-token hidden state.
 ///
-/// `hidden` shape: `[hidden_size]`.  Returns `[hidden_size]`.
+/// `hidden` shape: `[1, hidden_size]`.  Returns `[hidden_size]`.
 pub fn moe_forward_one_token(
     hidden: &Tensor,
     weights: &HashMap<String, Tensor>,
     cfg: &MoeConfig,
 ) -> Tensor {
-    let hidden_dim = hidden.shape[0];
+    let hidden_dim = hidden.shape[1];
     let num_experts = cfg.num_experts;
     let k = cfg.num_experts_used;
 
+    // Router: the 2-D gating projection.  Qwen3.6/GLM-DSA call it
+    // `mlp.gate.weight` (mapped from GGUF `ffn_gate_inp.weight`); the
+    // `mlp.expert_gate.weight` tensor is the 3-D ROUTED EXPERT gate and
+    // must never be used as the router.
     let gate_inp = weights
-        .get("mlp.expert_gate.weight")
+        .get("mlp.gate.weight")
         .or_else(|| weights.get("ffn_gate_inp.weight"))
-        .expect("missing router gate (ffn_gate_inp.weight / mlp.expert_gate.weight)");
+        .expect("missing router gate (ffn_gate_inp.weight / mlp.gate.weight)");
     let exp_probs_b = weights.get("exp_probs_b.bias");
 
     // ── Routing scores: [num_experts]
-    let scores = hidden.matmul(&gate_inp.transpose());
+    // The router is stored as a 2-D `[d0=hidden, d1=num_experts]` tensor
+    // (quantized as `[rows=n_experts, cols=hidden]` B^T, or f32 in GGUF
+    // order).  Either way `hidden.matmul(router)` gives
+    // `sum_j hidden[j] * router[e, j]` — the per-expert score — so we use
+    // it directly; never `.transpose()` (that reads `.data`, which is empty
+    // for quantized-only tensors and would zero the router).
+    let scores = hidden.matmul(gate_inp);
 
     let mut routed_acc = Tensor::zeros(vec![hidden_dim]);
     if num_experts >= 1 && k >= 1 {
-        // ── top-k selection (descending)
+        // ── top-k selection: O(N) partition via select_nth_unstable_by, then sort top-k
         let mut idx_score: Vec<(usize, f32)> =
             (0..num_experts).map(|i| (i, scores.data[i])).collect();
-        idx_score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-        let active: Vec<(usize, f32)> = idx_score.iter().take(k).cloned().collect();
+        let active_k = k.min(num_experts);
+        if active_k < num_experts {
+            idx_score.select_nth_unstable_by(active_k - 1, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            idx_score[..active_k].sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            idx_score.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        let active: Vec<(usize, f32)> = idx_score[..active_k].to_vec();
 
         // Per-active-expert weight (sum depends on gating variant).
         let active_w: Vec<f32> = match cfg.gating_func {
@@ -161,32 +185,24 @@ fn sigmoid(x: f32) -> f32 {
 
 /// Compute the routed expert branch for one expert.
 ///
-/// The engine is expected to have pre-sliced each `*_exps.weight` tensor
-/// (3-D, [num_experts, ...]) into per-expert 2-D tensors and stored them
-/// in the weights map under the suffixed key (e.g. `ffn_gate_exps.7`).
+/// Routed experts live in the weights map as single 3-D quantized tensors
+/// (`mlp.expert_gate.weight` / `ffn_gate_exps`, ...).  Each active expert is
+/// sliced on demand with `Tensor::expert_slice` — a quantized sub-matrix,
+/// so the whole 3-D tensor is never dequantized to f32.
 fn expert_one_token(
     hidden: &Tensor,
     weights: &HashMap<String, Tensor>,
     expert_idx: usize,
 ) -> Tensor {
-    let gate = weights
-        .get(&format!("ffn_gate_exps.{}", expert_idx))
-        .or_else(|| weights.get(&format!("mlp.expert_gate.{}", expert_idx)))
-        .or_else(|| weights.get("ffn_gate_exps.current"))
+    let gate = expert_weight(weights, &["mlp.expert_gate.weight", "ffn_gate_exps"], expert_idx)
         .expect("missing routed expert gate");
-    let up = weights
-        .get(&format!("ffn_up_exps.{}", expert_idx))
-        .or_else(|| weights.get(&format!("mlp.expert_up.{}", expert_idx)))
-        .or_else(|| weights.get("ffn_up_exps.current"))
+    let up = expert_weight(weights, &["mlp.expert_up.weight", "ffn_up_exps"], expert_idx)
         .expect("missing routed expert up");
-    let down = weights
-        .get(&format!("ffn_down_exps.{}", expert_idx))
-        .or_else(|| weights.get(&format!("mlp.expert_down.{}", expert_idx)))
-        .or_else(|| weights.get("ffn_down_exps.current"))
+    let down = expert_weight(weights, &["mlp.expert_down.weight", "ffn_down_exps"], expert_idx)
         .expect("missing routed expert down");
 
-    let gate_proj = hidden.matmul(gate); // [expert_ffn]
-    let up_proj = hidden.matmul(up);
+    let gate_proj = hidden.matmul(&gate); // [expert_ffn]
+    let up_proj = hidden.matmul(&up);
     // SiLU(gate) * up — scalar formula since f32 doesn't have method silu().
     let mut gated = Vec::with_capacity(gate_proj.size());
     for j in 0..gate_proj.size() {
@@ -194,7 +210,37 @@ fn expert_one_token(
         let silu_g = g / (1.0 + (-g).exp());
         gated.push(silu_g * up_proj.data[j]);
     }
-    Tensor::from_vec(gated, gate_proj.shape.clone()).matmul(down) // [hidden]
+    Tensor::from_vec(gated, gate_proj.shape.clone()).matmul(&down) // [hidden]
+}
+
+/// Look up a routed expert tensor and slice the requested expert out of it.
+///
+/// Accepts either a 3-D parent (sliced on demand, quantized when possible —
+/// the normal path) or the legacy per-expert keys (`<name>.<i>` /
+/// `<name>.current`) for callers that pre-slice.
+fn expert_weight(
+    weights: &HashMap<String, Tensor>,
+    names: &[&str],
+    expert_idx: usize,
+) -> Option<Tensor> {
+    for n in names {
+        if let Some(parent) = weights.get(*n) {
+            if let Some(slice) = parent.expert_slice(expert_idx) {
+                return Some(slice);
+            }
+        }
+    }
+    for n in names {
+        if let Some(t) = weights.get(&format!("{}.{}", n, expert_idx)) {
+            return Some(t.clone());
+        }
+    }
+    for n in names {
+        if let Some(t) = weights.get(&format!("{}.current", n)) {
+            return Some(t.clone());
+        }
+    }
+    None
 }
 
 fn expert_shared(hidden: &Tensor, weights: &HashMap<String, Tensor>) -> Tensor {
@@ -229,7 +275,7 @@ pub fn moe_forward(hidden: &Tensor, weights: &HashMap<String, Tensor>, cfg: &Moe
     for t in 0..seq_len {
         let row = Tensor::from_vec(
             hidden.data[t * hidden_dim..(t + 1) * hidden_dim].to_vec(),
-            vec![hidden_dim],
+            vec![1, hidden_dim],
         );
         let out = moe_forward_one_token(&row, weights, cfg);
         out_data.extend_from_slice(&out.data);
@@ -240,12 +286,15 @@ pub fn moe_forward(hidden: &Tensor, weights: &HashMap<String, Tensor>, cfg: &Moe
 /// Slice a 3-D expert tensor into per-expert 2-D views and insert them into
 /// `weights_out` under keyed names like `ffn_gate_exps.3`.
 ///
-/// GGUF stores 3-D expert tensors with shape `[expert_dim_out, expert_dim_in, num_experts]`
-/// (DeepSeek-2 / GLM-DSA convention).  Each "slice" is a `[expert_dim_out, expert_dim_in]` view
-/// that the MoE module multiplies as `hidden @ slice.T`.
+/// GGUF stores 3-D expert tensors with shape `[d0, d1, num_experts]` and the
+/// data row-major over `[expert, d1, d0]` (d0 contiguous, experts outermost).
+/// Each slice is a `[d0, d1]` quantized tensor that the MoE module multiplies
+/// as `hidden @ slice` (the B^T GEMM kernel convention).  Slicing is done via
+/// `Tensor::expert_slice`, which stays quantized and never materializes the
+/// full 3-D tensor to f32.
 ///
 /// `src_engine_name` is what the source tensor is called in the engine weights map
-/// (e.g. `ffn_gate_exps` or `mlp.expert_gate`).
+/// (e.g. `ffn_gate_exps` or `mlp.expert_gate.weight`).
 pub fn slice_experts(
     weights_in: &HashMap<String, Tensor>,
     weights_out: &mut HashMap<String, Tensor>,
@@ -258,25 +307,11 @@ pub fn slice_experts(
     //       loader or engine pre-sliced).  Pass through unchanged.
     if let Some(parent) = weights_in.get(src_engine_name) {
         if parent.shape.len() == 3 {
-            // [out_dim, in_dim, num_experts] — the loader permutes 3-D GGUF
-            // expert tensors (stored as `[E, O, I]`) into this `[O, I, E]`
-            // layout before passing in, so the original simple indexing
-            // works.  Each expert e is a [O, I] slice with index
-            // `o * (I*E) + i * E + e` (row-major over the O and I axes, with
-            // E being the contiguous innermost stride).
             let num_experts = parent.shape[2];
-            let out_dim = parent.shape[0];
-            let in_dim = parent.shape[1];
             for e in 0..num_experts {
-                let mut sub = Vec::with_capacity(out_dim * in_dim);
-                for o in 0..out_dim {
-                    for i in 0..in_dim {
-                        let idx = o * (in_dim * num_experts) + i * num_experts + e;
-                        sub.push(parent.data[idx]);
-                    }
+                if let Some(sub) = parent.expert_slice(e) {
+                    weights_out.insert(format!("{}.{}", moe_q_name, e), sub);
                 }
-                let key = format!("{}.{}", moe_q_name, e);
-                weights_out.insert(key, Tensor::from_vec(sub, vec![out_dim, in_dim]));
             }
         } else if parent.shape.len() == 2 {
             // Treat the 2-D tensor as a single-expert "wrap".
@@ -323,14 +358,14 @@ mod tests {
 
     #[test]
     fn slice_experts_splits_3d_into_per_expert() {
-        // 3-D parent: [out=2, in=3, num_experts=2] — 12 elements.
-        // e0 slice should be: parent[:,:,0] flattened to [2,3].
-        // e1 slice should be: parent[:,:,1] flattened to [2,3].
+        // 3-D parent: [d0=2, d1=3, d2=2] — 12 elements, GGUF row-major over
+        // [expert, d1, d0]: e0 slice should be data[e0: e0+6] reshaped to
+        // [2,3]; e1 slice should be data[e1: e1+6] reshaped to [2,3].
         let mut data: Vec<f32> = Vec::new();
-        for o in 0..2 {
+        for e in 0..2 {
             for i in 0..3 {
-                for e in 0..2 {
-                    let v = (o * 30 + i * 10 + e) as f32;
+                for o in 0..2 {
+                    let v = (e * 100 + i * 10 + o) as f32;
                     data.push(v);
                 }
             }
@@ -349,10 +384,61 @@ mod tests {
         // Check element-wise correctness.
         for o in 0..2 {
             for i in 0..3 {
-                let want_e0 = (o * 30 + i * 10 + 0) as f32;
-                let want_e1 = (o * 30 + i * 10 + 1) as f32;
+                let want_e0 = (0 * 100 + i * 10 + o) as f32;
+                let want_e1 = (1 * 100 + i * 10 + o) as f32;
                 assert_eq!(e0.data[o * 3 + i], want_e0);
                 assert_eq!(e1.data[o * 3 + i], want_e1);
+            }
+        }
+    }
+
+    #[test]
+    fn expert_slice_quantized_matches_dequantized_reference() {
+        // 3-D parent [d0=32, d1=4, d2=3], GGUF row-major over [expert, d1, d0],
+        // quantized with Q8_0 (block = 32 = d0).  `expert_slice` must carve the
+        // per-expert block range [e*d1, (e+1)*d1) and matmul like the f32
+        // reference — proving the block-range arithmetic is correct.
+        let (d0, d1, d2) = (32usize, 4usize, 3usize);
+        let mut flat = Vec::with_capacity(d0 * d1 * d2);
+        for e in 0..d2 {
+            for i in 0..d1 {
+                for o in 0..d0 {
+                    flat.push(((e * 1000 + i * 100 + o) % 101) as f32);
+                }
+            }
+        }
+        let raw = crate::kernels::q8_0::quantize_f32_to_q8_0(&flat);
+        let q8 = crate::kernels::q8_0::Matrix {
+            rows: d1 * d2,
+            cols: d0,
+            blocks: crate::kernels::q8_0::blocks_from_bytes(&raw),
+        };
+        let parent = Tensor::from_q8_0_only(q8, vec![d0, d1, d2]);
+
+        // Dequantize the full stream back to the flat [expert, d1, d0] order.
+        let mut deq = vec![0.0f32; flat.len()];
+        crate::kernels::dequantize_q8_0(&raw, &mut deq);
+
+        let hidden = Tensor::from_vec(
+            (0..d0).map(|o| ((o * 37) % 17) as f32).collect(),
+            vec![1, d0],
+        );
+
+        for e in 0..d2 {
+            let slice = parent.expert_slice(e).expect("expert slice");
+            assert_eq!(slice.shape, vec![d0, d1]);
+            let got = hidden.matmul(&slice);
+            // Reference: transposed f32 slice, element (o, i) = W[i, o].
+            let mut ref_data = Vec::with_capacity(d0 * d1);
+            for o in 0..d0 {
+                for i in 0..d1 {
+                    ref_data.push(deq[e * d1 * d0 + i * d0 + o]);
+                }
+            }
+            let reference = hidden.matmul(&Tensor::from_vec(ref_data, vec![d0, d1]));
+            for j in 0..d1 {
+                let diff = (got.data[j] - reference.data[j]).abs();
+                assert!(diff < 1e-3, "expert {} output {} diff {}", e, j, diff);
             }
         }
     }

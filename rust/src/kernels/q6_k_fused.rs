@@ -204,11 +204,22 @@ mod tests {
                 a[i * k + j] = (i + 1) as f32 * 0.01 + (j as f32).sin() * 0.5;
             }
         }
-        // ground truth: use the existing scalar q6_k_matmul_transposed_b
-        // implementation, which uses the same signature and layout.
-        use super::super::q6_k_gemm::q6_k_matmul_transposed_b;
+        // ground truth: exact f32 dequant + dot (independent of the Q8_K
+        // activation approximation used by the default m>1 dispatch).
         let mut truth = vec![0.0f32; m * n];
-        q6_k_matmul_transposed_b(&a, &b, &mut truth, m, k, n);
+        for r in 0..n {
+            let mut deq = vec![0.0f32; k];
+            for b_idx in 0..blocks_per_row {
+                b.blocks[r * blocks_per_row + b_idx].dequantize(&mut deq[b_idx * 256..(b_idx + 1) * 256]);
+            }
+            for i in 0..m {
+                let mut acc = 0.0f32;
+                for l in 0..k {
+                    acc += a[i * k + l] * deq[l];
+                }
+                truth[i * n + r] = acc;
+            }
+        }
 
         let mut got = vec![0.0f32; m * n];
         q6_k_matmul_fused(&a, &b, &mut got, m, k, n);

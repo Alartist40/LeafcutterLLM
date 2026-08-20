@@ -139,10 +139,16 @@ pub fn ssm_forward(
     // 9. Selective scan on x (4096 channels), not the full conv output
     let state_len = conv_channels * state_size;
     let initial_state = ssm_cache.get(layer_idx, state_len);
+    let _ssm_t0 = std::time::Instant::now();
     let (y, final_state) = selective_scan(
         &x, &b_proj, &c_proj, &dt_proj, &a_vec,
         conv_channels, Some(&initial_state),
     );
+    let _ssm_elapsed = _ssm_t0.elapsed();
+    if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+        eprintln!("[PROFILE] ssm_selective_scan               {:>8.2}ms",
+            _ssm_elapsed.as_secs_f32() * 1000.0);
+    }
     ssm_cache.set(layer_idx, final_state);
 
     // 10. Group norm (ssm_norm.weight = [state_size/num_groups])

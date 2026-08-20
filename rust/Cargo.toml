@@ -15,52 +15,29 @@ name = "leafcutter"
 path = "src/main.rs"
 
 [[bin]]
-name = "split_model"
-path = "src/bin/split_model.rs"
+name = "benchmark_models"
+path = "src/bin/benchmark_models.rs"
 
 [[bin]]
-name = "diagnose_models"
-path = "src/bin/diagnose_models.rs"
+name = "comprehensive_diagnostic"
+path = "src/bin/comprehensive_diagnostic.rs"
 
 [[bin]]
-name = "list_tensors"
-path = "src/bin/list_tensors.rs"
-
-[[bin]]
-name = "check_shapes"
-path = "src/bin/check_shapes.rs"
-
-[[bin]]
-name = "ref_full"
-path = "src/bin/ref_full.rs"
-
-[[bin]]
-name = "test_llama_ffi"
-path = "src/bin/test_llama_ffi.rs"
+name = "inspect_ornith"
+path = "src/bin/inspect_ornith.rs"
 
 [[bin]]
 name = "test_generation"
 path = "src/bin/test_generation.rs"
 
 [[bin]]
-name = "test_llama"
-path = "src/bin/test_llama.rs"
-
-[[bin]]
-name = "ref_layers"
-path = "src/bin/ref_layers.rs"
-
-[[bin]]
-name = "diagnose_qwen36"
-path = "src/bin/diagnose_qwen36.rs"
-
-[[bin]]
-name = "test_ssm_synthetic"
-path = "src/bin/test_ssm_synthetic.rs"
+name = "probe_3d"
+path = "src/bin/probe_3d.rs"
 
 [dependencies]
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
 tower = { version = "0.4", features = ["util"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -80,35 +57,12 @@ wgpu = "29.0.3"
 pollster = "0.4.0"
 bytemuck = "1.25.0"
 ureq = { version = "2", features = ["json"] }
+colored = "2.1"
 which = "7.0"
 libc = "0.2"
 shellexpand = "3.1"
 hex = "0.4.3"
 matrixmultiply = "0.3"
-
-[[bin]]
-name = "comprehensive_diagnostic"
-path = "src/bin/comprehensive_diagnostic.rs"
-
-[[bin]]
-name = "test_real_deltanet"
-path = "src/bin/test_real_deltanet.rs"
-
-[[bin]]
-name = "test_deltanet_accumulation"
-path = "src/bin/test_deltanet_accumulation.rs"
-
-[[bin]]
-name = "inspect_ornith"
-path = "src/bin/inspect_ornith.rs"
-
-[[bin]]
-name = "test_qwen_ffi"
-path = "src/bin/test_qwen_ffi.rs"
-
-[[bin]]
-name = "benchmark_models"
-path = "src/bin/benchmark_models.rs"
 
 [features]
 default = []

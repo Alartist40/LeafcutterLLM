@@ -1,9 +1,11 @@
 # How to Add a New Architecture to LeafcutterLLM — A Methodology
 
-> **Wrap-up note (2026-08-01):** This methodology record remains the reference
+> **Wrap-up note (2026-08-18):** This methodology record remains the reference
 > for adding any future GGUF architecture. The most recent architecture added
-> via this process is Qwen3.5 / Ornith (native, shipped); Kimi K2.6 and GLM-5.2
-> scaffolding (MLA + MoE) is in place but not real-model-validated.
+> via this process is Qwen3.5 / Ornith (native, shipped); MoE routing is now
+> **real-model-validated** on `ornith-1.0-35b` (Qwen3.6, 256 experts) with
+> quantized on-demand expert slicing (2026-08-18, see `CHANGELOG.md`).
+> Kimi K2.6 and GLM-5.2 scaffolding (MLA + MoE) is still not real-model-validated.
 
 This is a record of how Milestone 1 of "add native support for Kimi K2.6
 and GLM-5.2 to LeafcutterLLM" was actually carried out. The intent is

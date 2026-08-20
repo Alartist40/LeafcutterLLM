@@ -237,6 +237,117 @@ impl Tensor {
         }
     }
 
+    /// Total resident bytes of this tensor: quantized blocks plus any
+    /// materialized f32 data (4 bytes each).  This is the real memory the
+    /// tensor occupies in the layer cache — cache accounting must use it,
+    /// not `quantized_memory_bytes` alone, or materialized tensors silently
+    /// exceed the budget and blow through available RAM.
+    pub fn resident_bytes(&self) -> usize {
+        self.quantized_memory_bytes()
+            .saturating_add(self.data.len().saturating_mul(4))
+    }
+
+    /// Slice one expert out of a 3-D expert tensor (GGUF dims `[d0, d1, d2]`
+    /// where `d2` = number of experts).
+    ///
+    /// GGUF / llama.cpp store these row-major over `[expert, d1, d0]` with
+    /// `d0` contiguous and the expert axis outermost (see
+    /// `llama-model.cpp` `create_tensor_gate_up_exps`), so expert `e`
+    /// occupies elements `[e*d1*d0, (e+1)*d1*d0)` — rows `[e*d1, (e+1)*d1)`
+    /// of the loader's collapsed `[d1*d2, d0]` matrix.
+    ///
+    /// Returns a 2-D `[d0, d1]` tensor for that expert — quantized (no f32
+    /// materialization) when the parent carries `q_data`, otherwise a plain
+    /// f32 slice.  Returns `None` for non-3-D tensors or when the parent has
+    /// neither quantized nor f32 data.
+    pub fn expert_slice(&self, expert_idx: usize) -> Option<Tensor> {
+        if self.shape.len() != 3 {
+            return None;
+        }
+        let d0 = self.shape[0];
+        let d1 = self.shape[1];
+        let d2 = self.shape[2];
+        if expert_idx >= d2 {
+            return None;
+        }
+        let shape = vec![d0, d1];
+        if let Some(q) = &self.q_data {
+            let sub = match q {
+                QuantizedData::Q4_K(m) => {
+                    let bpr = m.blocks_per_row();
+                    let start = expert_idx * d1 * bpr;
+                    QuantizedData::Q4_K(Q4KMatrix {
+                        rows: d1,
+                        cols: d0,
+                        blocks: m.blocks[start..start + d1 * bpr].to_vec(),
+                    })
+                }
+                QuantizedData::Q5_K(m) => {
+                    let bpr = m.blocks_per_row();
+                    let start = expert_idx * d1 * bpr;
+                    QuantizedData::Q5_K(Q5KMatrix {
+                        rows: d1,
+                        cols: d0,
+                        blocks: m.blocks[start..start + d1 * bpr].to_vec(),
+                    })
+                }
+                QuantizedData::Q6_K(m) => {
+                    let bpr = m.blocks_per_row();
+                    let start = expert_idx * d1 * bpr;
+                    QuantizedData::Q6_K(Q6KMatrix {
+                        rows: d1,
+                        cols: d0,
+                        blocks: m.blocks[start..start + d1 * bpr].to_vec(),
+                    })
+                }
+                QuantizedData::Q8_0(m) => {
+                    let bpr = m.blocks_per_row();
+                    let start = expert_idx * d1 * bpr;
+                    QuantizedData::Q8_0(Q8Matrix {
+                        rows: d1,
+                        cols: d0,
+                        blocks: m.blocks[start..start + d1 * bpr].to_vec(),
+                    })
+                }
+                QuantizedData::Q4_0(m) => {
+                    let bpr = m.blocks_per_row();
+                    let start = expert_idx * d1 * bpr;
+                    QuantizedData::Q4_0(Q4Matrix {
+                        rows: d1,
+                        cols: d0,
+                        blocks: m.blocks[start..start + d1 * bpr].to_vec(),
+                    })
+                }
+                QuantizedData::IQ4_NL(m) => {
+                    let bpr = m.blocks_per_row();
+                    let start = expert_idx * d1 * bpr;
+                    QuantizedData::IQ4_NL(IQ4NLMatrix {
+                        rows: d1,
+                        cols: d0,
+                        blocks: m.blocks[start..start + d1 * bpr].to_vec(),
+                    })
+                }
+            };
+            Some(Tensor { shape, data: Vec::new(), q_data: Some(sub), backend: self.backend })
+        } else {
+            if self.data.is_empty() {
+                return None;
+            }
+            // `.data` is flat in `[expert, d1, d0]` order; the returned
+            // `[d0, d1]` tensor must be the transposed layout (element
+            // `(o, i) = W[i, o]`) so the standard f32 matmul produces the
+            // same result as the quantized B^T GEMM on the sliced blocks.
+            let start = expert_idx * d1 * d0;
+            let mut sub = Vec::with_capacity(d0 * d1);
+            for o in 0..d0 {
+                for i in 0..d1 {
+                    sub.push(self.data[start + i * d0 + o]);
+                }
+            }
+            Some(Tensor::from_vec(sub, shape))
+        }
+    }
+
     /// Set the global backend for all new Tensors.
     pub fn set_global_backend(backend: &'static dyn Backend) {
         set_global_backend(backend);

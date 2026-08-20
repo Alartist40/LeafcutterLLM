@@ -18,6 +18,7 @@ use std::time::Instant;
 use crate::llama_ffi::{backend_init, LlamaModel, LlamaContext};
 use crate::inference::engine::Engine as NativeEngine;
 use crate::tokenizer::GgufBpeTokenizer;
+use tokio_stream::StreamExt;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -275,13 +276,51 @@ pub async fn health_handler(State(engine): State<SharedEngine>) -> Json<HealthRe
 pub async fn chat_completions_handler(
     State(engine): State<SharedEngine>,
     Json(req): Json<ChatCompletionRequest>,
-) -> Result<Json<ChatCompletionResponse>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
+    use axum::response::IntoResponse;
     let prompt = req.messages.iter()
         .map(|m| format!("{}: {}", m.role, m.content))
         .collect::<Vec<_>>()
         .join("\n");
 
     let capped_max = engine.max_seq_len().min(req.max_tokens);
+
+    if req.stream {
+        let (tx, rx) = tokio::sync::mpsc::channel::<String>(32);
+        let model_name = req.model.clone();
+        let req_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
+        let created = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        tokio::task::spawn_blocking(move || {
+            if let Ok((text, _)) = engine.generate(&prompt, capped_max, req.temperature, req.top_p) {
+                for chunk in text.as_bytes().chunks(16) {
+                    if let Ok(s) = std::str::from_utf8(chunk) {
+                        let json_chunk = serde_json::json!({
+                            "id": req_id,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_name,
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "content": s },
+                                "finish_reason": null
+                            }]
+                        });
+                        let _ = tx.blocking_send(json_chunk.to_string());
+                    }
+                }
+            }
+            let _ = tx.blocking_send("[DONE]".to_string());
+        });
+
+        use axum::response::sse::Event;
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx)
+            .map(|data| Ok::<_, std::convert::Infallible>(Event::default().data(data)));
+        return Ok(axum::response::Sse::new(stream).into_response());
+    }
 
     let (text, _tokens) = tokio::task::spawn_blocking(move || {
         engine.generate(&prompt, capped_max, req.temperature, req.top_p)
@@ -311,7 +350,7 @@ pub async fn chat_completions_handler(
         }],
     };
 
-    Ok(Json(resp))
+    Ok(Json(resp).into_response())
 }
 
 pub fn create_app(engine: SharedEngine) -> Router {

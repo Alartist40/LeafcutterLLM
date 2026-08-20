@@ -221,6 +221,13 @@ fn run_q4_k_q8_gemv(a: &[f32], b: &Q4KMatrix, c: &mut [f32], k: usize, n: usize)
     let compute = |j: usize| -> f32 {
         let row_base = j * bpr;
         let w = &b.blocks[row_base..row_base + bpr];
+        #[cfg(target_arch = "aarch64")]
+        {
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                return unsafe { crate::kernels::q8_k::q4_k_dot_q8_k_sdot(w, &a_blocks) };
+            }
+            return unsafe { crate::kernels::q8_k::q4_k_dot_q8_k_neon(w, &a_blocks) };
+        }
         #[cfg(target_arch = "x86_64")]
         {
             if std::is_x86_feature_detected!("avx2") {
@@ -230,15 +237,24 @@ fn run_q4_k_q8_gemv(a: &[f32], b: &Q4KMatrix, c: &mut [f32], k: usize, n: usize)
         q4_k_dot_q8_k_scalar(w, &a_blocks)
     };
 
-    if n >= 4096 {
+    // Chunked parallelization: split the output into a few contiguous ranges
+    // (one per worker, 2-way oversubscribed) instead of one Rayon task per
+    // column. Per-column tasks are tiny (~k/256 block dots) and their dispatch
+    // overhead dominates large-n GEMVs (e.g. lm_head, n = 248K).
+    if n >= 1024 {
         use rayon::prelude::*;
-        c.par_iter_mut().enumerate().for_each(|(j, out)| {
-            *out = compute(j);
+        let nthreads = rayon::current_num_threads().max(1);
+        let chunk = (n / (nthreads * 2)).max(1);
+        c.par_chunks_mut(chunk).enumerate().for_each(|(ci, out)| {
+            let start = ci * chunk;
+            for (jj, o) in out.iter_mut().enumerate() {
+                *o = compute(start + jj);
+            }
         });
-    } else {
-        for j in 0..n {
-            c[j] = compute(j);
-        }
+        return;
+    }
+    for j in 0..n {
+        c[j] = compute(j);
     }
 }
 
@@ -251,6 +267,10 @@ fn run_q6_k_q8_gemv(a: &[f32], b: &Q6KMatrix, c: &mut [f32], k: usize, n: usize)
     let compute = |j: usize| -> f32 {
         let row_base = j * bpr;
         let w = &b.blocks[row_base..row_base + bpr];
+                #[cfg(target_arch = "aarch64")]
+        {
+            return unsafe { crate::kernels::q8_k::q6_k_dot_q8_k_neon(w, &a_blocks) };
+        }
         #[cfg(target_arch = "x86_64")]
         {
             if std::is_x86_feature_detected!("avx2") {
@@ -260,10 +280,16 @@ fn run_q6_k_q8_gemv(a: &[f32], b: &Q6KMatrix, c: &mut [f32], k: usize, n: usize)
         q6_k_dot_q8_k_scalar(w, &a_blocks)
     };
 
-    if n >= 4096 {
+    // Chunked parallelization (see `run_q4_k_q8_gemv`).
+    if n >= 1024 {
         use rayon::prelude::*;
-        c.par_iter_mut().enumerate().for_each(|(j, out)| {
-            *out = compute(j);
+        let nthreads = rayon::current_num_threads().max(1);
+        let chunk = (n / (nthreads * 2)).max(1);
+        c.par_chunks_mut(chunk).enumerate().for_each(|(ci, out)| {
+            let start = ci * chunk;
+            for (jj, o) in out.iter_mut().enumerate() {
+                *o = compute(start + jj);
+            }
         });
     } else {
         for j in 0..n {
@@ -274,20 +300,150 @@ fn run_q6_k_q8_gemv(a: &[f32], b: &Q6KMatrix, c: &mut [f32], k: usize, n: usize)
 
 /// Q8_K-activation GEMV for Q4_K (m == 1 only).
 pub fn q4_k_matmul_transposed_b_q8(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
-    assert_eq!(m, 1, "Q8_K GEMV requires m == 1");
     assert_eq!(b.cols, k);
     assert_eq!(b.rows, n);
     for v in c.iter_mut() { *v = 0.0; }
-    run_q4_k_q8_gemv(a, b, c, k, n);
+    if m == 1 {
+        run_q4_k_q8_gemv(a, b, c, k, n);
+    } else {
+        run_q4_k_q8_gemm(a, b, c, m, k, n);
+    }
+}
+
+/// Batched Q8_K-activation GEMM for Q4_K (m > 1, prefill).
+///
+/// Quantizes every activation row to Q8_K once, then for each output column
+/// reconstructs the weight `aux8` nibbles once per block and reuses them
+/// across all `m` rows via `sdot`.
+fn run_q4_k_q8_gemm(a: &[f32], b: &Q4KMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    let bpr = b.blocks_per_row();
+    let abpr = k / QK_K;
+    let mut a_q = vec![Q8KBlock::default(); m * abpr];
+    for i in 0..m {
+        quantize_row_q8_k(&a[i * k..(i + 1) * k], &mut a_q[i * abpr..(i + 1) * abpr]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::kernels::q4_k::QK_K as Q4QK;
+        use crate::kernels::q8_k::build_q4_aux8;
+        use crate::kernels::q8_k::q4_block_dot_sdot;
+        use rayon::prelude::*;
+        let nthreads = rayon::current_num_threads().max(1);
+        let chunkp = (n / (nthreads * 2)).max(1);
+        let mut col_results = vec![0.0f32; n * m];
+        col_results.par_chunks_mut(m).enumerate().for_each(|(j, col)| {
+            let row_base = j * bpr;
+            let mut aux = [0u8; Q4QK];
+            unsafe {
+                for blk in 0..bpr {
+                    let block = &b.blocks[row_base + blk];
+                    build_q4_aux8(block, &mut aux);
+                    for i in 0..m {
+                        col[i] += q4_block_dot_sdot(block, &aux, &a_q[i * abpr + blk]);
+                    }
+                }
+            }
+        });
+        for j in 0..n {
+            for i in 0..m {
+                c[i * n + j] = col_results[j * m + i];
+            }
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        use rayon::prelude::*;
+        let nthreads = rayon::current_num_threads().max(1);
+        let chunkp = (n / (nthreads * 2)).max(1);
+        let mut col_results = vec![0.0f32; n * m];
+        col_results.par_chunks_mut(m).enumerate().for_each(|(j, col)| {
+            let row_base = j * bpr;
+            let w = &b.blocks[row_base..row_base + bpr];
+            for i in 0..m {
+                let arow = &a_q[i * abpr..(i + 1) * abpr];
+                col[i] += q4_k_dot_q8_k_scalar(w, arow);
+            }
+        });
+        for j in 0..n {
+            for i in 0..m {
+                c[i * n + j] = col_results[j * m + i];
+            }
+        }
+    }
 }
 
 /// Q8_K-activation GEMV for Q6_K (m == 1 only).
 pub fn q6_k_matmul_transposed_b_q8(a: &[f32], b: &Q6KMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
-    assert_eq!(m, 1, "Q8_K GEMV requires m == 1");
     assert_eq!(b.cols, k);
     assert_eq!(b.rows, n);
     for v in c.iter_mut() { *v = 0.0; }
-    run_q6_k_q8_gemv(a, b, c, k, n);
+    if m == 1 {
+        run_q6_k_q8_gemv(a, b, c, k, n);
+    } else {
+        run_q6_k_q8_gemm(a, b, c, m, k, n);
+    }
+}
+
+/// Batched Q8_K-activation GEMM for Q6_K (m > 1, prefill).
+fn run_q6_k_q8_gemm(a: &[f32], b: &Q6KMatrix, c: &mut [f32], m: usize, k: usize, n: usize) {
+    let bpr = b.blocks_per_row();
+    let abpr = k / QK_K;
+    let mut a_q = vec![Q8KBlock::default(); m * abpr];
+    for i in 0..m {
+        quantize_row_q8_k(&a[i * k..(i + 1) * k], &mut a_q[i * abpr..(i + 1) * abpr]);
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use crate::kernels::q6_k::QK_K as Q6QK;
+        use crate::kernels::q8_k::build_q6_aux8;
+        use crate::kernels::q8_k::q6_block_dot_sdot;
+        use rayon::prelude::*;
+        let nthreads = rayon::current_num_threads().max(1);
+        let chunkp = (n / (nthreads * 2)).max(1);
+        let mut col_results = vec![0.0f32; n * m];
+        col_results.par_chunks_mut(m).enumerate().for_each(|(j, col)| {
+            let row_base = j * bpr;
+            let mut aux = [0i8; Q6QK];
+            unsafe {
+                for blk in 0..bpr {
+                    let block = &b.blocks[row_base + blk];
+                    build_q6_aux8(block, &mut aux);
+                    for i in 0..m {
+                        col[i] += q6_block_dot_sdot(block, &aux, &a_q[i * abpr + blk]);
+                    }
+                }
+            }
+        });
+        for j in 0..n {
+            for i in 0..m {
+                c[i * n + j] = col_results[j * m + i];
+            }
+        }
+        return;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        use rayon::prelude::*;
+        let nthreads = rayon::current_num_threads().max(1);
+        let chunkp = (n / (nthreads * 2)).max(1);
+        let mut col_results = vec![0.0f32; n * m];
+        col_results.par_chunks_mut(m).enumerate().for_each(|(j, col)| {
+            let row_base = j * bpr;
+            let w = &b.blocks[row_base..row_base + bpr];
+            for i in 0..m {
+                let arow = &a_q[i * abpr..(i + 1) * abpr];
+                col[i] += q6_k_dot_q8_k_scalar(w, arow);
+            }
+        });
+        for j in 0..n {
+            for i in 0..m {
+                c[i * n + j] = col_results[j * m + i];
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -339,6 +495,7 @@ mod tests {
         Q6KMatrix { rows, cols, blocks }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_q4_k_gemv_col_q8_avx2_matches_scalar() {
         let k = 1024;
@@ -360,6 +517,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn test_q6_k_gemv_col_q8_avx2_matches_scalar() {
         let k = 1024;
@@ -379,5 +537,210 @@ mod tests {
             assert!(rel < 1e-3,
                 "q6 col {} avx2 vs scalar: got={}, expected={}, rel={:.6}", j, got, expected, rel);
         }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_q4_k_q8_gemm_m4_matches_dequant() {
+        let k = 1024;
+        let m = 4;
+        let n = 512;
+        let a: Vec<f32> = (0..m * k).map(|idx| ((idx as f32) * 0.13).sin() * 2.0).collect();
+        let b = make_q4_matrix(n, k);
+
+        // Q8_K batched path (sdot on aarch64)
+        let mut c_q8 = vec![0.0f32; m * n];
+        crate::kernels::q8_k_gemm::q4_k_matmul_transposed_b_q8(&a, &b, &mut c_q8, m, k, n);
+
+        // Reference: per-row m=1 Q8_K gemv (same activation quantization).
+        for i in 0..m {
+            let mut c_row = vec![0.0f32; n];
+            crate::kernels::q8_k_gemm::q4_k_matmul_transposed_b_q8(
+                &a[i * k..(i + 1) * k], &b, &mut c_row, 1, k, n,
+            );
+            for j in 0..n {
+                let diff = (c_q8[i * n + j] - c_row[j]).abs();
+                assert!(diff < 1e-4,
+                    "q4 batched ({i},{j}): batched={}, row={}, diff={:.6}", c_q8[i * n + j], c_row[j], diff);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_q6_k_q8_gemm_m4_matches_dequant() {
+        let k = 1024;
+        let m = 4;
+        let n = 512;
+        let a: Vec<f32> = (0..m * k).map(|idx| ((idx as f32) * 0.17).cos() * 1.5).collect();
+        let b = make_q6_matrix(n, k);
+
+        let mut c_q8 = vec![0.0f32; m * n];
+        crate::kernels::q8_k_gemm::q6_k_matmul_transposed_b_q8(&a, &b, &mut c_q8, m, k, n);
+
+        // Reference: per-row m=1 Q8_K gemv (same activation quantization).
+        for i in 0..m {
+            let mut c_row = vec![0.0f32; n];
+            crate::kernels::q8_k_gemm::q6_k_matmul_transposed_b_q8(
+                &a[i * k..(i + 1) * k], &b, &mut c_row, 1, k, n,
+            );
+            for j in 0..n {
+                let diff = (c_q8[i * n + j] - c_row[j]).abs();
+                assert!(diff < 1e-4,
+                    "q6 batched ({i},{j}): batched={}, row={}, diff={:.6}", c_q8[i * n + j], c_row[j], diff);
+            }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_q4_k_dot_q8_neon_2col_matches_scalar() {
+        let k = 1024;
+        let n = 512;
+        let a: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.37).cos() * 1.5).collect();
+        let b = make_q4_matrix(n, k);
+
+        let mut a_blocks = vec![Q8KBlock::default(); k / QK_K];
+        quantize_row_q8_k(&a, &mut a_blocks);
+
+        for j in (0..n).step_by(2) {
+            let row_base = j * (k / QK_K);
+            let w1 = &b.blocks[row_base..row_base + (k / QK_K)];
+            let w2 = &b.blocks[row_base + (k / QK_K)..row_base + 2 * (k / QK_K)];
+            let (got1, got2) = unsafe {
+                crate::kernels::q8_k::q4_k_dot_q8_k_2col_neon(w1, w2, &a_blocks)
+            };
+            let expected1 = q4_k_dot_q8_k_scalar(w1, &a_blocks);
+            let expected2 = q4_k_dot_q8_k_scalar(w2, &a_blocks);
+            let diff1 = (got1 - expected1).abs();
+            let diff2 = (got2 - expected2).abs();
+            assert!(diff1 < 1e-4,
+                "q4 2col col {} got1={}, expected1={}, diff={:.6}", j, got1, expected1, diff1);
+            assert!(diff2 < 1e-4,
+                "q4 2col col {} got2={}, expected2={}, diff={:.6}", j + 1, got2, expected2, diff2);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_q4_k_dot_q8_sdot_2col_matches_scalar() {
+        let k = 1024;
+        let n = 512;
+        let a: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.37).cos() * 1.5).collect();
+        let b = make_q4_matrix(n, k);
+
+        let mut a_blocks = vec![Q8KBlock::default(); k / QK_K];
+        quantize_row_q8_k(&a, &mut a_blocks);
+
+        for j in (0..n).step_by(2) {
+            let row_base = j * (k / QK_K);
+            let w1 = &b.blocks[row_base..row_base + (k / QK_K)];
+            let w2 = &b.blocks[row_base + (k / QK_K)..row_base + 2 * (k / QK_K)];
+            let (got1, got2) = unsafe {
+                crate::kernels::q8_k::q4_k_dot_q8_k_2col_sdot(w1, w2, &a_blocks)
+            };
+            let expected1 = q4_k_dot_q8_k_scalar(w1, &a_blocks);
+            let expected2 = q4_k_dot_q8_k_scalar(w2, &a_blocks);
+            let diff1 = (got1 - expected1).abs();
+            let diff2 = (got2 - expected2).abs();
+            assert!(diff1 < 1e-4,
+                "q4 2col sdot col {} got1={}, expected1={}, diff={:.6}", j, got1, expected1, diff1);
+            assert!(diff2 < 1e-4,
+                "q4 2col sdot col {} got2={}, expected2={}, diff={:.6}", j + 1, got2, expected2, diff2);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_q4_k_dot_q8_neon_matches_scalar() {
+        let k = 1024;
+        let n = 512;
+        let a: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.37).cos() * 1.5).collect();
+        let b = make_q4_matrix(n, k);
+
+        let mut a_blocks = vec![Q8KBlock::default(); k / QK_K];
+        quantize_row_q8_k(&a, &mut a_blocks);
+
+        for j in 0..n {
+            let row_base = j * (k / QK_K);
+            let w = &b.blocks[row_base..row_base + (k / QK_K)];
+            let expected = q4_k_dot_q8_k_scalar(w, &a_blocks);
+            let got = unsafe { crate::kernels::q8_k::q4_k_dot_q8_k_neon(w, &a_blocks) };
+            let diff = (got - expected).abs();
+            assert!(diff < 1e-4,
+                "q4 col {} neon vs scalar: got={}, expected={}, diff={:.6}", j, got, expected, diff);
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_q6_k_dot_q8_neon_matches_scalar() {
+        let k = 1024;
+        let n = 512;
+        let a: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.29).sin() * 1.5).collect();
+        let b = make_q6_matrix(n, k);
+
+        let mut a_blocks = vec![Q8KBlock::default(); k / QK_K];
+        quantize_row_q8_k(&a, &mut a_blocks);
+
+        for j in 0..n {
+            let row_base = j * (k / QK_K);
+            let w = &b.blocks[row_base..row_base + (k / QK_K)];
+            let expected = q6_k_dot_q8_k_scalar(w, &a_blocks);
+            let got = unsafe { crate::kernels::q8_k::q6_k_dot_q8_k_neon(w, &a_blocks) };
+            let diff = (got - expected).abs();
+            assert!(diff < 1e-4,
+                "q6 col {} neon vs scalar: got={}, expected={}, diff={:.6}", j, got, expected, diff);
+        }
+    }
+
+    /// Microbenchmark: time a full GEMV at production shapes so the Q4_K vs
+    /// Q6_K per-block throughput gap can be measured without running the model.
+    /// Run with `cargo test --release -- --ignored bench_gemv --nocapture`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore]
+    fn bench_gemv() {
+        use std::time::Instant;
+
+        let run4 = |k: usize, n: usize| {
+            let a: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.13).cos() * 2.0).collect();
+            let b = make_q4_matrix(n, k);
+            let mut c = vec![0.0f32; n];
+            let nblocks = n * (k / QK_K);
+            let t0 = Instant::now();
+            for _ in 0..8 {
+                run_q4_k_q8_gemv(&a, &b, &mut c, k, n);
+            }
+            let dt = t0.elapsed().as_secs_f64() / 8.0;
+            let bytes = nblocks as f64 * 128.0;
+            println!(
+                "Q4_K GEMV k={} n={} blocks={}M: {:.2} ms  ({:.1} GB/s)",
+                k, n, nblocks as f64 / 1e6, dt * 1e3, bytes / dt / 1e9
+            );
+        };
+        let run6 = |k: usize, n: usize| {
+            let a: Vec<f32> = (0..k).map(|i| ((i as f32) * 0.13).cos() * 2.0).collect();
+            let b = make_q6_matrix(n, k);
+            let mut c = vec![0.0f32; n];
+            let nblocks = n * (k / QK_K);
+            let t0 = Instant::now();
+            for _ in 0..8 {
+                run_q6_k_q8_gemv(&a, &b, &mut c, k, n);
+            }
+            let dt = t0.elapsed().as_secs_f64() / 8.0;
+            let bytes = nblocks as f64 * 210.0;
+            println!(
+                "Q6_K GEMV k={} n={} blocks={}M: {:.2} ms  ({:.1} GB/s)",
+                k, n, nblocks as f64 / 1e6, dt * 1e3, bytes / dt / 1e9
+            );
+        };
+
+        run4(4096, 12288);
+        run4(4096, 8192);
+        run4(12288, 4096);
+        run6(4096, 8192);
+        run6(12288, 4096);
+        run6(4096, 248320);
     }
 }

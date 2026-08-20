@@ -130,11 +130,13 @@ impl LayerCacheInner {
         Self { map: HashMap::new(), order: VecDeque::new() }
     }
 
-    /// Total estimated bytes of cached quantized weights.
+    /// Total resident bytes of cached layer weights.  Uses `resident_bytes`
+    /// (quantized blocks + any materialized f32 data) so the eviction budget
+    /// reflects the real memory footprint, not just the quantized size.
     fn cached_bytes(&self) -> usize {
         self.map
             .values()
-            .map(|arc| arc.values().map(|t| t.quantized_memory_bytes()).sum::<usize>())
+            .map(|arc| arc.values().map(|t| t.resident_bytes()).sum::<usize>())
             .sum()
     }
 }
@@ -146,6 +148,20 @@ fn available_memory_mb() -> usize {
         .and_then(|s| {
             s.lines()
                 .find(|l| l.starts_with("MemAvailable:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|v| v.parse::<usize>().ok())
+        })
+        .unwrap_or(0)
+        / 1024
+}
+
+/// Read total RAM from /proc/meminfo (MiB). 0 if unavailable.
+fn total_memory_mb() -> usize {
+    std::fs::read_to_string("/proc/meminfo")
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find(|l| l.starts_with("MemTotal:"))
                 .and_then(|l| l.split_whitespace().nth(1))
                 .and_then(|v| v.parse::<usize>().ok())
         })
@@ -201,45 +217,49 @@ impl GGUFModel {
                 return mb.saturating_mul(1024 * 1024);
             }
         }
+
+        let total_mb = total_memory_mb();
         let avail_mb = available_memory_mb();
-        if avail_mb == 0 {
+        let ram_mb = if total_mb > 0 { total_mb } else { avail_mb };
+        if ram_mb == 0 {
             return 0; // meminfo unavailable → unlimited (backward compatible)
         }
-        // Dense trunk estimate (f32): KV cache at a default working context
-        // (min(config.max_seq_len, 4096) unless LEAFCUTTER_CTX_KB overrides),
-        // plus activations (roughly 3 hidden layers of the hidden dimension
-        // scaled by batch/heads), plus a resident LM head (2 floats per vocab
-        // entry covers an f32 head; quantized heads are cheaper).
+
+        // Fast path: if total model size + 1.5 GiB headroom fits in total system RAM,
+        // cache all layers residently in memory (return 0 = unlimited cache budget).
+        let headroom_bytes = 1536 * 1024 * 1024;
+        if total_model_bytes.saturating_add(headroom_bytes) <= ram_mb * 1024 * 1024 {
+            return 0;
+        }
+
+        // Dense trunk estimate (f32): working context window + activations + lm head
         let ctx = std::env::var("LEAFCUTTER_CTX_KB")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .map(|kb| kb * 1024)
-            .unwrap_or_else(|| config.max_seq_len.min(4096));
-        let kv_cache_bytes = 2usize // K and V
+            .unwrap_or_else(|| config.max_seq_len.min(1024));
+        let kv_cache_bytes = 2usize
             .saturating_mul(config.num_hidden_layers)
             .saturating_mul(config.num_key_value_heads)
             .saturating_mul(config.kv_head_dim)
             .saturating_mul(ctx)
-            .saturating_mul(4); // f32
+            .saturating_mul(2); // f16 / quantized KV
         let activation_bytes = config
             .hidden_size
-            .saturating_mul(config.num_attention_heads.max(1) + 3) // qkv + o + mlp
+            .saturating_mul(config.num_attention_heads.max(1) + 3)
             .saturating_mul(4);
         let head_bytes = config
             .vocab_size
             .saturating_mul(config.hidden_size)
-            .saturating_mul(2); // f32 head, lower bound
+            .saturating_mul(2);
         let trunk_bytes = kv_cache_bytes.saturating_add(activation_bytes).saturating_add(head_bytes);
-        let margin_mb = 512; // OS + page cache + slack
+        let margin_mb = 512;
         let budget_bytes = (avail_mb.saturating_sub(margin_mb) * 1024 * 1024).saturating_sub(trunk_bytes);
 
-        // Trunk-first: if even the trunk doesn't fit, still give the cache a
-        // minimal slice so a huge model can stream; otherwise give it the
-        // leftover. If the whole model fits under the budget, cache everything.
         if total_model_bytes <= budget_bytes {
             0
         } else {
-            budget_bytes.max(256 * 1024 * 1024) // floor 256 MiB so streaming works
+            budget_bytes.max(256 * 1024 * 1024)
         }
     }
 
@@ -248,7 +268,7 @@ impl GGUFModel {
         self.layer_cache.lock().map(|c| c.map.len()).unwrap_or(0)
     }
 
-    /// Total estimated bytes of cached quantized weights (for monitoring).
+    /// Total resident bytes of cached layer weights (for monitoring).
     pub fn cached_bytes(&self) -> usize {
         self.layer_cache.lock().map(|c| c.cached_bytes()).unwrap_or(0)
     }
@@ -767,20 +787,22 @@ impl GGUFModel {
 
             let shape_gguf: Vec<usize> = info.dimensions.iter().map(|&d| d as usize).collect();
             let is_2d = shape_gguf.len() == 2;
-            // For 3-D MoE expert tensors (e.g. ffn_gate_exps.weight stored as
-            // `[O, I, E]` — experts last/innermost, row-major), the quantized
-            // block stream is a flat byte array with total size O*I*E.  We
-            // collapse the leading dims so the kernel sees a 2-D `[O*I, E]`
-            // matrix: rows*cols == total element count, and E must be a
-            // multiple of the quant block size (256 for K-quants).  The
-            // Tensor's metadata shape stays 3-D so `moe::slice_experts` can
-            // split it per-expert with `o*(I*E) + i*E + e` indexing.
+            // For 3-D MoE expert tensors (e.g. ffn_gate_exps.weight stored
+            // with GGUF dims `[d0, d1, d2]`, d2 = num_experts), GGUF/llama.cpp
+            // store the data row-major over `[expert, d1, d0]` with d0
+            // contiguous (ne[0] innermost, expert outermost — see
+            // llama-model.cpp create_tensor_gate_up_exps).  The quantized
+            // block stream is therefore already a `[d1*d2, d0]` matrix:
+            //   rows = d1*d2, cols = d0, blocks_per_row = d0/256.
+            // Expert `e` then occupies rows `[e*d1, (e+1)*d1)` — exactly what
+            // `Tensor::expert_slice` reads back.  (Do NOT collapse to
+            // `[d0*d1, d2]` — that mislabels the block stream and makes every
+            // expert block range wrong.)  The Tensor's metadata shape stays
+            // 3-D so `Tensor::expert_slice` can split it per-expert.
             let (kernel_rows, kernel_cols, keep_shape_3d) = if is_2d {
                 (shape_gguf[1], shape_gguf[0], false)
             } else if shape_gguf.len() == 3 {
-                let leading: usize = shape_gguf[..shape_gguf.len() - 1].iter().product();
-                let trailing = *shape_gguf.last().unwrap();
-                (leading, trailing, true)
+                (shape_gguf[1] * shape_gguf[2], shape_gguf[0], true)
             } else {
                 (shape_gguf[0], shape_gguf.get(1).copied().unwrap_or(1), false)
             };
@@ -905,12 +927,17 @@ impl GGUFModel {
                 tensor = tensor.transpose();
                 sanitize_weights(&mut tensor);
             }
-            // 3-D MoE expert tensors are stored as quantized blocks (q_data)
-            // and need eager dequantization so slice_experts can index .data.
-            // Conv1d weight (ssm_conv1d.weight) is read element-by-element by
-            // the conv1d kernel (not as a matmul) — it needs f32 .data even
-            // though the matmul paths use .q_data.
-            if keep_shape_3d || engine_name.contains("ssm_conv1d") {
+            // 3-D MoE expert tensors stay quantized in the cache — per-expert
+            // slices are produced on demand by `Tensor::expert_slice` (which
+            // reads q_data directly, no f32 materialization).  Only tensors
+            // that need element-wise f32 access materialize: conv1d weight
+            // (ssm_conv1d.weight is read element-by-element by the conv1d
+            // kernel, not as a matmul) and any other 3-D tensor that is not a
+            // routed expert (kept conservative so unknown 3-D shapes don't
+            // lose their .data).  This is the fix for the 35B MoE OOM: expert
+            // tensors are no longer dequantized to ~3.2 GB/layer.
+            let is_moe_expert = engine_name.contains("expert_") || engine_name.contains("_exps");
+            if !is_moe_expert && (keep_shape_3d || engine_name.contains("ssm_conv1d")) {
                 if std::env::var("LEAFCUTTER_DEBUG").map(|v| v == "1").unwrap_or(false) {
                     eprintln!("[loader] materializing {} (shape={:?})", engine_name, tensor.shape);
                 }

@@ -16,8 +16,18 @@
 //!   leafcutter --meta                                    Print synapse metadata JSON
 
 use clap::{CommandFactory, Parser, Subcommand};
+use colored::Colorize;
 use std::io::{self, Write};
 use std::path::PathBuf;
+
+// ── Leafcutter palette — Gold & Purple (mirrors Paraclea) ─────────────────────
+/// Bright gold — user prompts, values, active state.  RGB(255, 215, 0)
+fn gold(s: &str) -> colored::ColoredString   { s.truecolor(255, 215, 0).bold() }
+/// Vivid purple — borders, system labels, separators.  RGB(177, 74, 237)
+fn purple(s: &str) -> colored::ColoredString { s.truecolor(177, 74, 237).bold() }
+/// Dim purple — secondary info, non-bold separators.   RGB(177, 74, 237)
+fn dim_purple(s: &str) -> colored::ColoredString { s.truecolor(177, 74, 237) }
+
 
 #[cfg(feature = "llama-ffi")]
 use std::sync::Arc;
@@ -412,9 +422,10 @@ fn cmd_run_safetensor(model_arg: &str, mut temp: f32, _top_p: f32, mut max_token
         path
     } else {
         // Try common dirs before giving up.
+        let home = std::env::var("HOME").unwrap_or_default();
         let candidates = [
-            "/home/xander/Downloads/models",
-            "/home/xander/Documents/portfolio/LeafcutterLLM",
+            format!("{}/Downloads/models", home),
+            format!("{}/Documents/portfolio/LeafcutterLLM", home),
         ];
         let mut found = None;
         for dir in &candidates {
@@ -648,26 +659,36 @@ fn find_model(name: &str) -> Option<PathBuf> {
 
 fn cmd_list_auto() {
     let dirs = resolve_models_dirs();
-    eprintln!("Leaves in:");
+    println!("{}", purple("╔══════════════════════════════════════════════════════╗"));
+    println!("{}", gold("║  🌿 LeafcutterLLM — Available Models                 ║"));
+    println!("{}", purple("╚══════════════════════════════════════════════════════╝"));
+    println!("{}", dim_purple("  Searching in:"));
     for d in &dirs {
-        eprintln!("  - {}", d.display());
+        println!("    {}", dim_purple(&format!("- {}", d.display())));
     }
-    eprintln!();
+    println!();
     let models = scan_models(&dirs);
     if models.is_empty() {
-        eprintln!("No models found.");
-        eprintln!("Point the tool at your models with: leafcutter source add <dir>");
-        eprintln!("Or set LEAF_MODELS_DIR=/path/to/models");
+        println!("  {}", "No models found.".yellow());
+        println!("  {}", dim_purple("Point the tool at your models with:"));
+        println!("    {}", gold("leafcutter source add <dir>"));
+        println!("  {}", dim_purple("Or set LEAF_MODELS_DIR=/path/to/models"));
         return;
     }
     for (i, (path, size)) in models.iter().enumerate() {
         let name = path.file_name().unwrap().to_string_lossy();
-        let kind = if path.is_dir() { "[safetensors]" } else { "" };
-        println!("  [{}] {:<50} {} {}", i, name, format_size(*size), kind);
+        let kind = if path.is_dir() { dim_purple("[safetensors]").to_string() } else { String::new() };
+        println!("  {} {:<50} {} {}",
+            gold(&format!("[{}]", i)),
+            name.bold(),
+            gold(&format_size(*size)),
+            kind,
+        );
     }
-    eprintln!();
-    eprintln!("Run: leafcutter run <name>");
+    println!();
+    println!("  {} {}", dim_purple("Run:"), gold("leafcutter run <name>"));
 }
+
 
 fn cmd_source(op: SourceOp) {
     use leafcutter::config;
@@ -1135,26 +1156,50 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
     let mut system_prompt: String = String::new(); // empty → profile default
     let gguf = GGUFile::open(&path_str).ok();
 
-    // --- Welcome banner (Ollama-style model card) ---
+    // --- Welcome banner (model card) ---
     let model_name = path.file_name().unwrap().to_string_lossy();
     let file_mb = path.metadata().map(|m| m.len() as f64 / 1_048_576.0).unwrap_or(0.0);
+    let npu_suffix = if hw.npu.is_present() {
+        format!(" · npu:{}", hw.npu.label())
+    } else {
+        String::new()
+    };
+
+    // Helper: print a key-value row inside the banner box.
+    // Label is dim-purple, value is gold, padded to 34 chars with purple right border.
+    macro_rules! banner_row {
+        ($label:expr, $value:expr) => {{
+            let val = truncate_str(&$value.to_string(), 34);
+            let padded = format!("{:<34}", val);
+            eprintln!("  {}  {}: {}{}",
+                purple("║"),
+                dim_purple($label),
+                gold(&padded),
+                purple("║"),
+            );
+        }};
+    }
+
     eprintln!();
-    eprintln!("  ╔══════════════════════════════════════════════╗");
-    eprintln!("  ║  🌿 Leafcutter — Native Engine               ║");
-    eprintln!("  ╠══════════════════════════════════════════════╣");
-    eprintln!("  ║  Model:    {:<34}║", truncate_str(&model_name, 34));
-    eprintln!("  ║  Arch:     {:<34}║", truncate_str(&info.architecture, 34));
-    eprintln!("  ║  Layers:   {:<34}║", format!("{} layers, {} hidden", info.total_layers, info.hidden_size));
-    eprintln!("  ║  Size:     {:<34}║", format!("{:.1} MB", file_mb));
-    eprintln!("  ║  Hardware: {:<34}║", format!("{} · {} cores · {:.0} GiB free", hw.os, hw.cpu_cores, hw.ram_available_mb as f64 / 1024.0));
-    eprintln!("  ║  Tier:     {:<34}║", format!("{} — {}", tier.number(), tier.label()));
-    eprintln!("  ║  Profile:  {:<34}║", truncate_str(profile.name, 34));
-    eprintln!("  ║  Temp:     {:<34}║", format!("{:.2}  (top_p={:.2})", temp, top_p));
-    eprintln!("  ║  Max tok:  {:<34}║", format!("{}", max_tokens));
-    eprintln!("  ╚══════════════════════════════════════════════╝");
+    eprintln!("  {}", purple("╔══════════════════════════════════════════════╗"));
+    eprintln!("  {}", gold( "║  🌿 LeafcutterLLM — Native Engine            ║"));
+    eprintln!("  {}", purple("╠══════════════════════════════════════════════╣"));
+    banner_row!("Model   ", model_name);
+    banner_row!("Arch    ", info.architecture);
+    banner_row!("Layers  ", format!("{} layers, {} hidden", info.total_layers, info.hidden_size));
+    banner_row!("Size    ", format!("{:.1} MB", file_mb));
+    banner_row!("Hardware", format!("{} · {} cores · {:.0} GiB free{}", hw.os, hw.cpu_cores, hw.ram_available_mb as f64 / 1024.0, npu_suffix));
+    banner_row!("Tier    ", format!("{} — {}", tier.number(), tier.label()));
+    banner_row!("Profile ", profile.name);
+    banner_row!("Temp    ", format!("{:.2}  (top_p={:.2})", temp, top_p));
+    banner_row!("Max tok ", max_tokens);
+    eprintln!("  {}", purple("╚══════════════════════════════════════════════╝"));
     eprintln!();
-    eprintln!("  Type /help for commands. /bye to exit.");
-    eprintln!("  ─────────────────────────────────────────────────");
+    eprintln!("  {} {}",
+        dim_purple("Type"),
+        gold("/help for commands · /bye to exit"),
+    );
+    eprintln!("  {}", dim_purple("─────────────────────────────────────────────────"));
 
     let mut conversation: Vec<(String, String)> = Vec::new();
 
@@ -1167,13 +1212,16 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
     leafcutter::cpu_monitor::start();
 
     loop {
-        // Ollama-style prompt: ">>> " for user input.
-        print!("\n>>> ");
+        // Gold ">>> " prompt — matches Paraclea's "You >" in gold.
+        print!("\n{} ", gold(">>>"));
         io::stdout().flush().ok();
 
+
         let mut input = String::new();
-        if io::stdin().read_line(&mut input).is_err() {
-            break;
+        match io::stdin().read_line(&mut input) {
+            Ok(0) => break, // EOF — stdin closed (piped input finished)
+            Ok(_) => {}
+            Err(_) => break,
         }
         let input = input.trim().to_string();
 
@@ -1192,7 +1240,10 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
                     engine.ssm_cache.clear();
                     engine.deltanet_cache.clear();
                     engine.seq_offset = 0;
-                    eprintln!("Goodbye!");
+                    eprintln!("\n{} {}\n",
+                        purple("Leafcutter >"),
+                        gold("Goodbye! See you soon."),
+                    );
                     break;
                 }
                 "/clear" => {
@@ -1201,7 +1252,7 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
                     engine.ssm_cache.clear();
                     engine.deltanet_cache.clear();
                     engine.seq_offset = 0;
-                    eprintln!("[context cleared]");
+                    eprintln!("{}", dim_purple("[context cleared — caches flushed]"));
                     continue;
                 }
                 "/help" | "/?" => {
@@ -1456,7 +1507,6 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
             .map(|s| s.0)
             .collect();
         let mut in_thinking = profile.opens_with_thinking;
-        let mut thinking_prefix_shown = false;
         let mut thinking_tail = String::new();
         let debug_chunks = std::env::var("LEAFCUTTER_CHUNK_DEBUG").is_ok();
         let generated_ids = engine.generate_streaming_with_stops(
@@ -1476,11 +1526,7 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
                     if let Some(pos) = thinking_tail.find("</think>") {
                         let (pre, rest) = thinking_tail.split_at(pos);
                         if !pre.is_empty() {
-                            if !thinking_prefix_shown {
-                                eprint!("💭");
-                                thinking_prefix_shown = true;
-                            }
-                            eprint!("{}", pre);
+                            eprint!("{}", dim_purple(pre));
                         }
                         thinking_tail = rest["</think>".len()..].to_string();
                         if std::env::var("LEAFCUTTER_CHUNK_DEBUG").is_ok() {
@@ -1492,18 +1538,11 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
                     } else {
                         // Emit all but the last 7 chars (they can't be part
                         // of a partial `</think>`), keeping the boundary.
-                        // SAFETY: the 7-byte window can straddle a multi-byte
-                        // UTF-8 character (e.g. emoji), so we floor to the
-                        // nearest char boundary to avoid a panic on `split_at`.
                         let raw_keep = thinking_tail.len().saturating_sub(7);
                         let keep = floor_char_boundary(&thinking_tail, raw_keep);
                         if keep > 0 {
                             let (emit, rest) = thinking_tail.split_at(keep);
-                            if !thinking_prefix_shown {
-                                eprint!("💭");
-                                thinking_prefix_shown = true;
-                            }
-                            eprint!("{}", emit);
+                            eprint!("{}", dim_purple(emit));
                             thinking_tail = rest.to_string();
                         }
                     }
@@ -1511,10 +1550,11 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
                     return true;
                 }
                 if !thinking_tail.is_empty() {
-                    eprint!("{}", thinking_tail);
+                    eprint!("{}", dim_purple(&thinking_tail));
                     thinking_tail.clear();
+                    eprintln!();
                 }
-                eprint!("{}", chunk);
+                eprint!("{}", gold(chunk));
                 let _ = io::stdout().flush();
                 generated_text.push_str(chunk);
                 true
@@ -1534,14 +1574,19 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
 
         let peak_rss = get_peak_rss_mb();
         let cur_rss = get_current_rss_mb();
-        eprintln!("─────────────────────────────────────────────────");
-        eprintln!("{} | out={} | {:.2}s | {:.2} tok/s | RAM {} (peak {})",
-            truncate_str(&model_name, 28),
-            gen_tokens,
-            gen_elapsed.as_secs_f64(),
-            tok_per_sec,
-            format_rss(cur_rss),
-            format_rss(peak_rss),
+        eprintln!("{}", dim_purple("─────────────────────────────────────────────────"));
+        eprintln!("{} {} {} {} {} {} {}",
+            dim_purple(&truncate_str(&model_name, 28)),
+            dim_purple("|"),
+            gold(&format!("out={}", gen_tokens)),
+            dim_purple("|"),
+            gold(&format!("{:.2}s", gen_elapsed.as_secs_f64())),
+            dim_purple("|"),
+            gold(&format!("{:.2} tok/s  RAM {} (peak {})",
+                tok_per_sec,
+                format_rss(cur_rss),
+                format_rss(peak_rss),
+            )),
         );
         eprintln!();
         conversation.push(("assistant".into(), generated_text));
@@ -1551,22 +1596,26 @@ fn cmd_run(model_arg: &str, mut temp: f32, mut top_p: f32, mut max_tokens: usize
 /// Print the /help screen.
 fn print_help(temp: f32, top_p: f32, max_tokens: usize, profile: &leafcutter::profiles::ModelProfile) {
     eprintln!();
-    eprintln!("Available Commands:");
-    eprintln!("  /set <key> <val>  Set parameter (temp, top_p, max, system)");
-    eprintln!("  /show <target>    Show info, profile, system, history, stats");
-    eprintln!("  /temp <f>         Set temperature (alias for /set temp)");
-    eprintln!("  /info             Show loaded model info");
-    eprintln!("  /stats            Show rolling session statistics");
-    eprintln!("  /clear            Clear conversation + flush caches");
-    eprintln!("  /source           List model source dirs (/source add <dir>)");
-    eprintln!("  /help, /?         Show this help");
-    eprintln!("  /bye, /quit       Exit");
+    eprintln!("{}", gold("  Available Commands:"));
+    eprintln!("  {}  {}", dim_purple("/set <key> <val>"), "Set parameter (temp, top_p, max, system)");
+    eprintln!("  {}      {}", dim_purple("/show <target>"), "Show info, profile, system, history, stats");
+    eprintln!("  {}         {}", dim_purple("/temp <f>"), "Set temperature (alias for /set temp)");
+    eprintln!("  {}            {}", dim_purple("/info"), "Show loaded model info");
+    eprintln!("  {}           {}", dim_purple("/stats"), "Show rolling session statistics");
+    eprintln!("  {}           {}", dim_purple("/clear"), "Clear conversation + flush caches");
+    eprintln!("  {}          {}", dim_purple("/source"), "List model source dirs (/source add <dir>)");
+    eprintln!("  {}        {}", dim_purple("/help, /?"), "Show this help");
+    eprintln!("  {}    {}", dim_purple("/bye, /quit"), "Exit");
     eprintln!();
-    eprintln!("Current Settings:");
-    eprintln!("  temperature : {:.2}", temp);
-    eprintln!("  top_p       : {:.2}", top_p);
-    eprintln!("  max_tokens  : {}", max_tokens);
-    eprintln!("  profile     : {} ({})", profile.name, profile.description);
+    eprintln!("{}", gold("  Current Settings:"));
+    eprintln!("  {}  {}", dim_purple("temperature :"), gold(&format!("{:.2}", temp)));
+    eprintln!("  {}        {}", dim_purple("top_p :"), gold(&format!("{:.2}", top_p)));
+    eprintln!("  {}   {}", dim_purple("max_tokens :"), gold(&format!("{}", max_tokens)));
+    eprintln!("  {}      {} {}",
+        dim_purple("profile :"),
+        gold(profile.name),
+        dim_purple(&format!("({})", profile.description)),
+    );
     eprintln!();
 }
 
@@ -1577,7 +1626,8 @@ fn truncate_str(s: &str, max: usize) -> String {
     } else if max <= 3 {
         "...".to_string()
     } else {
-        format!("{}...", &s[..max - 3])
+        let cut = floor_char_boundary(s, max - 3);
+        format!("{}...", &s[..cut])
     }
 }
 
@@ -1744,14 +1794,14 @@ async fn run_server_native(model_path: &str, port: u16, host: &str) {
     use leafcutter::api::{NativeStreamingEngine, LeafcutterEngine, run_server};
     use std::sync::Arc;
 
-    eprintln!("LeafcutterLLM (Serve Mode: native-streaming, no FFI)");
-    eprintln!("   Model: {}", model_path);
-    eprintln!("   Host: {}:{}", host, port);
+    eprintln!("{}", gold("🌿 LeafcutterLLM — Serve Mode: native-streaming"));
+    eprintln!("   {}  {}", dim_purple("Model:"), model_path);
+    eprintln!("   {}   {}:{}", dim_purple("Host:"), host, port);
     eprintln!();
 
     let engine: Arc<dyn LeafcutterEngine> = match NativeStreamingEngine::load(model_path) {
         Ok(e) => {
-            eprintln!("Native Streaming Engine loaded (low RAM mode)");
+            eprintln!("{}", gold("✅ Native Streaming Engine loaded (low RAM mode)"));
             Arc::new(e)
         }
         Err(e) => {
@@ -1771,14 +1821,14 @@ async fn run_server_native(model_path: &str, port: u16, host: &str) {
 async fn run_server_ffi(model_path: &str, port: u16, host: &str, engine_type: &str, benchmark: bool) {
     use leafcutter::api::{FfiEngine, NativeStreamingEngine, LeafcutterEngine};
 
-    println!("🌿 LeafcutterLLM v0.9.5 (Server Mode: {})", engine_type);
-    println!("   Model: {}", model_path);
-    println!("   Host: {}", host);
+    eprintln!("{}", gold(&format!("🌿 LeafcutterLLM v0.9.5 — Server Mode: {}", engine_type)));
+    eprintln!("   {}  {}", dim_purple("Model:"), model_path);
+    eprintln!("   {}   {}", dim_purple("Host:"), host);
 
     let engine: Arc<dyn LeafcutterEngine> = if engine_type == "native-streaming" {
         match NativeStreamingEngine::load(model_path) {
             Ok(e) => {
-                println!("✅ Native Streaming Engine loaded (low RAM mode)");
+                eprintln!("{}", gold("✅ Native Streaming Engine loaded (low RAM mode)"));
                 Arc::new(e)
             }
             Err(e) => {
@@ -1789,7 +1839,7 @@ async fn run_server_ffi(model_path: &str, port: u16, host: &str, engine_type: &s
     } else {
         match FfiEngine::load(model_path) {
             Ok(e) => {
-                println!("✅ llama.cpp FFI Engine loaded (Full load mode)");
+                eprintln!("{}", gold("✅ llama.cpp FFI Engine loaded (Full load mode)"));
                 Arc::new(e)
             }
             Err(e) => {
@@ -2221,7 +2271,10 @@ fn cmd_generate_native(
                 } else {
                     // Emit all but the last 7 chars (they can't be part of a
                     // partial `</think>`), keeping the boundary.
-                    let keep = thinking_tail.len().saturating_sub(7);
+                    // SAFETY: the 7-byte window can straddle a multi-byte
+                    // UTF-8 character (e.g. CJK or emoji), so we floor to the
+                    // nearest char boundary to avoid a panic on `split_at`.
+                    let keep = floor_char_boundary(&thinking_tail, thinking_tail.len().saturating_sub(7));
                     if keep > 0 {
                         let (emit, rest) = thinking_tail.split_at(keep);
                         if !thinking_prefix_shown {

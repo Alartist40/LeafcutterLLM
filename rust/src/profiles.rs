@@ -468,7 +468,7 @@ mod tests {
         let p = &MINISTRAL_PROFILE;
         let rendered = render_prompt(p, "", "hi");
         // Default system is prepended inside the [INST] block.
-        assert!(rendered.starts_with("[INST] You are a helpful assistant."));
+        assert!(rendered.starts_with("[INST] You are Ministral-3-3B-Instruct-2512"));
         assert!(rendered.ends_with("hi [/INST]"));
         // A custom system replaces the default.
         let rendered2 = render_prompt(p, "custom sys", "hi");

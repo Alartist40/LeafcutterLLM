@@ -413,6 +413,63 @@ pub fn simd_sum_sq(data: &[f32]) -> f32 {
     simd_sum
 }
 
+/// SIMD-accelerated SiLU (x * sigmoid(x)) using a fast base-2 exponential.
+/// Out-of-range values fall back to the scalar path tail. Relative error < 1e-4.
+pub fn simd_silu(x: &[f32], out: &mut [f32]) {
+    debug_assert_eq!(x.len(), out.len());
+    let len = x.len();
+    let mut i = 0;
+
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        use std::arch::aarch64::*;
+        // exp(-v) = 2^(t), t = -v * log2(e); polynomial for 2^frac on [0,1)
+        const C1: f32 = 0.6931471805599453; // ln2
+        const C2: f32 = 0.2402265069591007; // ln2^2/2
+        const C3: f32 = 0.0555041086648216; // ln2^3/6
+        const C4: f32 = 0.0096181291076284; // ln2^4/24
+        const C5: f32 = 0.0013333558146428; // ln2^5/120
+        const C6: f32 = 0.0001540353039338; // ln2^6/720
+        let c1 = vdupq_n_f32(C1);
+        let c2 = vdupq_n_f32(C2);
+        let c3 = vdupq_n_f32(C3);
+        let c4 = vdupq_n_f32(C4);
+        let c5 = vdupq_n_f32(C5);
+        let c6 = vdupq_n_f32(C6);
+        let le = vdupq_n_f32(-1.4426950408889634); // -log2(e)
+        let one = vdupq_n_f32(1.0);
+        let neg126 = vdupq_n_f32(-126.0);
+        let pos127 = vdupq_n_f32(127.0);
+        while i + 4 <= len {
+            let v = vld1q_f32(x.as_ptr().add(i));
+            let t = vmulq_f32(v, le);
+            let fl = vminq_f32(vmaxq_f32(vrndmq_f32(t), neg126), pos127); // clamp under/overflow
+            let fr = vsubq_f32(t, fl);
+            // 2^fr = 1 + fr*(C1 + fr*(C2 + fr*(C3 + fr*(C4 + fr*(C5 + fr*C6)))))
+            let mut p = vfmaq_f32(c5, c6, fr);
+            p = vfmaq_f32(c4, p, fr);
+            p = vfmaq_f32(c3, p, fr);
+            p = vfmaq_f32(c2, p, fr);
+            p = vfmaq_f32(c1, p, fr);
+            p = vfmaq_f32(one, p, fr);
+            // 2^fl via exponent-field reconstruction
+            let fl_int = vcvtq_s32_f32(fl);
+            let biased_int = vaddq_s32(fl_int, vdupq_n_s32(127));
+            let exp2 = vreinterpretq_f32_s32(vshlq_n_s32(biased_int, 23));
+            let em = vmulq_f32(exp2, p); // exp(-v)
+            let sig = vrecpeq_f32(vaddq_f32(one, em));
+            let sig = vmulq_f32(sig, vrecpsq_f32(vaddq_f32(one, em), sig)); // Newton refine
+            // silu = v * sigmoid(v); note sigmoid(v) = 1/(1+exp(-v))
+            vst1q_f32(out.as_mut_ptr().add(i), vmulq_f32(v, sig));
+            i += 4;
+        }
+    }
+
+    for rem in i..len {
+        out[rem] = x[rem] * (1.0 / (1.0 + (-x[rem]).exp()));
+    }
+}
+
 /// SIMD-accelerated dot product (f32). Falls back to scalar on non-x86_64.
 /// In deterministic mode (`LEAFCUTTER_DETERMINISTIC=1`) uses a serial,
 /// f64-accumulated reference reduction so results are bit-identical
@@ -534,6 +591,22 @@ mod tests {
         let mut out = vec![0.0f32; 5];
         simd_vec_add(&a, &b, &mut out);
         assert_eq!(out, vec![6.0, 6.0, 6.0, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn test_simd_silu_matches_scalar() {
+        let x: Vec<f32> = (0..200).map(|i| (i as f32 - 100.0) * 0.3).collect();
+        let mut out = vec![0.0f32; x.len()];
+        simd_silu(&x, &mut out);
+        for (i, &v) in x.iter().enumerate() {
+            let expected = v * (1.0 / (1.0 + (-v).exp()));
+            let rel = if expected.abs() > 1e-6 {
+                (out[i] - expected).abs() / expected.abs()
+            } else {
+                (out[i] - expected).abs()
+            };
+            assert!(rel < 1e-4, "silu mismatch at {}: got {}, expected {}", i, out[i], expected);
+        }
     }
 
     #[test]

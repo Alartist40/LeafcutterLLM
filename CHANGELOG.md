@@ -3,6 +3,183 @@
 All notable changes to the LeafcutterLLM project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2026-08-20] — ARM sdot quantized kernels (bit-exact); batched m>1 prefill GEMM; NEON delta_rule & SiLU; per-component profiling; Ollama parity drive
+
+### Added
+- **ARMv9 dot-product (sdot) quantized kernels** (`rust/src/kernels/q8_k.rs`):
+  - `q4_k_dot_q8_k_sdot` / `q4_k_dot_q8_k_2col_sdot` / `q6_k_dot_q8_k_sdot` using
+    the `sdot vd.4s, vn.16b, vm.16b` instruction (replaces the 16-bit widening
+    `vmull/vpadal` NEON chain). Bit-identical to the scalar reference.
+  - Reusable primitives: `q4_block_dot_sdot`, `q6_block_dot_sdot` (one weight
+    block × one activation block) and block builders `build_q4_aux8` /
+    `build_q6_aux8` (weight block → i8 aux bytes used by the dot).
+  - Inline-asm note: operands must be written `{0:v}.4s, {1:v}.16b, {2:v}.16b`;
+    `{0:q}` fails with "invalid operand for instruction". Functions need
+    `#[target_feature(enable = "neon,dotprod")]` and the call sites guard on
+    `is_aarch64_feature_detected!("dotprod")`.
+- **Dispatch changes** (`q8_k_gemm.rs`, `q4_k_gemm.rs`, `q6_k_gemm.rs`):
+  - Q4_K decode GEMV → **single-column sdot** (the 2-column interleave loses on
+    the CIX Sky1 to register pressure: 4.3–5.5 ms vs 3.08 ms for n=12288).
+  - Q6_K stays on NEON everywhere: sdot's asm barriers break memory pipelining on
+    the bandwidth-bound lm_head (58 → 32 ms) and on decode shapes (11–14 ms vs
+    2.5–6 ms NEON).
+  - Opt-out env: `LEAFCUTTER_Q8_GEMV=0` (also forces deterministic mode).
+- **Batched m>1 Q8 GEMM** (`run_q4_k_q8_gemm`, `run_q6_k_q8_gemm`): each
+  activation row is quantized once and each weight column's `aux8` block buffer
+  is built once, then reused across all m rows. `q4_k_matmul_transposed_b_q8` /
+  `q6_k_matmul_transposed_b_q8` now handle both m==1 (GEMV) and m>1 (prefill):
+  prefill dropped from **63 s → 7.5 s** (m=77).
+- **NEON `delta_rule_block`** (`deltanet.rs`): the DeltaNet recurrent update is
+  vectorized over the head's vector lanes (head_k_dim % 4 == 0 fast path, scalar
+  fallback). Per-call delta_rule went **6.5 ms → 2.2 ms** average; end-to-end
+  decode cost 110 ms → ~30 ms/token.
+- **NEON fast-exp SiLU** (`simd.rs` `simd_silu`, `backend/cpu.rs`): base-2
+  exponential via exponent-field reconstruction (`2^fl` from the floored
+  `-v·log2e`, 6-term Taylor for the fraction) + `vrecpe/vrecps` Newton reciprocal.
+  Relative error ≤ 8e-6, 2.7× faster than scalar `expf` (1.20 ms → 0.45 ms per
+  FFN call). FFN fused multiply now uses `simd_vec_mul`.
+  - Note for rebuilders: use `vcvtq_s32_f32` (integer conversion) for the
+    exponent field — `vreinterpretq_s32_f32` reinterprets the float *bits*, which
+    silently breaks the trick. Clamp `fl` to [-126, 127] to avoid shift overflow.
+- **Per-component layer profiling** (`engine.rs`, gated by `LEAFCUTTER_PROFILE=1`):
+  independent timers for `pre_norm`, `attention/deltanet/ssm/mla_forward`,
+  `post_norm`, `ffn_forward`, plus per-matmul lines, `delta_rule`, and
+  `lm_head_separate_forward`. (Earlier version reused one timer and double-counted
+  — each timer is now printed immediately after its op.)
+
+### Measured (Orange Pi 6 Plus / CIX Sky1, aarch64, 12 cores, 14 GiB)
+- Clean kernel bench (single-col sdot): Q4_K k=4096 n=12288 = **3.08–3.45 ms**,
+  n=8192 = 1.24–2.55 ms, k=12288 n=4096 = 3.29–3.64 ms; Q6 lm_head = 32.4–34.6 ms
+  (24–26 GB/s, bandwidth-bound).
+- Ornith-1.0-9B decode: **1.0 → 1.5 tok/s** under load (≈2.4 tok/s projected on an
+  idle machine), 60-token wall 122 s → **~40 s**; decode matmuls ≈ 320 ms/token,
+  lm_head ≈ 48 ms/token, delta_rule ≈ 30 ms/token.
+- **Ollama A/B (same hardware, similar load)**: Ollama `ornith:9b` = **2.93 tok/s**
+  decode (60 tok / 20.5 s); Leafcutter = **1.50 tok/s**. Gap is now kernel-level
+  (matmuls + bandwidth-bound lm_head), not setup.
+
+### Investigated / Decisions
+- **SVE2 / i8mm (smmla) is a dead end on the Sky1**: the probe showed the SVE
+  vector length is **128 bits** (same as NEON), and `smmla {0:v}.4s, {1:v}.16b,
+  {2:v}.16b` produces the wrong dot pattern for single-column Q8 dot products
+  (272 vs 136). Its only win would be llama.cpp's 2-column zip-interleave, which
+  our 2-col experiments already showed loses on this chip. → Do not port the
+  llama.cpp SVE2 path.
+- **DeepSeek V4 (165 B params, native FP8/INT8, 156 GB on disk) is not runnable
+  on this machine**: routing needs random access to any of 256 experts, so the
+  full weight set (~82 GB even at Q4_K_M) must be addressable; 14 GiB RAM is ~6×
+  too small. Abandoned locally (would only run on a larger host).
+
+### Fixed
+- **`q6_k_fused` test ground truth**: `fused_matches_scalar_within_tolerance` now
+  compares against the exact f32 dequant result (the fused kernel is unused in
+  inference). Batched m>1 tests compare against per-row m=1 Q8 GEMV with 1e-4
+  tolerance (Q8 quantization error is 2–8%, so dequant comparison was too strict).
+- Test suite: **202 passed / 0 failed / 4 ignored** (was 201; +1 `simd_silu` test).
+
+---
+
+## [2026-08-19] — Qwen3.8-27B verification; ARM 12-core thread pool scaling; automatic layer prefetching; Gold/Purple UI stream; MoE top-k $O(N)$ partitioning
+
+### Added
+- **Qwen3.8-27B-Q4_K_M Verification**: Verified end-to-end load and coherent streaming decode of Qwen3.8-27B (64 layers, 5120 hidden) on 16 GB CIX Sky1 hardware. The model loads in Tier 3 streaming CPU mode and outputs coherent persona-aware thinking (`💭The user is asking what I am. I should respond as Ornith…`).
+- **Seamless Gold & Purple UI**: Redesigned streaming response UI in `main.rs` to remove text labels (`Thinking...` / `Leafcutter >`). Thinking tokens stream in dimmed purple (`dim_purple`) so reasoning blends subtly into the background, transitioning seamlessly into bright Gold (`#FFD700`) for the response text.
+- **ARM Thread Pool Sizing**: Updated `default_thread_count()` in `init.rs` for `aarch64` ARM processors so multi-threaded GEMV scale across all physical CPU cores (e.g. 11/12 worker threads on the CIX Sky1) rather than halving SMT threads to 6.
+- **Automatic Layer Prefetching**: Enabled background layer prefetching by default (`use_prefetch`) when system RAM fits the model, overlapping layer $l+1$ parsing with layer $l$ matmul.
+- **`leaf` CLI Shortcut**: Updated `install.sh` to install both `leafcutter` binary and a convenience `leaf` symlink in `BIN_DIR`.
+- **Reference Architecture Analysis**: Authored `reference_analysis.md` summarizing core architectural techniques from `colibri` (weight JIT & multi-tiering), `kimi-k3-in-c` (native MXFP4 nibble matmul & ring streaming), and `llama.cpp` (`ggml-alloc` static arena), with a prioritized LeafcutterLLM roadmap.
+
+### Fixed
+- **REPL EOF Infinite Loop**: Fixed an issue in `cmd_run` where piping input into `leafcutter run` caused an infinite loop of empty `>>>` prompts upon EOF. `read_line` now breaks cleanly on `Ok(0)`.
+- **MoE Top-K Expert Selection**: Optimized expert selection in `moe.rs` by replacing $O(N \log N)$ sorting over all experts with $O(N)$ `select_nth_unstable_by` partitioning.
+- **Hardware Probing Documentation**: Added `§ 0.1 Hardware Reality` to `NEXT_STEPS.md` documenting the CIX Sky1 (P1/CD8180) 12-core ARMv9 SoC, LPDDR5 bandwidth targets, Mali-G720 Vulkan path, and Zhouyi AIPU (`/dev/aipu`).
+
+---
+
+## [2026-08-18] — MoE expert streaming (no f32 materialization); quantized cache accounting; NPU detection; aarch64 test fixes
+
+### Fixed — 35B MoE OOM (the big one)
+
+Running `ornith-1.0-35b-Q4_K_M.gguf` (256 experts, Qwen3.6 MoE) was
+OOM-killed 3× (6.5–7.1 GB anon RSS) because every 3-D MoE expert tensor was
+eagerly dequantized to f32 (~1.07 GB each × 3 per layer ≈ 3.2 GB/layer) so
+`slice_experts` could index `.data`.
+
+- **`tensor.rs`** — new `Tensor::expert_slice(expert)` carves one expert's
+  quantized sub-matrix (Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/IQ4_NL) out of a 3-D parent
+  with **no f32 materialization**; f32-only parents get a correctly
+  transposed slice. New `resident_bytes()` = quantized blocks + any f32 data.
+- **`loader.rs`** — 3-D expert tensors are now built as a `[d1*d2, d0]`
+  quantized matrix (was the wrong `[d0*d1, d2]`), matching GGUF/llama.cpp
+  row-major `[expert, d1, d0]` layout (verified against
+  `llama-model.cpp::create_tensor_gate_up_exps`). Experts stay quantized in
+  cache; `materialize_data()` only fires for non-expert 3-D tensors and
+  `ssm_conv1d.weight`.
+- **`moe.rs`** — `expert_one_token` slices the active top-k experts on demand
+  via `expert_slice` (per-token copy ~2 MB, freed each call). Router now
+  reads `mlp.gate.weight` (was reading the 3-D `mlp.expert_gate.weight`!);
+  `hidden.matmul(router)` replaces `hidden.matmul(&router.transpose())` —
+  `transpose()` reads `.data`, which is empty for quantized-only tensors and
+  silently zeroed the router scores. `moe_forward_one_token` hidden shape
+  fixed to `[1, hidden_size]` (was 1-D, which panicked `matmul`). MoE forward
+  verified end-to-end on real layer-0 weights: finite, ~5 ms/token.
+- **`engine.rs`** — `ffn_moe_forward` no longer pre-slices experts (they're
+  sliced on demand); this path had never run before (load always OOM'd).
+
+### Fixed — cache budget now counts real resident bytes
+
+`LayerCacheInner::cached_bytes` used `quantized_memory_bytes` only, so
+materialized f32 data blew past the budget silently. It now uses
+`Tensor::resident_bytes()` (quantized + `data.len()*4`).
+
+### Measured (Orange Pi 6 Plus, aarch64, 14 GiB total / ~6.7 GiB free, no swap)
+
+| Model | Before | After |
+|-------|--------|-------|
+| ornith-1.0-35b Q4_K_M (19.7 GB) | OOM-killed 3× (~6.5–7.1 GB) | **Streams, peak 3.96 GB** |
+| ornith-1.0-9b Q4_K_M (5.6 GB) | — | Coherent 25 tokens, peak 3.3 GB |
+
+### Added — NPU adaptive detection (honest, non-routing)
+
+- **`detect.rs`** — new `NpuKind` (`ZhouyiAipu` / `Other`), `probe_npu()`
+  (checks `/dev/aipu` + `/sys/class/misc/aipu`), `HardwareInfo.npu` field,
+  `supports_dynamic_offload()` (always false). The Zhouyi AIPU
+  (`armchina,zhouyi-v3` driver, CIX Sky1) only runs **precompiled** `.aipu.bin`
+  graphs — it cannot stream llama.cpp-style LLM ops, so it is detected and
+  reported in the banner (`npu:zhouyi-aipu`) but **never routed for offload**
+  and never upgrades the tier.
+- **`main.rs`** — banner shows ` · npu:zhouyi-aipu` when present.
+
+### Fixed — aarch64 build/test breakages (unblocks Orange Pi testing)
+
+- **`kernels/q8_k_gemm.rs`** — `test_q4_k_gemv_col_q8_avx2_matches_scalar` and
+  `test_q6_k_gemv_col_q8_avx2_matches_scalar` gated behind
+  `#[cfg(target_arch = "x86_64")]` (they referenced AVX2 intrinsics that don't
+  compile on ARM).
+- **`profiles.rs`** — stale Ministral template assertion updated to
+  `"[INST] You are Ministral-3-3B-Instruct-2512"`.
+
+### Fixed — misc
+
+- **`main.rs::truncate_str`** — sliced `&s[..max-3]` at a non-UTF-8 boundary
+  (panicked on CJK/emoji model names). Now uses the existing
+  `floor_char_boundary`.
+- **`main.rs::cmd_run_safetensor`** — hardcoded `/home/xander/...` model dirs
+  replaced with `$HOME`-relative paths.
+- **`Cargo.toml`** — removed 13 stale `[[bin]]` entries whose sources no
+  longer exist (all-bins builds were failing); registered the new `probe_3d`
+  diagnostic bin. `cargo build --bins` and `cargo test --lib` both green.
+- **`src/bin/probe_3d.rs`** (new diagnostic) — loads layer 0 of a 3-D MoE
+  model, prints expert tensor shapes / quantized status, and runs
+  `moe_forward_one_token` to prove the quantized slice path works.
+
+### Tests
+
+`cargo test --release --lib` → **192 passed, 0 failed, 3 ignored** (was 190).
+New tests: `expert_slice_quantized_matches_dequantized_reference`,
+`npu_kind_labels_and_never_offloads`, updated `slice_experts_splits_3d_into_per_expert`
+to the real GGUF (experts-outermost) layout.
+
 ---
 
 ## [2026-08-17] — Doc consolidation; kimi-k3-in-C techniques landed

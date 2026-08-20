@@ -41,6 +41,88 @@ impl Default for DeltaNetParams {
     }
 }
 
+/// One DeltaNet delta-rule block for a single (s, v_head) pair:
+/// S (head_v_dim x head_k_dim, row-major) updated with k, v, decay, beta,
+/// producing v_pred = S@k before the update and out = S'@q after.
+fn delta_rule_block(
+    state: &mut [f32],
+    k_h: &[f32],
+    q_h: &[f32],
+    v_h: &[f32],
+    head_v_dim: usize,
+    head_k_dim: usize,
+    decay_h: f32,
+    beta_h: f32,
+    v_pred: &mut [f32],
+    out: &mut [f32],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        if head_k_dim % 4 == 0 {
+            unsafe {
+            use std::arch::aarch64::*;
+            let nvec = head_k_dim / 4;
+            let decay_v = vdupq_n_f32(decay_h);
+            for i in 0..head_v_dim {
+                let row = i * head_k_dim;
+                // v_pred = S @ k
+                let mut acc = vdupq_n_f32(0.0);
+                for v in 0..nvec {
+                    let s = vld1q_f32(&state[row + v * 4]);
+                    let kv = vld1q_f32(&k_h[v * 4]);
+                    acc = vfmaq_f32(acc, s, kv);
+                }
+                let vp = vaddvq_f32(acc);
+                v_pred[i] = vp;
+
+                // S = decay*S + beta*(v - v_pred) outer k
+                let delta_v = v_h[i] - vp;
+                let bdv_v = vdupq_n_f32(beta_h * delta_v);
+                for v in 0..nvec {
+                    let s = vld1q_f32(&state[row + v * 4]);
+                    let kv = vld1q_f32(&k_h[v * 4]);
+                    let ns = vfmaq_f32(vmulq_f32(decay_v, s), bdv_v, kv);
+                    vst1q_f32(&mut state[row + v * 4], ns);
+                }
+
+                // out = S @ q
+                let mut acc2 = vdupq_n_f32(0.0);
+                for v in 0..nvec {
+                    let s = vld1q_f32(&state[row + v * 4]);
+                    let qv = vld1q_f32(&q_h[v * 4]);
+                    acc2 = vfmaq_f32(acc2, s, qv);
+                }
+                out[i] = vaddvq_f32(acc2);
+            }
+            }
+            return;
+        }
+    }
+
+    // Scalar fallback (non-aarch64, or head_k_dim % 4 != 0).
+    for i in 0..head_v_dim {
+        let mut sum = 0.0f32;
+        for j in 0..head_k_dim {
+            sum += state[i * head_k_dim + j] * k_h[j];
+        }
+        v_pred[i] = sum;
+    }
+    for i in 0..head_v_dim {
+        let delta_v = v_h[i] - v_pred[i];
+        for j in 0..head_k_dim {
+            let idx = i * head_k_dim + j;
+            state[idx] = decay_h * state[idx] + beta_h * delta_v * k_h[j];
+        }
+    }
+    for i in 0..head_v_dim {
+        let mut sum = 0.0f32;
+        for j in 0..head_k_dim {
+            sum += state[i * head_k_dim + j] * q_h[j];
+        }
+        out[i] = sum;
+    }
+}
+
 pub fn deltanet_forward(
     hidden_states: &Tensor,
     weights: &HashMap<String, Tensor>,
@@ -155,6 +237,7 @@ pub fn deltanet_forward(
         state_cache.init_layer(layer_idx, params.num_v_heads, params.head_v_dim, params.head_k_dim);
     }
     let state = state_cache.get_mut(layer_idx).unwrap();
+    let _delta_t0 = std::time::Instant::now();
 
     // Qwen3.5 V-head pairing is INTERLEAVED (llama.cpp ggml_repeat_4d,
     // llama-model.cpp:523-525): v_head h_v pairs with q/k head (h_v % num_qk_heads).
@@ -178,39 +261,28 @@ pub fn deltanet_forward(
 
                 // DeltaNet delta rule:
                 // 1. Predict v from current state: v_pred = S @ k
-                let mut v_pred = vec![0.0f32; params.head_v_dim];
-                for i in 0..params.head_v_dim {
-                    let mut sum = 0.0f32;
-                    for j in 0..params.head_k_dim {
-                        sum += state[state_stride + i * params.head_k_dim + j] * k_h[j];
-                    }
-                    v_pred[i] = sum;
-                }
-
                 // 2. State update: S = decay * S + beta * ((v - v_pred) outer k)
-                let mut max_delta_v = 0.0f32;
-                for i in 0..params.head_v_dim {
-                    let delta_v = v_h[i] - v_pred[i];
-                    max_delta_v = max_delta_v.max(delta_v.abs());
-                    for j in 0..params.head_k_dim {
-                        let idx = state_stride + i * params.head_k_dim + j;
-                        state[idx] = decay_h * state[idx] + beta_h * delta_v * k_h[j];
-                    }
-                }
-
-
-
                 // 3. Output: o = S @ q  (q is already scaled)
+                let mut v_pred = vec![0.0f32; params.head_v_dim];
                 let out_base = s * output_dim_per_token + h_v * params.head_v_dim;
-                for i in 0..params.head_v_dim {
-                    let mut sum = 0.0f32;
-                    for j in 0..params.head_k_dim {
-                        sum += state[state_stride + i * params.head_k_dim + j] * q_h[j];
-                    }
-                    output[out_base + i] = sum;
-                }
+                delta_rule_block(
+                    &mut state[state_stride..state_stride + params.head_v_dim * params.head_k_dim],
+                    k_h,
+                    q_h,
+                    v_h,
+                    params.head_v_dim,
+                    params.head_k_dim,
+                    decay_h,
+                    beta_h,
+                    &mut v_pred,
+                    &mut output[out_base..out_base + params.head_v_dim],
+                );
             }
         }
+    if std::env::var("LEAFCUTTER_PROFILE").is_ok() {
+        eprintln!("[PROFILE] deltanet_delta_rule              {:>8.2}ms",
+            _delta_t0.elapsed().as_secs_f32() * 1000.0);
+    }
 
     let mut output_tensor = Tensor::from_vec(output, vec![seq_len, output_dim_per_token]);
 
@@ -506,6 +578,59 @@ fn adaptive_project(x: &Tensor, target: usize) -> Tensor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_delta_rule_block_matches_scalar() {
+        // Reference scalar implementation.
+        fn scalar(state: &mut [f32], k: &[f32], q: &[f32], v: &[f32],
+                  hvd: usize, hkd: usize, decay: f32, beta: f32) -> (Vec<f32>, Vec<f32>) {
+            let mut vp = vec![0.0f32; hvd];
+            for i in 0..hvd {
+                let mut sum = 0.0f32;
+                for j in 0..hkd { sum += state[i * hkd + j] * k[j]; }
+                vp[i] = sum;
+            }
+            for i in 0..hvd {
+                let dv = v[i] - vp[i];
+                for j in 0..hkd {
+                    state[i * hkd + j] = decay * state[i * hkd + j] + beta * dv * k[j];
+                }
+            }
+            let mut out = vec![0.0f32; hvd];
+            for i in 0..hvd {
+                let mut sum = 0.0f32;
+                for j in 0..hkd { sum += state[i * hkd + j] * q[j]; }
+                out[i] = sum;
+            }
+            (vp, out)
+        }
+
+        let hvd = 8;
+        let hkd = 32;
+        let mut s1 = (0..hvd * hkd).map(|i| (i as f32) * 0.01).collect::<Vec<_>>();
+        let mut s2 = s1.clone();
+        let k: Vec<f32> = (0..hkd).map(|i| (i as f32 * 0.07).sin()).collect();
+        let q: Vec<f32> = (0..hkd).map(|i| (i as f32 * 0.11).cos()).collect();
+        let v: Vec<f32> = (0..hvd).map(|i| (i as f32) * 0.5).collect();
+        let decay = 0.9f32;
+        let beta = 0.3f32;
+
+        let (vp1, o1) = scalar(&mut s1, &k, &q, &v, hvd, hkd, decay, beta);
+        let mut vp2 = vec![0.0f32; hvd];
+        let mut o2 = vec![0.0f32; hvd];
+        delta_rule_block(&mut s2, &k, &q, &v, hvd, hkd, decay, beta, &mut vp2, &mut o2);
+
+        for i in 0..hvd {
+            let t = 1e-4 * (1.0 + vp1[i].abs());
+            assert!((vp1[i] - vp2[i]).abs() < t, "v_pred[{i}]: {} vs {}", vp1[i], vp2[i]);
+            let t = 1e-4 * (1.0 + o1[i].abs());
+            assert!((o1[i] - o2[i]).abs() < t, "out[{i}]: {} vs {}", o1[i], o2[i]);
+        }
+        for i in 0..hvd * hkd {
+            let t = 1e-4 * (1.0 + s1[i].abs());
+            assert!((s1[i] - s2[i]).abs() < t, "state[{i}]: {} vs {}", s1[i], s2[i]);
+        }
+    }
 
     #[test]
     fn test_deltanet_shapes() {

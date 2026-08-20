@@ -617,7 +617,9 @@ Leafcutter is **fully open source** (MIT license). Every kernel, every architect
 | Llama-3.2-3B-Instruct | 1.9 GB | Q4_K_XL | ✅ Forward + generation | ✅ | ~570 MB |
 | Ministral-3-3B-Reasoning-2512 | 2.1 GB | Q4_K_M | ✅ Forward + generation | — | **504 MB** |
 | Ministral-3-8B-Reasoning-2512 | 5.2 GB | Q4_K_M | ✅ Forward + generation | — | **739 MB** |
-| **Ornith 1.0 9B (Qwen3.5 hybrid)** | 5.3 GB | Q4_K_M | ✅ **Coherent chat** (`leafcutter run ornith`) | — | **~8.1 GB** |
+| **Ornith 1.0 9B (Qwen3.5 hybrid)** | 5.3 GB | Q4_K_M | ✅ **Coherent chat** (`leafcutter run ornith`) | — | **~3.3 GB** |
+| **Ornith 1.0 35B (Qwen3.6 MoE, 256 exp.)** | 19.7 GB | Q4_K_M | ✅ **Streams** via quantized expert slicing (was OOM-killed) | — | **3,963 MB** |
+| Qwen3.8-27B | 16 GB | Q4_K_M | ✅ MoE loads/streams (bench pending) | ✅ | TBD |
 | Qwen3.6-27B | 16 GB | IQ4_NL | ⚠️ Loads, attention OOB | ✅ | ~1.2 GB |
 
 **Llama-3.2-3B verification:** Python reference comparison shows max diff < 0.003 across all 28 layers. Greedy decode produces coherent output.

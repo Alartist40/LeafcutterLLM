@@ -59,8 +59,8 @@ self-tunes — no user knob required to trade speed for memory.
 | Tier | System | Entry point | Target | Current status |
 |------|--------|-------------|--------|----------------|
 | **1. GPU** | GPU backend | not built | GPU present | ❌ Phase-6 planned (Vulkan partial offload; AMD Vega iGPU probe) |
-| **2. Fast small** | `Engine` (`engine.rs`) + `layer_cache` | `leafcutter run ornith` | ≤9B class, fits RAM | ✅ coherent, ~8.1 GB RAM, 1.65 tok/s, 169 tests green |
-| **3. Large streaming** | same `Engine`/loader in streaming mode | `validate_70b_memory.rs`, `LEAFCUTTER_NO_CACHE=1` | 70B+ on small RAM | ✅ 70B forward @ **1,145 MB peak**; generation coherence in progress |
+| **2. Fast small** | `Engine` (`engine.rs`) + `layer_cache` | `leafcutter run ornith` | ≤9B class, fits RAM | ✅ coherent, ~3.3 GB RAM, 192 tests green |
+| **3. Large streaming** | same `Engine`/loader in streaming mode | `validate_70b_memory.rs`, `LEAFCUTTER_NO_CACHE=1` | 70B+ on small RAM | ✅ 70B forward @ **1,145 MB peak**; MoE 35B streams @ **3,963 MB peak** (quantized expert slicing) |
 
 Tiers 2 and 3 are **not two programs** — they are two modes of the same loader
 and engine. The single adaptive cache (§4) is the bridge between them.
@@ -94,6 +94,35 @@ the detection + tier brain in **`src/detect.rs`** (dependency-free, unit-tested)
   the model cannot fit in VRAM. A Vega-class iGPU (~2–4 GB shared VRAM) cannot hold
   a 5.6 GB Q4_K model, so partial offload of attention/FFN layers is the realistic
   ceiling on this hardware; CPU + AVX2 is expected to stay competitive for that class.
+- **NPU is detected but not offloadable:** `detect.rs` also probes the NPU
+  (`NpuKind` — Zhouyi AIPU via `/dev/aipu` + `/sys/class/misc/aipu`, reported as
+  `npu:zhouyi-aipu` in the banner). `NpuKind::supports_dynamic_offload()` is always
+  `false`, because Arm China Zhouyi AIPUs only execute **precompiled** `.aipu.bin`
+  graphs — they cannot stream llama.cpp-style ops. Detection is honest reporting +
+  future-proofing; it never upgrades the tier and never routes compute to the NPU.
+
+### 3.1 ARM Quantized Kernel Dispatch (sdot / NEON) — 2026-08-20
+
+Quantized decode matmuls live in `src/kernels/q8_k.rs` (block dots) and
+`q8_k_gemm.rs` (row dispatch), wired from `q4_k_gemm.rs` / `q6_k_gemm.rs`.
+
+- **Activation path**: the f32 activation row is quantized once to Q8_K
+  (`build_aux8`), then every weight block is dotted against it.
+- **Q4_K decode → single-column `sdot`**: on `is_aarch64_feature_detected!(
+  "dotprod")` the dot uses the `sdot vd.4s, vn.16b, vm.16b` instruction
+  (bit-exact vs scalar). A 2-column interleave variant exists but is NOT used:
+  it loses to single-column on the CIX Sky1 (register pressure, 4.3–5.5 ms vs
+  3.08 ms at n=12288). `LEAFCUTTER_Q8_GEMV=0` falls back to NEON.
+- **Q6_K stays NEON**: sdot's asm barriers break memory pipelining on the
+  bandwidth-bound lm_head (58 → 32 ms with NEON) and decode shapes. The lm_head
+  uses the transposed-b Q6_K GEMV (≈24–26 GB/s, bandwidth-bound).
+- **m>1 prefill**: `run_q4_k_q8_gemm` / `run_q6_k_q8_gemm` build each weight
+  column's block buffers once and each activation row's Q8 once, then reuse them
+  across all rows — prefill at m=77 dropped from 63 s to 7.5 s.
+- **SVE2/i8mm (smmla) is NOT used**: the Sky1's SVE vector length is 128 bits
+  (same as NEON); `smmla` yields the wrong dot pattern for single-column Q8 dots
+  (272 vs 136) and only pays off via llama.cpp's 2-column zip-interleave, which
+  loses on this chip. Dead end, documented in `CHANGELOG.md` [2026-08-20].
 
 ---
 
@@ -135,7 +164,19 @@ when the layer cache is enabled **and** `all_layers_cached()`, so a streaming
 re-enables the old aggressive behavior for experimentation. This was the fix for
 the 16× regression where the entire 5.6 GB file was re-read from disk ~32×/token.
 
-### 4.4 Policy summary
+### 4.5 MoE expert streaming (no f32 materialization)
+
+3-D MoE expert tensors (`gate_exps`/`up_exps`/`down_exps`, GGUF dims `[d0, d1, d2]`
+with `d2` = number of experts, experts outermost) stay **quantized** in the layer
+cache. `Tensor::expert_slice(e)` (`tensor.rs`) carves one expert's quantized
+sub-matrix on demand (Q4_K/Q5_K/Q6_K/Q8_0/Q4_0/IQ4_NL), and `moe.rs` slices only
+the active top-k experts per token (a few MB each, freed each call). This replaced
+the old eager per-layer f32 materialization (~1.07 GB × 3 per layer) that OOM-killed
+`ornith-1.0-35b` at 6.5–7.1 GB — it now streams at **3,963 MB peak RSS**. `cached_bytes`
+reports `resident_bytes()` (quantized blocks + materialized f32), so the layer-cache
+budget is enforced against real residency.
+
+### 4.6 Policy summary
 
 | Env var | Meaning | Default |
 |---------|---------|---------|
@@ -192,7 +233,20 @@ Hardware: AMD Ryzen 7 5800HS (8C/16T, AVX2, CPU-only), 16 GB RAM.
 | 70B Tier 3, adaptive cache | Coherent English (`"The capital of France is a city like no other,"`), peak **11.5 GB**, ~58 s/tok disk-bound |
 | 70B lm_head, old path | 8.84 GB materialization (now gated off by §4.2) |
 | lm_head fast tier | Q6_K block cache via `q6_k_matmul_transposed_b`, ~87.8 ms/tok, −3 GB vs f32 cache |
-| Test suite | 169 passed / 0 failed / 3 ignored (release, lib) |
+| Test suite | 202 passed / 0 failed / 4 ignored (release, lib) |
+
+### 6.1 Orange Pi 6 Plus / CIX Sky1 (aarch64, 12 cores, 14 GiB) — 2026-08-20
+
+| Scenario | Result |
+|----------|--------|
+| Ornith-1.0-9B Q4_K_M, 60-token generation | **~40 s wall (~1.5–1.7 tok/s under load; ≈2.4 tok/s idle)**, correct output |
+| Prefill (m=77) | **7.5 s** (was 63 s) |
+| Decode matmuls (Q4/Q6 K, sdot+NEON) | ≈ 320 ms/token |
+| lm_head (Q6_K, bandwidth-bound) | ≈ 48 ms/token (24–26 GB/s) |
+| delta_rule (NEON vectorized) | ≈ 30 ms/token (was 110 ms) |
+| FFN SiLU (NEON fast-exp) | 0.45 ms/call (was 1.20 ms) |
+| Ollama `ornith:9b` A/B (same load) | 2.93 tok/s decode — Leafcutter is ~1.95× behind, gap is kernel-level |
+| DeepSeek V4 (165B, FP8, 156 GB) | Not runnable on 14 GiB RAM (~82 GB needed at Q4_K_M) — abandoned locally |
 
 ---
 
